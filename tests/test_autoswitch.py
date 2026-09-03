@@ -2782,6 +2782,20 @@ def _usage7(pct5: float, pct7: float, reset7: str | None = None) -> dict:
     return {"five_hour": {"pct": pct5}, "seven_day": seven}
 
 
+def _usage75(
+    pct5: float, pct7: float, reset7: str | None = None, reset5: str | None = None
+) -> dict:
+    """Like ``_usage7`` but with an explicit 5-hour reset too, for the
+    5-hour-breaks-a-weekly-tie ranking axis."""
+    seven: dict = {"pct": pct7}
+    if reset7:
+        seven["resets_at"] = reset7
+    five: dict = {"pct": pct5}
+    if reset5:
+        five["resets_at"] = reset5
+    return {"five_hour": five, "seven_day": seven}
+
+
 class TestConsumeFirstStrategy:
     def _harness(self, temp_home: Path) -> EngineHarness:
         h = EngineHarness(temp_home, strategy="consume-first")
@@ -2862,6 +2876,63 @@ class TestConsumeFirstStrategy:
             "its weekly window resets sooner — it re-triggers next tick"
         )
         assert h.active_number() == 1
+    def test_at_limit_escape_ranks_by_headroom_not_reset(self, temp_home):
+        """#305: `consume_first` is the STRATEGY flag, not the trigger, and
+        the ranking key checked only the flag. Under strategy=consume-first,
+        an at-limit escape (active hard blocked) landed on whichever
+        candidate's WEEKLY window reset soonest — which is, by definition,
+        the most-consumed candidate — instead of the one that can actually
+        do work. #2 resets soonest but has almost no headroom left; #3 has
+        far more headroom but resets later. The escape must take #3."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage(
+            {
+                "1": _usage7(100, 100, _R_LATEST),  # active, hard at its limit
+                "2": _usage7(30, 95, _R_SOON),  # resets soonest, barely any room
+                "3": _usage7(20, 20, _R_LATER),  # more headroom, resets later
+            }
+        )
+        assert outcome is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit"
+        assert h.active_number() == 3, (
+            "at-limit must escape to the most headroom, not the soonest reset"
+        )
+
+    def test_weekly_tie_breaks_on_soonest_five_hour_reset(self, temp_home):
+        """The user-requested tiebreak chain: 7-day first, then 5-hour. #2
+        and #3 share the same weekly reset; #2's 5-hour window rolls over
+        first, so it is drained first — even though #2 has LESS headroom
+        than #3, so a headroom-only tiebreak (the pre-fix behavior) would
+        have picked #3 instead."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage(
+            {
+                "1": _usage75(20, 20, _R_LATEST),
+                "2": _usage75(10, 30, _R_SOON, reset5=_R_SOON),  # less headroom
+                "3": _usage75(10, 10, _R_SOON, reset5=_R_LATER),  # more headroom
+            }
+        )
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_full_tie_breaks_on_most_used(self, temp_home):
+        """Last link in the chain: when both resets tie, the MORE-used
+        account wins — the opposite of `best`'s own headroom-maximizing tie
+        rule — so a quota that is closer to expiring gets finished off
+        instead of leaving it half-drained next to a fresher peer."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage(
+            {
+                "1": _usage75(20, 20, _R_LATEST),
+                "2": _usage75(10, 80, _R_SOON, reset5=_R_SOON),  # more used
+                "3": _usage75(10, 30, _R_SOON, reset5=_R_SOON),  # more headroom
+            }
+        )
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2, (
+            "an equally-soon tie must favor the more-used account"
+        )
 
     def test_respects_cooldown(self, temp_home):
         h = self._harness(temp_home)  # default cooldown 300s

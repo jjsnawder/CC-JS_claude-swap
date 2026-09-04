@@ -73,3 +73,58 @@ records the fact of the fork (cheatsheet, REBUILD, inventory row, memory).
 handoffs would then hold this project's history — "handoff follows the session").
 **Why it matters:** the guides all point here; a reconcile run from elsewhere
 leaves no plan, decision, or handoff where the next session will look.
+
+## 2026-09-04 - Fable bar and reset-aware ranking are settings, not new defaults
+**Chose:** turn on `autoswitch.model = Fable` and `autoswitch.strategy =
+consume-first` in Jeremy's settings.json (`cswap config set`), and persist the
+95% threshold the same way. No change to the package defaults.
+**Rejected:** changing upstream's default so scoped per-model windows always
+bind (would flip `test_without_model_setting_the_same_usage_holds` and three
+oauth tests, and put a permanent behaviour delta in the fork for something a
+one-line config already does).
+**Why it matters:** anyone reading the engine and seeing "only 5h/7d by
+default" is right — the operator's behaviour comes from settings.json in the
+backup root, which is not in this repo and is re-read only when the TUI or
+`cswap auto` is relaunched.
+
+## 2026-09-04 - Carry open upstream PR #313 by cherry-pick
+**Chose:** cherry-pick the commits of realiti4/claude-swap PR #313 (consume-first
+ranking: trigger-scoped reset key, 5h tiebreak, most-used-first) onto `jeremy`
+with upstream authorship intact, before building on the ranking key.
+**Rejected:** waiting for the merge (consume-first would run with the #305
+escape bug meanwhile); re-implementing the fix ourselves (a guaranteed rebase
+conflict against the eventual upstream version).
+**Why it matters:** at the next reconcile these commits should vanish as
+already-applied. If upstream merged a *different* version, resolve toward
+upstream and re-apply the fork's 5h guard on top — never keep both.
+
+## 2026-09-04 - One pure ranking-key helper shared by engine and TUI
+**Chose:** factor the consume-first sort key out of `_rank_candidates` into a
+module-level pure function the TUI "Next best" panel imports, so the display
+and the decision cannot disagree (the same pattern `binding_pct` already
+follows for the metric).
+**Rejected:** re-deriving the order inside `tui/autoview.py` (today's state,
+which is exactly why the panel showed a headroom order under a reset strategy).
+**Why it matters:** any future strategy tweak lands in one place; a TUI test
+that pins the panel to the helper catches drift.
+
+## 2026-09-04 - 5h-hot demotion under consume-first reuses hysteresisPct
+**Chose:** under consume-first (proactive triggers only), a candidate whose 5h
+window is within `hysteresisPct` (default 10) of the threshold ranks behind
+every cool candidate; otherwise soonest weekly reset wins as upstream defines.
+No new setting.
+**Rejected:** a dedicated margin knob (no evidence yet it needs to differ from
+the `best`-strategy hysteresis; add one only when Jeremy asks); excluding hot
+accounts outright (an escape must still be able to land on them).
+**Why it matters:** this is the one fork-specific behaviour on the ranking
+path. It is shaped as an upstream PR (`feat/consume-first-5h-guard`, cites
+issue #303) so it can leave the fork.
+
+## 2026-09-04 - TUI strategy hotkey is session-only, like the threshold key
+**Chose:** `s` on the auto screen flips `best`/`consume-first` for the session
+(engine restart, re-ranked Next best, `(session)` tag, reverted on unmount).
+Persistence stays with `cswap config set autoswitch.strategy`.
+**Rejected:** writing settings.json from the hotkey (upstream deliberately keeps
+`t` session-only; mixing the two models in one screen invites "which one is
+live" confusion).
+**Why it matters:** the TUI never becomes a second writer of settings.json.

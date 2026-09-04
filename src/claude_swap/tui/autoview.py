@@ -416,6 +416,10 @@ class AutoScreen(Screen):
             entry = Text()
             entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
             entry.append(acc.email, style=palette.foreground)
+            # Muting greys the LABEL (number + email) only: the pct keeps its
+            # severity colour under every strategy, so the panel reads the
+            # same way whichever key ordered it.
+            label_end = len(entry)
             if acc.usage.sentinel is not None:
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
@@ -451,13 +455,13 @@ class AutoScreen(Screen):
                 if unhealthy or (active_below and key[1] >= active_reset_ts):
                     # Muted, still RANKED: this is the order the engine would
                     # use the moment the account becomes eligible.
-                    entry.stylize(palette.muted)
+                    entry.stylize(palette.muted, 0, label_end)
                 ranked.append(((0.0, 1 if unhealthy else 0) + key, acc.number))
             else:
                 entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
                 ranked.append(((pct,), acc.number))
             if idle:
-                entry.stylize(palette.muted)  # nothing here is takeable
+                entry.stylize(palette.muted, 0, label_end)  # nothing takeable
             lines[acc.number] = entry
 
         text = Text()

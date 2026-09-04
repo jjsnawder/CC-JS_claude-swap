@@ -1555,11 +1555,12 @@ class TestAutoScreen:
         return app.screen.query_one("#candidates", Static).render().plain
 
     def _muted_rows(self, app) -> set[str]:
-        """Emails whose whole row carries the muted style.
+        """Emails whose row label carries the muted style.
 
-        `_candidates_text` mutes a row by stylizing the entry end to end, so
-        a muted row is one where a muted span spans its email; an unmuted row
-        only carries the per-field spans (foreground e-mail, severity pct).
+        `_candidates_text` mutes a row by stylizing its label (number +
+        email) — the pct keeps its severity colour — so a muted row is one
+        where a muted span covers its email; an unmuted row only carries
+        the per-field spans (foreground e-mail, severity pct).
         """
         from textual.widgets import Static
 
@@ -1758,6 +1759,45 @@ class TestAutoScreen:
             await self._open(pilot)
             await settle(pilot)
             assert self._muted_rows(app) == {"user3@example.com"}
+
+    async def test_muted_row_keeps_the_pct_severity_colour(
+        self, tmp_path, fake_engine
+    ):
+        """Muting greys the label only: the `NN% used` span on a skipped row
+        keeps the same severity colour `best` would give it, so the panel's
+        colours read identically under both strategies."""
+        from textual.widgets import Static
+
+        from claude_swap.tui.theme import Palette
+
+        app = self._consume_first_app(
+            tmp_path,
+            [
+                make_account(
+                    1, active=True, entry=make_entry(20.0, 20.0, reset7_in=86400 * 4)
+                ),
+                make_account(2, entry=make_entry(10.0, 10.0, reset7_in=86400)),
+                make_account(3, entry=make_entry(10.0, 10.0, reset7_in=86400 * 9)),
+            ],
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            assert self._muted_rows(app) == {"user3@example.com"}
+            text = app.screen.query_one("#candidates", Static).render()
+            plain = text.plain
+            palette = Palette.from_theme(app.current_theme)
+            at = plain.index("% used", plain.index("user3@example.com"))
+            colours = set()
+            for span in text.spans:
+                if span.start <= at < span.end:
+                    fg = getattr(span.style, "foreground", None)
+                    colours.add(
+                        str(getattr(fg, "hex", fg) if fg is not None else span.style)
+                        .lower()
+                    )
+            assert palette.severity(10.0).lower() in colours
+            assert palette.muted.lower() not in colours
 
     async def test_candidates_over_threshold_row_is_muted_and_last(
         self, tmp_path, fake_engine

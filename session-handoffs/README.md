@@ -1,0 +1,1 @@
+Session handoff files, newest last. Each captures the firm decisions and full bootstrap context from one working session. To resume: read the most recent file here, then the plan file it points to. Written by the `handoff` skill; never hand-edit — supersede with a new handoff instead.

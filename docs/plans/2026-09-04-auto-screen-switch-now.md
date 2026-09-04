@@ -1,6 +1,6 @@
 # Plan — Auto screen `n` = Switch now
 
-Date: 2026-09-04 · Branch: `jeremy` · Status: **planned → building**
+Date: 2026-09-04 · Branch: `jeremy` · Status: **built**
 Depends on: `2026-09-04-autoswitch-fable-consume-first.md` (shipped).
 
 ## Ask
@@ -85,3 +85,9 @@ the Next-best branch; cut when Jeremy says.
 
 ## Status log
 - 2026-09-04 — planned; building via tool-runner.
+- 2026-09-04 (later) — built. Engine + tests committed, TUI `n` committed. Review
+  (Opus 5) found two defects in the unreadable-active path (landing gate
+  refused what failover would take; ordinary recovery legs released the
+  no-return bar on a null baseline) — both fixed, mutation-checked, covered.
+  Full suite 2132 passed / 77 skipped. Next: Jeremy relaunches the TUI and
+  tries `n` in dry-run; upstream PR `feat/tui-switch-now` deferred.

@@ -28,6 +28,7 @@ from claude_swap.autoswitch import (
     TickOutcome,
     UnquarantineEvent,
     _recovery_is_useful,
+    consume_first_key,
     pct_label,
 )
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
@@ -2842,6 +2843,26 @@ class TestConsumeFirstStrategy:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
+    def test_hot_tier_steers_proactive_switch(self, temp_home):
+        """The hot tier is not consume-first-trigger bookkeeping: the same key
+        runs on the `proactive` trigger (active AT/OVER the threshold under
+        strategy consume-first), where every healthy account qualifies and the
+        sort alone decides. Same shape as
+        `test_over_threshold_prefers_soonest_reset_over_max_headroom` — #2
+        resets soonest and wins #313's chain outright — except #2's 5-hour
+        window now sits at 82 (bar 90 - 10 = 80), so the cool #3 takes it."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 20, _R_LATER),   # active over threshold: must move
+            "2": _usage7(82, 40, _R_SOON),    # soonest weekly, but 5h-hot
+            "3": _usage7(10, 10, _R_LATEST),  # cool, resets latest
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3, (
+            "a 5h-hot candidate must rank behind every cool one on the "
+            "proactive trigger too, not just on consume-first"
+        )
+
     def test_a_consume_first_target_must_still_be_healthy(self, temp_home):
         """The threshold landing gate has no cover on the consume-first path.
 
@@ -2933,6 +2954,159 @@ class TestConsumeFirstStrategy:
         assert h.active_number() == 2, (
             "an equally-soon tie must favor the more-used account"
         )
+
+    def test_hot_five_hour_candidate_ranks_after_cool_ones(self, temp_home):
+        """The 5h-hot demotion: consume-first exists to spend perishable
+        WEEKLY quota, so a candidate whose 5-hour window already sits within
+        the hysteresis margin of the threshold (defaults 90 - 10 = 80,
+        boundary INCLUSIVE) is a last-resort landing — it buys minutes of
+        work before the next trigger fires. #2 resets soonest and would win
+        #313's chain outright; the cool #3 must take it instead.
+        """
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATEST),  # active, resets last
+            "2": _usage7(80, 10, _R_SOON),    # soonest weekly, 5h AT the bar
+            "3": _usage7(10, 10, _R_LATER),   # cool, resets later
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3, (
+            "a 5h-hot candidate must rank behind every cool one, even when "
+            "its weekly window resets sooner"
+        )
+
+    def test_hot_candidate_is_demoted_not_excluded(self, temp_home):
+        """Demotion, not exclusion — the whole point of using the margin
+        instead of a hard filter. With no cool peer, the hot account is
+        still a valid consume-first target."""
+        h = self._harness(temp_home)
+        ranked, any_known, _ = h.engine._rank_candidates(
+            trigger="consume-first",
+            consume_first=True,
+            oauth_candidates=["2"],
+            no_return=None,
+            usage={
+                "1": _usage7(20, 20, _R_LATEST),
+                "2": _usage7(80, 10, _R_SOON),  # hot, and the only candidate
+            },
+            headroom={"1": 80.0, "2": 20.0},
+            current="1",
+            active_headroom=80.0,
+            settings=h.settings,
+            now=h.clock.now,
+        )
+        assert ranked == ["2"]
+        assert any_known is True
+
+    def test_hot_guard_ignored_on_at_limit_and_failover(self, temp_home):
+        """Escapes rank by headroom (#305) and the hot tier is scoped with
+        them: at-limit and failover need the account that can WORK, not the
+        one with the coolest 5-hour window.
+
+        The HOT candidate is deliberately the headroom WINNER here, so the
+        two orders DISAGREE and only the escape's `(-h,)` key can produce
+        this answer: the hot account has 18 pts left and the cool one 15, so
+        a hot tier leaking into an escape would land it on the cooler but
+        emptier account. Confirmed to fail if the `trigger in ("proactive",
+        "consume-first")` scoping is dropped from the consume-first key
+        branch."""
+        h = self._harness(temp_home)
+        at_limit = {
+            "1": _usage7(100, 100, _R_LATEST),  # active hard at its limit
+            "2": _usage7(82, 10, _R_SOON),      # hot, 18 pts: MOST headroom
+            "3": _usage7(10, 85, _R_LATER),     # cool, 15 pts: less headroom
+        }
+        outcome = h.tick_with_usage(at_limit)
+        assert outcome is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit"
+        assert h.active_number() == 2, (
+            "at-limit must take the most headroom (the hot #2), not the "
+            "cooler but emptier #3"
+        )
+
+        # Failover: same candidate shapes, the (now #2) active row
+        # unreadable. The escape still ranks by headroom, unaffected by the
+        # hot tier.
+        h.events.clear()
+        h.clock.advance(h.settings.cooldown_seconds + 1)
+        failover = {
+            "2": None,                          # active, auth likely dead
+            "1": _usage7(82, 10, _R_SOON),      # hot, 18 pts: MOST headroom
+            "3": _usage7(10, 85, _R_LATER),     # cool, 15 pts: less headroom
+        }
+        for _ in range(h.settings.unhealthy_ticks - 1):
+            assert h.tick_with_usage(failover) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage(failover) is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "failover"
+        assert h.active_number() == 1
+
+    def test_hot_guard_uses_hysteresis_margin(self, temp_home):
+        """The bar is ``threshold - hysteresisPct``, so the margin moves it.
+        A 5-hour window at 70% is cool at the defaults (bar 80) and hot once
+        the margin widens to 25 (bar 65) — same usage, opposite ranking."""
+        h = self._harness(temp_home)
+        args = dict(
+            trigger="consume-first",
+            consume_first=True,
+            oauth_candidates=["2", "3"],
+            no_return=None,
+            usage={
+                "1": _usage7(20, 20, _R_LATEST),
+                "2": _usage7(70, 10, _R_SOON),   # 5h at 70
+                "3": _usage7(10, 10, _R_LATER),  # always cool
+            },
+            headroom={"1": 80.0, "2": 30.0, "3": 90.0},
+            current="1",
+            active_headroom=80.0,
+            now=h.clock.now,
+        )
+        wide, _, _ = h.engine._rank_candidates(
+            settings=replace(h.settings, hysteresis_pct=25.0), **args
+        )
+        assert wide == ["3", "2"], "bar 65: #2 is hot and must be demoted"
+        narrow, _, _ = h.engine._rank_candidates(
+            settings=replace(h.settings, hysteresis_pct=10.0), **args
+        )
+        assert narrow == ["2", "3"], (
+            "bar 80: #2 is cool, so #313's soonest-weekly-reset order stands"
+        )
+
+    def test_consume_first_key_tiers_and_unknowns(self):
+        """The extracted key itself (module-level so the TUI's "Next best"
+        panel can rank identically, which makes its contract worth its own
+        test): hot tier first, unknown resets last inside a tier, unknown
+        5-hour pct == cool, least headroom breaks a full tie.
+
+        ``headroom`` is an independent input to the key, not derived from the
+        usage dict, so the explicit values below are picked to exercise the
+        tie axis rather than to mirror the fixture pcts."""
+        now = 1_000_000.0
+        kw = dict(threshold=90.0, hysteresis_pct=10.0, now=now)
+        cool = consume_first_key(_usage75(79, 10, _R_SOON, _R_SOON), 90.0, **kw)
+        boundary = consume_first_key(_usage75(80, 10, _R_SOON, _R_SOON), 90.0, **kw)
+        assert cool[0] == 0
+        assert boundary[0] == 1, "the bar is inclusive: 80 >= 90 - 10 is hot"
+        assert cool < boundary, "every cool candidate outranks every hot one"
+
+        # Unknown/past resets sort last within the tier; unknown 5h pct and
+        # unreadable usage are cool, never punished.
+        unknown = consume_first_key(_usage7(10, 10, _R_PAST), 50.0, **kw)
+        assert unknown == (0, float("inf"), float("inf"), 50.0)
+        assert consume_first_key({"seven_day": {"pct": 10.0}}, 50.0, **kw)[0] == 0
+        assert consume_first_key(None, None, **kw) == (
+            0, float("inf"), float("inf"), float("inf")
+        )
+
+        # Inside a tier: soonest weekly, then soonest 5-hour, then most-used.
+        soon = consume_first_key(_usage75(10, 10, _R_SOON, _R_LATER), 90.0, **kw)
+        later = consume_first_key(_usage75(10, 10, _R_LATER, _R_SOON), 90.0, **kw)
+        assert soon < later
+        five_soon = consume_first_key(_usage75(10, 10, _R_SOON, _R_SOON), 90.0, **kw)
+        assert five_soon < soon
+        used = consume_first_key(_usage75(10, 10, _R_SOON, _R_SOON), 20.0, **kw)
+        assert used < five_soon, "the more-used account wins a full tie"
 
     def test_respects_cooldown(self, temp_home):
         h = self._harness(temp_home)  # default cooldown 300s

@@ -40,7 +40,11 @@ class AutoSwitchSettings:
     candidate must itself sit below the threshold (never land somewhere that
     re-triggers next tick) and beat the active account's utilization by at
     least ``hysteresis_pct``, so two accounts hovering at the line never
-    ping-pong while a strictly better account is always taken.
+    ping-pong while a strictly better account is always taken. Under
+    ``strategy="consume-first"`` that same margin also sets the 5h-hot bar: a
+    candidate whose 5-hour window is within ``hysteresis_pct`` of the
+    threshold ranks behind every cooler one, since landing there buys only
+    minutes of work before the next trigger.
     """
 
     threshold: float = 90.0
@@ -116,7 +120,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "hysteresisPct", "hysteresis_pct", "float", 0.0, 50.0,
-            help="A target must beat the active account by this many pct",
+            help="A target must beat the active by this many pct (also consume-first's 5h-hot bar)",
         ),
         SettingSpec(
             "autoswitch", "strategy", "strategy", "choice",

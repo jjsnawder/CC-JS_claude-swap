@@ -539,7 +539,8 @@ def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
     """Epoch of an account's 7-day (weekly) window reset, or None if unknown
     or already past.
 
-    The consume-first strategy ranks by this FIRST — the weekly window is the
+    The consume-first strategy ranks by this first within the 5-hour-heat
+    tier (see :func:`consume_first_key`) — the weekly window is the
     perishable quota that is actually lost forever at reset, so among
     qualifying candidates the one whose week dies soonest is drained first
     (``_five_hour_reset_ts`` below breaks a tie on this axis, since two
@@ -564,7 +565,7 @@ def _five_hour_reset_ts(usage: dict | str | None, now: float) -> float | None:
     """Epoch of an account's 5-hour window reset, or None if unknown or
     already past. Same past-is-unknown reasoning as ``_seven_day_reset_ts``.
 
-    Consume-first's SECOND ranking axis: it recycles too fast to plan a move
+    Consume-first's reset tiebreak axis: it recycles too fast to plan a move
     around on its own, but when two candidates tie on the weekly reset (the
     common case for accounts added around the same time) it still separates
     them meaningfully, rather than falling straight through to headroom.
@@ -576,6 +577,71 @@ def _five_hour_reset_ts(usage: dict | str | None, now: float) -> float | None:
             if ts is not None and ts > now:
                 return ts
     return None
+
+
+def _five_hour_pct(usage: dict | str | None) -> float | None:
+    """The 5-hour window's utilization pct, or None when unknown.
+
+    Reads through the one canonical window source (``_window_pcts`` ->
+    ``oauth.relevant_windows``), so the "hot" test in
+    :func:`consume_first_key` can never disagree with the pcts the poll log
+    and ``oauth.account_headroom`` report. Unfiltered by ``models`` on
+    purpose: the 5-hour window always gates the account.
+    """
+    if not isinstance(usage, dict):
+        return None
+    return _window_pcts(usage).get("5h")
+
+
+def consume_first_key(
+    usage: dict | str | None,
+    headroom: float | None,
+    *,
+    threshold: float,
+    hysteresis_pct: float,
+    now: float,
+) -> tuple[int, float, float, float]:
+    """Consume-first's PROACTIVE ranking key (ascending; smaller wins).
+
+    ``(hot, seven_day_reset_ts, five_hour_reset_ts, headroom)``:
+
+    1. **Tier** — 0 cool, 1 "hot". A candidate whose 5-hour utilization is
+       already within the hysteresis margin of the threshold
+       (``pct >= threshold - hysteresis_pct``, boundary inclusive) ranks
+       behind EVERY cool candidate: consume-first is about spending
+       perishable *weekly* quota, and landing on an account whose 5-hour
+       window is about to bind buys minutes of work before the next
+       trigger. It is still a candidate, just a last-resort one — the
+       margin, not a hard exclusion, is what keeps a fleet of hot accounts
+       usable. Unknown 5-hour pct == cool (never punish an unreadable row).
+    2. Soonest weekly reset, unknown/past last (``_seven_day_reset_ts``).
+    3. Soonest 5-hour reset breaks a weekly tie (``_five_hour_reset_ts``).
+    4. Least headroom — the MORE-used account wins a full tie, the opposite
+       of ``best``'s rule: two quotas perishing at the same moment are
+       equally worth spending, so finish one off instead of half-draining
+       both. Unknown headroom sorts last within its tier.
+
+    Module-level and pure so the TUI's "Next best" panel
+    (``tui/autoview.py``) can import it and rank identically — a display
+    that computes its own order eventually disagrees with the decision. Escapes
+    ("at-limit"/"failover") do NOT use this key: they rank by headroom, so
+    they land on an account that can work (#305). Callers must scope it to
+    the "proactive"/"consume-first" triggers.
+    """
+    five_hour_pct = _five_hour_pct(usage)
+    # ``hysteresis_pct=0`` makes the tier INERT, not strict: the bar collapses
+    # onto the threshold itself, and a candidate whose 5-hour pct is already
+    # >= threshold has been dropped by the landing gate before it reaches this
+    # key — so with no margin configured nothing here can be hot.
+    hot = five_hour_pct is not None and five_hour_pct >= threshold - hysteresis_pct
+    seven_day_reset_ts = _seven_day_reset_ts(usage, now)
+    five_hour_reset_ts = _five_hour_reset_ts(usage, now)
+    return (
+        1 if hot else 0,
+        seven_day_reset_ts if seven_day_reset_ts is not None else float("inf"),
+        five_hour_reset_ts if five_hour_reset_ts is not None else float("inf"),
+        headroom if headroom is not None else float("inf"),
+    )
 
 
 def _binding_recovery_ts(
@@ -1794,8 +1860,9 @@ class AutoSwitchEngine:
         twice per tick: on the stored snapshot to decide provisionally, then
         on the escalated refetch to re-verify before switching.
         """
-        # consume-first ranks a qualifying candidate by soonest weekly reset,
-        # then soonest 5-hour reset, then most-used (see the key built below);
+        # consume-first ranks a qualifying candidate cool-before-5h-hot,
+        # then by soonest weekly reset, then soonest 5-hour reset, then
+        # most-used (`consume_first_key`, which owns that whole chain);
         # a proactive (below-threshold) target must reset strictly sooner
         # than where we are. That whole ranking is scoped to the "proactive"/
         # "consume-first" triggers only — an "at-limit"/"failover" escape
@@ -1864,9 +1931,6 @@ class AutoSwitchEngine:
                 continue  # the account we just left; see _no_return_account
             reset_ts = (
                 _seven_day_reset_ts(usage.get(num), now) if consume_first else None
-            )
-            five_hour_ts = (
-                _five_hour_reset_ts(usage.get(num), now) if consume_first else None
             )
             recovery_ts = (
                 _binding_recovery_ts(usage.get(num), self._models, now)
@@ -1969,14 +2033,13 @@ class AutoSwitchEngine:
                     (0, recovery_ts, -h) if by_recovery else (1, -h, recovery_ts)
                 )
             elif consume_first and trigger in ("proactive", "consume-first"):
-                # Soonest weekly reset first (unknown resets sort last), then
-                # soonest 5-hour reset breaks a weekly tie, then — the
-                # opposite of `best`'s ``-h`` below — the MORE-used account
-                # wins any remaining tie: two accounts perishing at the same
-                # moment are equally worth spending, so draining the one
-                # closer to its limit first finishes it off instead of
-                # leaving it half-drained next to a fresher peer, then
-                # sequence order.
+                # Cool candidates before 5h-hot ones, then soonest weekly
+                # reset (unknown last), then soonest 5-hour reset breaks a
+                # weekly tie, then — the opposite of `best`'s ``-h`` below —
+                # the MORE-used account wins any remaining tie, then sequence
+                # order. Built by `consume_first_key`, which owns the tier
+                # semantics and is what the TUI's "Next best" panel imports so
+                # the display cannot rank differently from the decision.
                 #
                 # Scoped to the SAME triggers as the ``all_above`` key above,
                 # for the same reason (#305): `consume_first` is the
@@ -1984,11 +2047,15 @@ class AutoSwitchEngine:
                 # would also catch "at-limit"/"failover" escapes and rank
                 # them by reset instead of headroom — landing the escape on
                 # whichever account is closest to ALSO being out of quota
-                # instead of the one that can actually do work.
-                key = (
-                    reset_ts if reset_ts is not None else float("inf"),
-                    five_hour_ts if five_hour_ts is not None else float("inf"),
+                # instead of the one that can actually do work. The hot tier
+                # is scoped with it: an escape needs the account that works,
+                # not the one with the coolest 5-hour window.
+                key = consume_first_key(
+                    usage.get(num),
                     h,
+                    threshold=settings.threshold,
+                    hysteresis_pct=settings.hysteresis_pct,
+                    now=now,
                 )
             else:
                 key = (-h,)

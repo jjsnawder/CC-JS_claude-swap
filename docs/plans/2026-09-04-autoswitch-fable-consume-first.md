@@ -1,6 +1,7 @@
 # Auto-switch: watch the Fable bar, prefer the soonest weekly reset
 
-**Status:** planned 2026-09-04, no code yet. Work items A–E below, in order.
+**Status:** DONE 2026-09-04 — A applied to settings, B–E committed on `jeremy`
+(0a000f3 #313 cherry-pick, ceeabe2 item E, 163ab4f items C+D). Upstream PRs not yet opened.
 **Origin:** Jeremy's live-monitor screenshot (TUI auto screen, LIVE, threshold
 95% session-only). Active account showed 5h 0% / 7d 25% / Fable 37%, but the
 log read `25% used (switch at 95%)`, and "Next best" ranked by % used while the
@@ -171,3 +172,11 @@ in flight.
 - 2026-09-04 — planning session: findings verified, decisions taken, plan
   written. Live monitor was running the whole time (untouched). Next: Jeremy
   exits the TUI, orchestrator runs A, Jeremy relaunches; then B.
+- 2026-09-04 (later) — built out. A: `cswap config set` model Fable / strategy
+  consume-first / threshold 95 (TUI exited first). B: PR #313 cherry-picked clean
+  (0a000f3). E: `consume_first_key` + 5h-hot tier (ceeabe2), reviewed; review
+  fixes made the trigger-scoping test discriminate and added proactive coverage.
+  C+D: Next best follows the strategy, `s` hotkey (163ab4f), reviewed; fixes added
+  the health tier, gate-faithful muting, reset-unknown idle line, stable tie order.
+  Full suite 2113 passed / 77 skipped. Open: upstream PRs (C+D depends on #313
+  merging); `cswap list` headroom without models filter noted upstream-later.

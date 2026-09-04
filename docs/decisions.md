@@ -128,3 +128,17 @@ Persistence stays with `cswap config set autoswitch.strategy`.
 `t` session-only; mixing the two models in one screen invites "which one is
 live" confusion).
 **Why it matters:** the TUI never becomes a second writer of settings.json.
+
+## 2026-09-04 - Auto-screen `n` (Switch now) goes through the engine as a `manual` trigger
+**Chose:** a one-shot `request_switch()` on `AutoSwitchEngine`; the next tick
+runs with trigger `manual`, which ranks exactly like the strategy's proactive
+path but ignores cooldown, hysteresis, the strictly-sooner reset gate and the
+no-return bar, while keeping the landing-health gate. Dry-run previews, live
+switches.
+**Rejected:** calling `switcher.switch_to` from the TUI like the dashboard does
+(bypasses freshen/quarantine and leaves the engine's anti-flap state blind to
+the move); adding `consume-first` to `switcher.switch(strategy=…)` (duplicates
+the ranking outside the engine — the panel/engine drift the shared key just
+removed).
+**Why it matters:** one decision path, one log, one state file. A manual move
+is recorded like any other so the engine cannot immediately undo it.

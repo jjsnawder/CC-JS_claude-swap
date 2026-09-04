@@ -357,8 +357,9 @@ class AutoScreen(Screen):
         engine's own key, imported rather than reimplemented -- inside a
         health tier that mirrors the engine's landing gate, and annotates
         each row with the weekly reset it ranks on, a ``5h hot`` marker for
-        the demoted tier, and muting for any row the proactive trigger
-        would not take right now, so "why did it not move" answers itself.
+        the demoted tier, and a ``skip`` tag on any row the proactive
+        trigger would not take right now, so "why did it not move" answers
+        itself. Labels and pcts render exactly as under ``best``.
 
         Scoped to that ONE trigger on purpose, and it is the common case
         rather than the whole engine: an ``at-limit``/``failover`` escape
@@ -416,10 +417,11 @@ class AutoScreen(Screen):
             entry = Text()
             entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
             entry.append(acc.email, style=palette.foreground)
-            # Muting greys the LABEL (number + email) only: the pct keeps its
-            # severity colour under every strategy, so the panel reads the
-            # same way whichever key ordered it.
-            label_end = len(entry)
+            # A row the proactive trigger would not take right now gets a
+            # trailing muted `skip` tag; the label and pct render exactly as
+            # under `best`, so the panel's colours mean the same thing
+            # whichever key ordered it.
+            skip = False
             if acc.usage.sentinel is not None:
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
@@ -452,16 +454,15 @@ class AutoScreen(Screen):
                 # row — untiered, an unhealthy account still rendered first
                 # and read as the engine's next pick.
                 unhealthy = pct >= threshold
-                if unhealthy or (active_below and key[1] >= active_reset_ts):
-                    # Muted, still RANKED: this is the order the engine would
-                    # use the moment the account becomes eligible.
-                    entry.stylize(palette.muted, 0, label_end)
+                # Tagged, still RANKED: this is the order the engine would
+                # use the moment the account becomes eligible.
+                skip = unhealthy or (active_below and key[1] >= active_reset_ts)
                 ranked.append(((0.0, 1 if unhealthy else 0) + key, acc.number))
             else:
                 entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
                 ranked.append(((pct,), acc.number))
-            if idle:
-                entry.stylize(palette.muted, 0, label_end)  # nothing takeable
+            if skip or idle:  # idle: nothing here is takeable
+                entry.append("  skip", style=palette.muted)
             lines[acc.number] = entry
 
         text = Text()

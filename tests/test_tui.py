@@ -1554,36 +1554,37 @@ class TestAutoScreen:
 
         return app.screen.query_one("#candidates", Static).render().plain
 
-    def _muted_rows(self, app) -> set[str]:
-        """Emails whose row label carries the muted style.
+    def _skipped_rows(self, app) -> set[str]:
+        """Emails whose row carries the trailing muted `skip` tag.
 
-        `_candidates_text` mutes a row by stylizing its label (number +
-        email) — the pct keeps its severity colour — so a muted row is one
-        where a muted span covers its email; an unmuted row only carries
-        the per-field spans (foreground e-mail, severity pct).
+        `_candidates_text` never greys a label: a row the proactive trigger
+        would not take renders exactly like any other (foreground e-mail,
+        severity pct) plus a muted `skip` tag at the end of its line.
         """
         from textual.widgets import Static
 
-        from claude_swap.tui.theme import Palette
-
-        text = app.screen.query_one("#candidates", Static).render()
-        muted = Palette.from_theme(app.current_theme).muted
-        plain = text.plain
+        plain = app.screen.query_one("#candidates", Static).render().plain
         rows: set[str] = set()
-        for span in text.spans:
-            # Textual resolves the Text into `content.Content`, so the style
-            # arrives as a Style with a parsed Color rather than the hex
-            # string that was appended; accept either.
-            style = span.style
-            fg = getattr(style, "foreground", None)
-            resolved = str(getattr(fg, "hex", fg) if fg is not None else style)
-            if resolved.lower() != muted.lower():
-                continue
+        for line in plain.splitlines():
             for acc in app.switcher._accounts:
-                at = plain.find(acc.email)
-                if at >= 0 and span.start <= at and span.end >= at + len(acc.email):
+                if acc.email in line and line.rstrip().endswith("skip"):
                     rows.add(acc.email)
         return rows
+
+    def _label_styles(self, app, email: str) -> set[str]:
+        """Resolved foreground colours of every span covering `email`."""
+        from textual.widgets import Static
+
+        text = app.screen.query_one("#candidates", Static).render()
+        at = text.plain.index(email)
+        colours: set[str] = set()
+        for span in text.spans:
+            if span.start <= at and span.end >= at + len(email):
+                fg = getattr(span.style, "foreground", None)
+                colours.add(
+                    str(getattr(fg, "hex", fg) if fg is not None else span.style).lower()
+                )
+        return colours
 
     async def test_candidates_ranked_by_weekly_reset_under_consume_first(
         self, tmp_path, fake_engine
@@ -1738,12 +1739,12 @@ class TestAutoScreen:
             summary = screen.query_one("#auto-summary", Static).render().plain
             assert "(session)" not in summary  # back to the configured value
 
-    async def test_candidates_mute_the_rows_the_trigger_would_skip(
+    async def test_candidates_tag_the_rows_the_trigger_would_skip(
         self, tmp_path, fake_engine
     ):
         """Below the threshold the proactive gate only moves to an account
         whose weekly window resets STRICTLY sooner than the active one, so #3
-        (resets later) is greyed and #2 (sooner) is not — the panel answers
+        (resets later) is tagged `skip` and #2 (sooner) is not — the panel answers
         "why didn't it move" without the log."""
         app = self._consume_first_app(
             tmp_path,
@@ -1758,14 +1759,13 @@ class TestAutoScreen:
         async with app.run_test(size=(100, 40)) as pilot:
             await self._open(pilot)
             await settle(pilot)
-            assert self._muted_rows(app) == {"user3@example.com"}
+            assert self._skipped_rows(app) == {"user3@example.com"}
 
-    async def test_muted_row_keeps_the_pct_severity_colour(
-        self, tmp_path, fake_engine
-    ):
-        """Muting greys the label only: the `NN% used` span on a skipped row
-        keeps the same severity colour `best` would give it, so the panel's
-        colours read identically under both strategies."""
+    async def test_skipped_row_renders_like_best(self, tmp_path, fake_engine):
+        """A skipped row is tagged, never greyed: its label keeps the
+        foreground colour and its `NN% used` span the severity colour `best`
+        would give it, so the panel's colours read identically under both
+        strategies."""
         from textual.widgets import Static
 
         from claude_swap.tui.theme import Palette
@@ -1783,7 +1783,7 @@ class TestAutoScreen:
         async with app.run_test(size=(100, 40)) as pilot:
             await self._open(pilot)
             await settle(pilot)
-            assert self._muted_rows(app) == {"user3@example.com"}
+            assert self._skipped_rows(app) == {"user3@example.com"}
             text = app.screen.query_one("#candidates", Static).render()
             plain = text.plain
             palette = Palette.from_theme(app.current_theme)
@@ -1798,14 +1798,17 @@ class TestAutoScreen:
                     )
             assert palette.severity(10.0).lower() in colours
             assert palette.muted.lower() not in colours
+            label = self._label_styles(app, "user3@example.com")
+            assert palette.muted.lower() not in label
+            assert palette.foreground.lower() in label
 
-    async def test_candidates_over_threshold_row_is_muted_and_last(
+    async def test_candidates_over_threshold_row_is_tagged_and_last(
         self, tmp_path, fake_engine
     ):
         """The engine's landing gate runs before its key: an account at/over
         the threshold re-triggers on the next tick and is never a proactive
         target, however soon its week resets. #2 resets soonest and is at 95%
-        — it must render last AND greyed, not first."""
+        — it must render last AND tagged `skip`, not first."""
         app = self._consume_first_app(
             tmp_path,
             [
@@ -1824,14 +1827,14 @@ class TestAutoScreen:
             assert plain.index("user3@example.com") < plain.index(
                 "user2@example.com"
             ), "an unhealthy landing must never rank first"
-            assert self._muted_rows(app) == {"user2@example.com"}
+            assert self._skipped_rows(app) == {"user2@example.com"}
 
     async def test_candidates_idle_when_active_weekly_reset_unknown(
         self, tmp_path, fake_engine
     ):
         """Below the threshold with the active account's weekly reset
         unreported, the engine's gate can never pass (it holds with
-        "reset-unknown"). Every row is greyed and the panel says why, instead
+        "reset-unknown"). Every row is tagged `skip` and the panel says why, instead
         of showing a ranking nothing would act on."""
         app = self._consume_first_app(
             tmp_path,
@@ -1846,7 +1849,7 @@ class TestAutoScreen:
             await self._open(pilot)
             await settle(pilot)
             assert "consume-first idle until" in self._candidates(app)
-            assert self._muted_rows(app) == {
+            assert self._skipped_rows(app) == {
                 "user2@example.com",
                 "user3@example.com",
             }

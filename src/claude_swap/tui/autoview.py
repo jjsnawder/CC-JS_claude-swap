@@ -83,6 +83,7 @@ class AutoScreen(Screen):
         Binding("l", "toggle_live", "Go live / dry-run"),
         Binding("t", "adjust_threshold", "Threshold"),
         Binding("s", "toggle_strategy", "Strategy"),
+        Binding("n", "switch_now", "Switch now"),
         Binding("left", "threshold_step(-1)", "-1%"),
         Binding("right", "threshold_step(1)", "+1%"),
         Binding("enter", "adjust_done", "Done"),
@@ -164,7 +165,7 @@ class AutoScreen(Screen):
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         if action in ("threshold_step", "adjust_done") and not self._adjusting:
             return False  # hidden and inert until adjust mode is armed
-        if action == "toggle_strategy" and self._adjusting:
+        if action in ("toggle_strategy", "switch_now") and self._adjusting:
             return False  # the keys belong to the threshold while it is armed
         return True
 
@@ -245,6 +246,35 @@ class AutoScreen(Screen):
         self.query_one("#event-log", RichLog).write(
             Text(
                 f"— strategy set to {flipped} for this session —",
+                style=Palette.from_theme(self.app.current_theme).muted,
+            )
+        )
+
+    # -- switch now -----------------------------------------------------------
+
+    def action_switch_now(self) -> None:
+        """Ask the engine to switch on its next tick (trigger ``manual``).
+
+        The ENGINE performs it, not this screen: only the engine's tick does
+        the health checks, the token freshening, the quarantine handling and
+        the state record that a hand-rolled ``switch_to`` here would skip. It
+        ranks by the strategy shown in the summary — the session override
+        included, since `s` rebuilds the engine — without the anti-flap
+        margins, so it takes the strategy's top HEALTHY candidate: the
+        margin-based `skip` tags in "Next best" are waived, but a row
+        at/over the threshold is not (landing there re-triggers at once).
+
+        Inert in threshold-adjust mode, like `s`: the keys belong to the
+        threshold while it is armed. No confirmation — in DRY-RUN this is a
+        preview (`[dry-run] would switch ...`) and going LIVE was already
+        confirmed once, by `l`.
+        """
+        if self._settings is None or self._adjusting or self._engine is None:
+            return
+        self._engine.request_switch()
+        self.query_one("#event-log", RichLog).write(
+            Text(
+                f"— switch now requested ({self._settings.strategy}) —",
                 style=Palette.from_theme(self.app.current_theme).muted,
             )
         )

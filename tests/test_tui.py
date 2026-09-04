@@ -1301,6 +1301,7 @@ class _FakeEngine:
         self.stopped = False
         self.applied_thresholds: list[float] = []
         self.wakes = 0
+        self.switch_requests = 0
         self._stop = threading.Event()
         _FakeEngine.instances.append(self)
 
@@ -1319,6 +1320,9 @@ class _FakeEngine:
 
     def wake(self) -> None:
         self.wakes += 1
+
+    def request_switch(self) -> None:
+        self.switch_requests += 1
 
 
 @pytest.fixture
@@ -1553,6 +1557,13 @@ class TestAutoScreen:
         from textual.widgets import Static
 
         return app.screen.query_one("#candidates", Static).render().plain
+
+    def _log_text(self, app) -> str:
+        """Everything written to the decision log, as one plain string."""
+        from textual.widgets import RichLog
+
+        log = app.screen.query_one("#event-log", RichLog)
+        return "\n".join(strip.text for strip in log.lines)
 
     def _skipped_rows(self, app) -> set[str]:
         """Emails whose row carries the trailing muted `skip` tag.
@@ -1923,6 +1934,87 @@ class TestAutoScreen:
             screen = app.screen
             assert screen._settings.strategy == "consume-first"
             assert len(fake_engine.instances) == 1  # no restart
+
+
+    async def test_switch_now_asks_the_engine_and_logs_it(
+        self, tmp_path, fake_engine
+    ):
+        """`n` never switches from the screen: it hands the request to the
+        engine, whose tick owns the health checks, freshening and state
+        record. The log line names the strategy the request will rank by, so
+        a session `s` override can never be mistaken for the file value."""
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            engine = fake_engine.instances[0]
+            assert engine.switch_requests == 0
+            assert fake.calls == []  # nothing switched before the press
+            await pilot.press("n")
+            await pilot.pause()
+            assert engine.switch_requests == 1
+            assert fake.calls == []  # ...and nothing switched by the press
+            assert "switch now requested (best)" in self._log_text(app)
+
+    async def test_switch_now_is_inert_in_threshold_adjust_mode(
+        self, tmp_path, fake_engine
+    ):
+        """Mirrors `s`: while the threshold is armed the keys belong to it,
+        so `n` must not fire a switch the user was not aiming at."""
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await pilot.press("t", "n")
+            await pilot.pause()
+            assert fake_engine.instances[0].switch_requests == 0
+            assert "switch now requested" not in self._log_text(app)
+
+    async def test_switch_now_needs_no_confirmation_in_dry_run(
+        self, tmp_path, fake_engine
+    ):
+        """In DRY-RUN the engine only PREVIEWS the move, so a confirm modal
+        would gate nothing; going LIVE was already confirmed once, by `l`."""
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            engine = fake_engine.instances[0]
+            assert engine.dry_run is True
+            await pilot.press("n")
+            await pilot.pause()
+            from claude_swap.tui.autoview import AutoScreen
+
+            assert isinstance(app.screen, AutoScreen)  # no ConfirmModal pushed
+            assert engine.switch_requests == 1
+
+    async def test_switch_now_reports_the_session_strategy(
+        self, tmp_path, fake_engine
+    ):
+        """After `s` the request ranks by the SESSION strategy (the toggle
+        rebuilt the engine), so the log line must read the session value —
+        `_settings`, not the file."""
+        app = self._consume_first_app(
+            tmp_path, [make_account(1, active=True), make_account(2)]
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await pilot.press("n")
+            await pilot.pause()
+            assert "switch now requested (consume-first)" in self._log_text(app)
+            await pilot.press("s")
+            await settle(pilot)
+            await pilot.press("n")
+            await pilot.pause()
+            assert "switch now requested (best)" in self._log_text(app)
+            assert fake_engine.instances[-1].switch_requests == 1
 
 
 class TestEventText:

@@ -7139,3 +7139,302 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+
+class TestManualSwitch:
+    """`request_switch()` — the TUI's `n` ("switch now").
+
+    The contract in one line: the STRATEGY's ranking, none of the ANTI-FLAP
+    margins, and still the landing-health gate. Each test below pins one leg
+    of that, plus the two properties that keep a keypress from becoming a
+    standing order: it is consumed by exactly one tick, and the switch it
+    performs is recorded like any other (so the ordinary cooldown protects
+    the landing).
+    """
+
+    def _cf_harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_best_ignores_hysteresis_and_takes_the_most_headroom(self, harness):
+        """Under `best`, well below the threshold and with no candidate
+        clearing the hysteresis margin, a normal tick does nothing — the
+        engine never even reaches candidate selection. The same tick after
+        `request_switch()` moves to the most-headroom account, 5 points
+        better than the active one against a 10-point margin."""
+        usage = {"1": _usage7(30, 30), "2": _usage7(25, 25), "3": _usage7(60, 60)}
+
+        assert harness.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert [
+            e.reason for e in harness.events if isinstance(e, NoSwitchEvent)
+        ] == ["below-threshold"]
+        assert harness.active_number() == 1
+        harness.events.clear()
+
+        harness.engine.request_switch()
+        assert harness.tick_with_usage(usage) is TickOutcome.SWITCHED
+        sw = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "manual"
+        assert harness.active_number() == 2
+
+    def test_wakes_the_loop_so_the_request_is_not_left_sleeping(self, harness):
+        """`n` must tick NOW, not at the next poll: a request that only set
+        its own flag would sit unnoticed for up to `interval_seconds`."""
+        assert not harness.engine._wake.is_set()
+        harness.engine.request_switch()
+        assert harness.engine._switch_now.is_set()
+        assert harness.engine._wake.is_set()
+
+    def test_consume_first_ignores_strictly_sooner_and_cooldown(self, temp_home):
+        """The active account's own weekly window resets soonest, so the
+        strictly-sooner gate refuses every candidate and the strategy is
+        correctly idle; the engine is also inside its cooldown. `n` overrides
+        both and takes the soonest-resetting of the OTHERS."""
+        h = self._cf_harness(temp_home)
+        usage = {
+            "1": _usage7(20, 20, _R_SOON),    # active: nothing resets sooner
+            "2": _usage7(10, 10, _R_LATER),   # soonest among the candidates
+            "3": _usage7(10, 10, _R_LATEST),
+        }
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
+            "already-consuming-soonest"
+        ]
+        h.events.clear()
+        h.engine._mutate_state(
+            lambda st: st.__setitem__("lastSwitchAt", h.clock.now)
+        )
+
+        h.engine.request_switch()
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert "cooldown" not in [
+            e.reason for e in h.events if isinstance(e, NoSwitchEvent)
+        ]
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "manual"
+        assert h.active_number() == 2
+
+    def test_consume_first_keeps_the_five_hour_hot_tier(self, temp_home):
+        """Margins are waived; the strategy's own KEY is not. #2 resets
+        sooner but its 5-hour window sits at 82 (bar: threshold 90 -
+        hysteresis 10), so the cool #3 wins — the same order the "Next best"
+        panel renders."""
+        h = self._cf_harness(temp_home)
+        h.engine.request_switch()
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_SOON),
+            "2": _usage7(82, 10, _R_LATER),   # soonest weekly, but 5h-hot
+            "3": _usage7(10, 10, _R_LATEST),  # cool, resets latest
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_never_lands_on_an_unhealthy_candidate(self, temp_home):
+        """The landing-health gate is NOT one of the waived margins: an
+        account at/over the threshold would re-trigger on the very next tick,
+        so `n` would buy a switch and an immediate switch back. The only
+        candidate is at 96% against a 95% threshold, so the request is spent
+        on a tick that goes nowhere."""
+        h = EngineHarness(temp_home, threshold=95.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        h.engine.request_switch()
+        outcome = h.tick_with_usage({"1": _usage7(30, 30), "2": _usage7(96, 96)})
+
+        assert outcome is not TickOutcome.SWITCHED
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+        assert h.active_number() == 1
+        assert "no-qualifying-candidate" in [
+            e.reason for e in h.events if isinstance(e, NoSwitchEvent)
+        ]
+        assert not h.engine._switch_now.is_set()  # consumed even when refused
+
+    def test_consumed_by_one_tick_and_the_landing_is_protected(self, harness):
+        """A keypress is a one-shot, not a mode. The tick after a manual
+        switch is an ordinary poll: no second SwitchEvent, `leftTrigger` is
+        recorded as `manual`, and the normal cooldown — which the manual tick
+        itself ignored — now refuses the proactive flap back."""
+        harness.engine.request_switch()
+        assert harness.tick_with_usage({
+            "1": _usage7(30, 30), "2": _usage7(25, 25), "3": _usage7(60, 60),
+        }) is TickOutcome.SWITCHED
+        assert harness.state()["leftTrigger"] == "manual"
+        assert not harness.engine._switch_now.is_set()
+        harness.events.clear()
+
+        # Account 2 is now active and over the threshold: without the record
+        # above this tick would be a proactive switch back to 1.
+        outcome = harness.tick_with_usage({
+            "1": _usage7(30, 30), "2": _usage7(95, 95), "3": _usage7(60, 60),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+        assert [
+            e.reason for e in harness.events if isinstance(e, NoSwitchEvent)
+        ] == ["cooldown"]
+
+    def test_unreadable_active_makes_manual_an_escape(self, temp_home):
+        """With the ACTIVE unreadable there is no "re-triggers next tick" to
+        protect against — the number that would re-trigger is the one we
+        cannot read — so the landing-health gate must not apply. It cannot be
+        rescued by `all_above` either (`_every_account_above_threshold` is
+        False on a None active), so without the exception `n` reports
+        no-qualifying-candidate on a fleet `failover` escapes to happily."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        h.engine.request_switch()
+        outcome = h.tick_with_usage({"1": None, "2": _usage7(92, 92)})
+
+        assert outcome is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "manual"
+        assert h.active_number() == 2
+
+    def test_an_unmeasured_manual_departure_is_not_undone(self, temp_home):
+        """A manual switch off an UNREADABLE active records (None, None) —
+        the same shape a failover writes, because the same thing is true:
+        nothing was measurable. The no-return bar must therefore read it with
+        the failover legs. Read with the ordinary ones, `was = inf` and any
+        finite peer reset releases the bar on no evidence, so the first
+        proactive tick after the cooldown undoes the user's own switch.
+
+        Constructed so the ranking genuinely WANTS the account we left (the
+        all_above headroom ratio, 9 >= 4x2) and so the failover legs both
+        say no (the peer is itself over the threshold, and its reset is far
+        past the horizon rather than sooner than the active's) — the second
+        half proves the bar is what held it, by popping the record and
+        watching the same tick switch."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        h.engine.request_switch()
+        assert h.tick_with_usage(
+            {"1": None, "2": _usage7(92, 92)}
+        ) is TickOutcome.SWITCHED
+        assert h.state()["leftTrigger"] == "manual"
+        assert h.state()["leftHeadroom"] is None
+        assert h.state()["leftRecoveryAt"] is None
+        h.clock.advance(h.settings.cooldown_seconds + 1)
+        h.events.clear()
+
+        # Both over the threshold (all_above); #1 holds 9 points against the
+        # active's 4, which clears the horizon ratio. Its BINDING window is
+        # the weekly one (5h sits at 10), so it has a real, finite reset for
+        # the ordinary legs to mistake for recovery — and that reset is
+        # decades out, so the failover legs correctly see none.
+        later = {"1": _usage7(10, 91, _R_SOON), "2": _usage7(96, 96)}
+        outcome = h.tick_with_usage(later)
+        assert outcome is not TickOutcome.SWITCHED
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+        assert h.active_number() == 2
+
+        # ...and the ranking really did want it: without the record there is
+        # nothing to bar, and the identical tick moves.
+        h.engine._mutate_state(lambda st: st.pop("lastSwitchFrom", None))
+        h.events.clear()
+        assert h.tick_with_usage(later) is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_all_above_manual_takes_the_soonest_recovery(self, temp_home):
+        """With the whole fleet at/over the threshold the strategy question
+        is moot and both strategies rank by binding-window recovery. Manual
+        keeps that axis and drops only its hysteresis: here BOTH candidates
+        recover LATER than the active, so a proactive tick refuses them
+        outright, and `n` takes the sooner of the two."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        usage = {
+            "1": _usage75(95, 10, _R_LATEST, reset5=_iso_at(now + 600)),
+            "2": _usage75(95, 10, _R_LATEST, reset5=_iso_at(now + 3600)),
+            "3": _usage75(95, 10, _R_LATEST, reset5=_iso_at(now + 7200)),
+        }
+
+        assert h.tick_with_usage(usage) is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        h.events.clear()
+
+        h.engine.request_switch()
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "manual"
+        assert h.active_number() == 2
+
+    def test_consume_first_manual_says_why_an_api_key_fleet_is_untakeable(
+        self, temp_home
+    ):
+        """The API-key last resort is closed to manual-under-consume-first
+        (an API-key account has no weekly window to consume, whoever asked),
+        so with no OAuth peer at all there is nothing to take. That is not
+        `no-comparison` — the fleet is not unreadable, it is unsuitable — and
+        saying so is the difference between "cswap is thinking" and "`n` is
+        broken"."""
+        h = EngineHarness(
+            temp_home, strategy="consume-first", include_api_key_accounts=True
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("a@example.com", 1)
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["2"]["kind"] = "api_key"
+        h.switcher._write_json(h.switcher.sequence_file, data)
+
+        h.engine.request_switch()
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATEST), "2": "api key",
+        })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
+            "no-oauth-candidate"
+        ]
+
+    def test_refusal_detail_never_blames_a_margin_manual_waived(self, harness):
+        """`manual` waives the hysteresis margin, so naming it in the refusal
+        would send the user hunting for a setting that had nothing to do with
+        the outcome."""
+        harness.engine.request_switch()
+        harness.tick_with_usage({
+            "1": _usage7(30, 30), "2": _usage7(96, 96), "3": _usage7(97, 97),
+        })
+        refusal = next(
+            e
+            for e in harness.events
+            if isinstance(e, NoSwitchEvent) and e.reason == "no-qualifying-candidate"
+        )
+        assert "hysteresis" not in refusal.detail
+        assert "below the threshold" in refusal.detail
+
+    def test_dry_run_manual_is_a_preview(self, temp_home):
+        """`n` in DRY-RUN reports the move it would make and writes nothing —
+        the same contract every other trigger has there."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        h.engine = h._make_engine(dry_run=True)
+
+        h.engine.request_switch()
+        with patch.object(h.switcher, "switch_to") as mock_switch:
+            outcome = h.tick_with_usage({"1": _usage7(30, 30), "2": _usage7(25, 25)})
+
+        assert outcome is TickOutcome.SWITCHED
+        mock_switch.assert_not_called()
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.dry_run is True and sw.trigger == "manual"
+        assert h.active_number() == 1
+        assert h.state() == {}

@@ -363,6 +363,7 @@ class PollEvent(AutoSwitchEvent):
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
     trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first"
+    #             | "manual" (one-shot request from the TUI's "switch now")
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -755,6 +756,9 @@ class AutoSwitchEngine:
         # Cuts the current inter-tick sleep short (a session threshold change
         # from the TUI should show a fresh decision now, not next interval).
         self._wake = threading.Event()
+        # One-shot "switch now" request from the TUI (see ``request_switch``).
+        # Consumed by the next tick, which then decides with trigger "manual".
+        self._switch_now = threading.Event()
         self._unhealthy_ticks = 0
         # Both set per tick: a known-reset sleep target, and whether a BLOCKED
         # outcome is static enough (truly exhausted / no candidates) to wait
@@ -977,6 +981,12 @@ class AutoSwitchEngine:
             return TickOutcome.ERROR
 
     def _tick_inner(self) -> TickOutcome:
+        # Consume the one-shot request FIRST and unconditionally: whatever this
+        # tick decides (including the early returns below), the request is
+        # spent, so a `n` press can never queue up and fire a surprise switch
+        # several ticks later.
+        manual = self._switch_now.is_set()
+        self._switch_now.clear()
         self._sleep_until_ts = None
         self._blocked_wait_long = False
         self._idle_hold_slow = False
@@ -1065,7 +1075,12 @@ class AutoSwitchEngine:
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
             if utilization < settings.threshold:
-                if settings.strategy != "consume-first":
+                # `and not manual`: a "switch now" request must not be
+                # answered with "you are below the threshold". The provisional
+                # `trigger = "consume-first"` it then falls through to is
+                # overwritten by the `if manual:` block below, whatever the
+                # strategy; only the early return is being skipped here.
+                if settings.strategy != "consume-first" and not manual:
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
@@ -1085,6 +1100,13 @@ class AutoSwitchEngine:
                 trigger = "consume-first"
             else:
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
+        elif manual:
+            # The user asked to move NOW, so neither piece of unknown-usage
+            # bookkeeping applies: no idle-hold nap (its whole point is that
+            # nobody is waiting) and no unhealthy counting toward failover
+            # (`_unhealthy_ticks` is deliberately left where it was — a manual
+            # switch is not evidence about the active account's health).
+            trigger = "manual"
         else:
             if usage.get(current) == USAGE_TOKEN_EXPIRED:
                 # Expired and the refresh could not complete this pass (lock
@@ -1132,6 +1154,17 @@ class AutoSwitchEngine:
                 )
                 return TickOutcome.NO_ACTION
             trigger = "failover"
+
+        if manual:
+            # `n` in the TUI (``request_switch``). Everything above still runs:
+            # the unmanaged/absent-active and active-API-key exits are about
+            # whether this engine may act at all, not about when. From here the
+            # utilization classification is discarded — the human has already
+            # made that call — and the ranking follows the configured strategy
+            # minus the anti-flap margins (see ``_rank_candidates``). The
+            # cooldown below and in `_perform` stays scoped to the proactive
+            # triggers, so a manual switch is never refused for being recent.
+            trigger = "manual"
 
         if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
@@ -1273,7 +1306,7 @@ class AutoSwitchEngine:
             now=decided_now,
         )
 
-        if trigger == "consume-first" and ordered:
+        if trigger in ("consume-first", "manual") and ordered:
             # Two-phase commit: the provisional pick may have ridden a
             # snapshot up to CANDIDATE_MAX_INTERVAL_S stale — consume-first
             # decides below the threshold, where the collector only escalates
@@ -1304,13 +1337,38 @@ class AutoSwitchEngine:
                 now=decided_now,
             )
 
-        if not ordered and api_key_candidates and trigger != "consume-first":
+        if (
+            not ordered
+            and api_key_candidates
+            and trigger != "consume-first"
+            and not (trigger == "manual" and consume_first)
+        ):
             # Last resort when we must move: metered API-key accounts
             # (unmeasurable headroom). Never for a below-threshold consume-first
             # nudge — those API-key accounts have no weekly window to consume.
+            # A `manual` request follows its STRATEGY here rather than its
+            # urgency: under consume-first an API-key account is not a
+            # consumable target whoever asked for the move.
             ordered = api_key_candidates
 
         if not ordered:
+            if (
+                trigger == "manual"
+                and consume_first
+                and not oauth_candidates
+                and api_key_candidates
+            ):
+                # The API-key last resort above is deliberately closed to
+                # this combination, so the fleet is not "unreadable" (the
+                # `no-comparison` story below) — it holds nothing this
+                # strategy can target. Say so, or `n` looks broken.
+                self._emit(
+                    NoSwitchEvent(
+                        reason="no-oauth-candidate",
+                        detail="consume-first never targets API-key accounts",
+                    )
+                )
+                return TickOutcome.NO_ACTION
             if not any_known:
                 # No candidate readable this tick — true for every strategy,
                 # and must not be dressed up as a consume-first hold.
@@ -1365,10 +1423,17 @@ class AutoSwitchEngine:
                 self._emit(
                     NoSwitchEvent(
                         reason="no-qualifying-candidate",
+                        # Trigger-aware: `manual` waives the hysteresis
+                        # margin, so naming it would send the user hunting
+                        # for a setting that had nothing to do with it.
                         detail=(
-                            "no candidate is below the threshold and better "
-                            "than the active account by the hysteresis "
-                            "margin, or usage is unreadable this tick"
+                            "no candidate is below the threshold, or usage "
+                            "is unreadable this tick"
+                            if trigger == "manual"
+                            else "no candidate is below the threshold and "
+                            "better than the active account by the "
+                            "hysteresis margin, or usage is unreadable "
+                            "this tick"
                         ),
                     )
                 )
@@ -1723,9 +1788,27 @@ class AutoSwitchEngine:
         # this field existed has no such key, so fall back to the old
         # two-null inference for it (unchanged behaviour for pre-upgrade
         # state).
+        #
+        # A `manual` departure from an UNREADABLE active writes the same two
+        # nulls for the same reason a failover does — nothing was measurable
+        # to record — so it must take the same legs. An unmeasured departure
+        # is unmeasured whoever asked for it, and the ordinary legs read
+        # `was = inf` from those nulls and release the bar unconditionally,
+        # which lets the first proactive tick after the cooldown undo the
+        # user's own switch. SCOPED to `manual`, and to BOTH nulls: the
+        # consume-first split shape above is the one case that must not take
+        # these legs, and a `manual` record with a measured baseline has a
+        # real one to diff against.
         left_trigger = state.get("leftTrigger")
         is_failover_snapshot = (
-            left_trigger == "failover"
+            (
+                left_trigger == "failover"
+                or (
+                    left_trigger == "manual"
+                    and left_headroom is None
+                    and left_recovery is None
+                )
+            )
             if left_trigger is not None
             else (left_headroom is None and left_recovery is None)
         )
@@ -1859,6 +1942,27 @@ class AutoSwitchEngine:
         no state writes — so the consume-first two-phase commit can run it
         twice per tick: on the stored snapshot to decide provisionally, then
         on the escalated refetch to re-verify before switching.
+
+        THE ``manual`` TRIGGER RANKS LIKE THE STRATEGY'S PROACTIVE PATH AND
+        WAIVES ITS MARGINS. It is `proactive_like` everywhere the strategy is
+        chosen — the landing-health gate, the ``all_above`` recovery axis, and
+        both key selections — so `n` takes the same row the "Next best" panel
+        shows. What it drops are the four ANTI-FLAP margins, each of which
+        exists to stop the ENGINE oscillating on its own: the `best`
+        hysteresis, the ``all_above`` recovery hysteresis, the headroom ratio,
+        and consume-first's strictly-sooner reset. A human asking for a switch
+        has already decided the move is worth it; refusing it because the gain
+        is under a margin would make the key inert exactly when it is pressed.
+        (The no-return bar goes with them, upstream: ``_no_return_account``
+        returns None for any trigger outside proactive/consume-first.)
+
+        THE LANDING-HEALTH GATE IS KEPT, though, and is not a margin: a
+        candidate at/over the threshold re-triggers on the very next tick, so
+        `n` would buy a switch and an immediate switch back. With every
+        candidate unhealthy, manual returns nothing and `_tick_inner` reports
+        no-qualifying-candidate. ONE exception, at the gate itself: with the
+        ACTIVE account unreadable there is no next trigger to protect against
+        and manual behaves as an escape.
         """
         # consume-first ranks a qualifying candidate cool-before-5h-hot,
         # then by soonest weekly reset, then soonest 5-hour reset, then
@@ -1869,6 +1973,12 @@ class AutoSwitchEngine:
         # always ranks by headroom instead, regardless of strategy, so it
         # lands on an account that can actually work rather than the one
         # nearest its own limit.
+        # Every gate and key below that asks "is this the strategy's own
+        # proactive path?" — as opposed to an at-limit/failover escape, which
+        # ranks by headroom whatever the strategy. `manual` joins that set: it
+        # follows the strategy and only the anti-flap margins are waived
+        # inside, by explicit `trigger == "manual"` tests. See the docstring.
+        proactive_like = trigger in ("proactive", "consume-first", "manual")
         active_reset_ts = (
             _seven_day_reset_ts(usage.get(current), now) if consume_first else None
         )
@@ -1937,12 +2047,26 @@ class AutoSwitchEngine:
                 if all_above
                 else 0.0
             )
-            if trigger in ("proactive", "consume-first"):
+            if proactive_like:
                 # Landing must be healthy: an account at/over the threshold
                 # would re-trigger on the very next tick. At-limit and failover
                 # are escapes that skip this whole block — any account with real
                 # headroom beats a blocked or dead one.
-                if (100.0 - h) >= settings.threshold and not all_above:
+                if (
+                    (100.0 - h) >= settings.threshold
+                    and not all_above
+                    and not (trigger == "manual" and active_headroom is None)
+                ):
+                    # `manual` with an UNREADABLE active is an escape, not an
+                    # optimisation: there is no "re-triggers next tick" to
+                    # protect against, because the thing that would re-trigger
+                    # is the number we cannot read. `all_above` cannot rescue
+                    # it either — `_every_account_above_threshold` is False
+                    # whenever `active_headroom is None` — so without this the
+                    # request would be spent on `no-qualifying-candidate`
+                    # while `failover` from the same state switches happily.
+                    # Any candidate with headroom > 0 qualifies; the strategy
+                    # key below still decides WHICH.
                     continue
                 if all_above:
                     # Checked before the strategies, because with nothing below
@@ -1968,7 +2092,13 @@ class AutoSwitchEngine:
                         best_candidate_headroom,
                         now,
                     )
-                    if by_recovery:
+                    if trigger == "manual":
+                        # Both branches below are anti-flap margins; a human
+                        # asking to move now has overridden them. `by_recovery`
+                        # is still computed above — it picks the KEY, which is
+                        # the strategy question, not a margin.
+                        pass
+                    elif by_recovery:
                         # Hysteresis on the axis we actually rank by. It bounds
                         # the flap RATE rather than making a reverse move
                         # impossible: the target must come back meaningfully
@@ -2001,13 +2131,15 @@ class AutoSwitchEngine:
                         or reset_ts >= active_reset_ts
                     ):
                         continue
-                elif active_headroom is not None:
+                elif active_headroom is not None and trigger != "manual":
                     # best: the candidate must beat the active account by the
                     # full hysteresis margin (a one-way move like 99%→89%
-                    # qualifies; near-line pairs can't flap back).
+                    # qualifies; near-line pairs can't flap back). Waived for
+                    # `manual`: the margin bounds the engine's own flap rate,
+                    # and there is no flap to bound when a human presses a key.
                     if h - active_headroom < settings.hysteresis_pct:
                         continue
-            if all_above and trigger in ("proactive", "consume-first"):
+            if all_above and proactive_like:
                 # Ranked on the axis its own gate decided, and TIERED so the two
                 # stay comparable: a candidate returning inside the horizon
                 # beats one that does not, whatever its headroom. Untiered, the
@@ -2032,7 +2164,7 @@ class AutoSwitchEngine:
                 key: tuple = (
                     (0, recovery_ts, -h) if by_recovery else (1, -h, recovery_ts)
                 )
-            elif consume_first and trigger in ("proactive", "consume-first"):
+            elif consume_first and proactive_like:
                 # Cool candidates before 5h-hot ones, then soonest weekly
                 # reset (unknown last), then soonest 5-hour reset breaks a
                 # weekly tie, then — the opposite of `best`'s ``-h`` below —
@@ -2388,6 +2520,18 @@ class AutoSwitchEngine:
 
     def wake(self) -> None:
         """Cut the current inter-tick sleep short and tick now."""
+        self._wake.set()
+
+    def request_switch(self) -> None:
+        """One-shot "switch now" request from the TUI, for THIS session only.
+
+        Sets a flag the NEXT tick consumes (and clears) before deciding, then
+        wakes the loop so that tick happens immediately. The tick then decides
+        with trigger ``"manual"``: the strategy's own ranking, without the
+        anti-flap margins or the cooldown. Nothing is persisted — a request
+        that a tick has already spent cannot fire twice, and a request made
+        while the engine is stopping simply dies with it."""
+        self._switch_now.set()
         self._wake.set()
 
     def apply_threshold(self, threshold: float) -> None:

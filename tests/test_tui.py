@@ -48,15 +48,21 @@ def make_entry(
     age_s: float = 5.0,
     scoped: list[tuple[str, float]] | None = None,
     spend: dict | None = None,
+    reset5_in: float = 7200,
+    reset7_in: float = 86400 * 3,
 ) -> UsageEntry:
-    """``pct5``/``pct7`` of None omit that window (e.g. annual plans lack 7d)."""
+    """``pct5``/``pct7`` of None omit that window (e.g. annual plans lack 7d).
+
+    ``reset5_in``/``reset7_in`` are seconds from now to that window's
+    ``resets_at`` — the consume-first ranking is entirely about their order.
+    """
     if sentinel is not None:
         return UsageEntry(sentinel=sentinel)
     last_good: dict = {}
     if pct5 is not None:
-        last_good["five_hour"] = {"pct": pct5, "resets_at": _iso_in(7200)}
+        last_good["five_hour"] = {"pct": pct5, "resets_at": _iso_in(reset5_in)}
     if pct7 is not None:
-        last_good["seven_day"] = {"pct": pct7, "resets_at": _iso_in(86400 * 3)}
+        last_good["seven_day"] = {"pct": pct7, "resets_at": _iso_in(reset7_in)}
     if scoped is not None:
         last_good["scoped"] = [
             {"name": name, "pct": pct, "resets_at": _iso_in(86400 * 2)}
@@ -1530,6 +1536,350 @@ class TestAutoScreen:
             assert plain.index("user3@example.com") < plain.index(
                 "user2@example.com"
             )
+
+    # -- consume-first: the panel follows the engine's strategy --------------
+
+    def _consume_first_app(self, tmp_path, accounts, **autoswitch):
+        """FakeSwitcher + app with `strategy: consume-first` on disk."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"strategy": "consume-first", **autoswitch},
+        }))
+        return make_app(FakeSwitcher(accounts, tmp_path))
+
+    def _candidates(self, app) -> str:
+        from textual.widgets import Static
+
+        return app.screen.query_one("#candidates", Static).render().plain
+
+    def _muted_rows(self, app) -> set[str]:
+        """Emails whose whole row carries the muted style.
+
+        `_candidates_text` mutes a row by stylizing the entry end to end, so
+        a muted row is one where a muted span spans its email; an unmuted row
+        only carries the per-field spans (foreground e-mail, severity pct).
+        """
+        from textual.widgets import Static
+
+        from claude_swap.tui.theme import Palette
+
+        text = app.screen.query_one("#candidates", Static).render()
+        muted = Palette.from_theme(app.current_theme).muted
+        plain = text.plain
+        rows: set[str] = set()
+        for span in text.spans:
+            # Textual resolves the Text into `content.Content`, so the style
+            # arrives as a Style with a parsed Color rather than the hex
+            # string that was appended; accept either.
+            style = span.style
+            fg = getattr(style, "foreground", None)
+            resolved = str(getattr(fg, "hex", fg) if fg is not None else style)
+            if resolved.lower() != muted.lower():
+                continue
+            for acc in app.switcher._accounts:
+                at = plain.find(acc.email)
+                if at >= 0 and span.start <= at and span.end >= at + len(acc.email):
+                    rows.add(acc.email)
+        return rows
+
+    async def test_candidates_ranked_by_weekly_reset_under_consume_first(
+        self, tmp_path, fake_engine
+    ):
+        """Headroom order and weekly-reset order disagree on purpose: #2 has
+        the least room and the soonest weekly reset, so `best` would rank it
+        last and consume-first must rank it FIRST — the perishable quota is
+        the one worth spending."""
+        app = self._consume_first_app(
+            tmp_path,
+            [
+                make_account(
+                    1, active=True, entry=make_entry(20.0, 20.0, reset7_in=86400 * 9)
+                ),
+                make_account(2, entry=make_entry(10.0, 40.0, reset7_in=86400)),
+                make_account(3, entry=make_entry(10.0, 10.0, reset7_in=86400 * 4)),
+            ],
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            plain = self._candidates(app)
+            assert plain.index("user2@example.com") < plain.index(
+                "user3@example.com"
+            ), "consume-first ranks the soonest weekly reset first"
+
+    async def test_candidates_hot_five_hour_ranks_last_under_consume_first(
+        self, tmp_path, fake_engine
+    ):
+        """The 5h-hot demotion, on screen: #2 still resets soonest, but its
+        5-hour window sits at the bar (threshold 90 - hysteresis 10 = 80), so
+        it ranks behind the cool #3 and says why."""
+        app = self._consume_first_app(
+            tmp_path,
+            [
+                make_account(
+                    1, active=True, entry=make_entry(20.0, 20.0, reset7_in=86400 * 9)
+                ),
+                make_account(2, entry=make_entry(80.0, 5.0, reset7_in=86400)),
+                make_account(3, entry=make_entry(10.0, 40.0, reset7_in=86400 * 4)),
+            ],
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            plain = self._candidates(app)
+            assert plain.index("user3@example.com") < plain.index(
+                "user2@example.com"
+            ), "a 5h-hot candidate ranks behind every cool one"
+            assert "5h hot" in plain
+            # Nothing else can explain that order: #2 resets sooner AND holds
+            # the emptier weekly window (5% vs 40%). Only the tier demotes it.
+            assert plain.index("5h hot") > plain.index("user3@example.com")
+
+    async def test_candidates_show_reset_countdown_under_consume_first(
+        self, tmp_path, fake_engine
+    ):
+        app = self._consume_first_app(
+            tmp_path,
+            [
+                make_account(
+                    1, active=True, entry=make_entry(20.0, 20.0, reset7_in=86400 * 9)
+                ),
+                make_account(2, entry=make_entry(10.0, 10.0, reset7_in=86400 + 3600)),
+            ],
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            plain = self._candidates(app)
+            # The axis the ranking is on has to be visible next to the pct.
+            assert "resets 1d" in plain, plain
+
+    async def test_summary_shows_strategy_and_model(self, tmp_path, fake_engine):
+        app = self._consume_first_app(
+            tmp_path,
+            [make_account(1, active=True), make_account(2)],
+            model="Fable",
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            summary = app.screen.query_one("#auto-summary", Static).render().plain
+            assert "model Fable" in summary
+            assert "consume-first" in summary
+            assert "(session)" not in summary  # both came from the file
+
+    async def test_summary_states_account_wide_when_no_model_configured(
+        self, tmp_path, fake_engine
+    ):
+        """An unset autoswitch.model is a decision input too (5h/7d only) —
+        rendered, so a missing token is never read as a render gap."""
+        app = self._consume_first_app(
+            tmp_path, [make_account(1, active=True), make_account(2)]
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            summary = app.screen.query_one("#auto-summary", Static).render().plain
+            assert "model account-wide" in summary
+
+    async def test_strategy_toggle_is_session_only(self, tmp_path, fake_engine):
+        """`s` flips the strategy in memory, rebuilds the engine (it reads
+        settings at construction) and re-ranks the panel — and writes
+        nothing: `cswap config set` stays the only persistent path."""
+        import json as _json
+
+        accounts = [
+            make_account(
+                1, active=True, entry=make_entry(20.0, 20.0, reset7_in=86400 * 9)
+            ),
+            make_account(2, entry=make_entry(10.0, 40.0, reset7_in=86400)),
+            make_account(3, entry=make_entry(10.0, 10.0, reset7_in=86400 * 4)),
+        ]
+        app = self._consume_first_app(tmp_path, accounts)
+        on_disk = (tmp_path / "settings.json").read_text()
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            screen = app.screen
+            plain = self._candidates(app)
+            assert plain.index("user2@example.com") < plain.index(
+                "user3@example.com"
+            )
+            await pilot.press("s")
+            await settle(pilot)
+            assert screen._settings.strategy == "best"
+            from textual.widgets import Static
+
+            summary = screen.query_one("#auto-summary", Static).render().plain
+            assert "best (session)" in summary
+            # engine rebuilt from the flipped copy, same dry-run state
+            assert len(fake_engine.instances) == 2
+            assert fake_engine.instances[0].stopped is True
+            assert fake_engine.instances[1].settings.strategy == "best"
+            assert fake_engine.instances[1].dry_run is True
+            # ...and the panel re-ranked: `best` prefers the most headroom
+            plain = self._candidates(app)
+            assert plain.index("user3@example.com") < plain.index(
+                "user2@example.com"
+            )
+            assert "resets" not in plain  # best keeps today's rendering
+            # nothing persisted
+            assert (tmp_path / "settings.json").read_text() == on_disk
+            await pilot.press("s")
+            await settle(pilot)
+            assert screen._settings.strategy == "consume-first"
+            summary = screen.query_one("#auto-summary", Static).render().plain
+            assert "(session)" not in summary  # back to the configured value
+
+    async def test_candidates_mute_the_rows_the_trigger_would_skip(
+        self, tmp_path, fake_engine
+    ):
+        """Below the threshold the proactive gate only moves to an account
+        whose weekly window resets STRICTLY sooner than the active one, so #3
+        (resets later) is greyed and #2 (sooner) is not — the panel answers
+        "why didn't it move" without the log."""
+        app = self._consume_first_app(
+            tmp_path,
+            [
+                make_account(
+                    1, active=True, entry=make_entry(20.0, 20.0, reset7_in=86400 * 4)
+                ),
+                make_account(2, entry=make_entry(10.0, 10.0, reset7_in=86400)),
+                make_account(3, entry=make_entry(10.0, 10.0, reset7_in=86400 * 9)),
+            ],
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            assert self._muted_rows(app) == {"user3@example.com"}
+
+    async def test_candidates_over_threshold_row_is_muted_and_last(
+        self, tmp_path, fake_engine
+    ):
+        """The engine's landing gate runs before its key: an account at/over
+        the threshold re-triggers on the next tick and is never a proactive
+        target, however soon its week resets. #2 resets soonest and is at 95%
+        — it must render last AND greyed, not first."""
+        app = self._consume_first_app(
+            tmp_path,
+            [
+                make_account(
+                    1, active=True, entry=make_entry(20.0, 20.0, reset7_in=86400 * 9)
+                ),
+                # 5h cool (10%) so only the health tier is in play
+                make_account(2, entry=make_entry(10.0, 95.0, reset7_in=86400)),
+                make_account(3, entry=make_entry(10.0, 10.0, reset7_in=86400 * 4)),
+            ],
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            plain = self._candidates(app)
+            assert plain.index("user3@example.com") < plain.index(
+                "user2@example.com"
+            ), "an unhealthy landing must never rank first"
+            assert self._muted_rows(app) == {"user2@example.com"}
+
+    async def test_candidates_idle_when_active_weekly_reset_unknown(
+        self, tmp_path, fake_engine
+    ):
+        """Below the threshold with the active account's weekly reset
+        unreported, the engine's gate can never pass (it holds with
+        "reset-unknown"). Every row is greyed and the panel says why, instead
+        of showing a ranking nothing would act on."""
+        app = self._consume_first_app(
+            tmp_path,
+            [
+                # no 7d window at all: the reset is unknown, pct is the 5h 20%
+                make_account(1, active=True, entry=make_entry(20.0, None)),
+                make_account(2, entry=make_entry(10.0, 10.0, reset7_in=86400)),
+                make_account(3, entry=make_entry(10.0, 10.0, reset7_in=86400 * 4)),
+            ],
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            assert "consume-first idle until" in self._candidates(app)
+            assert self._muted_rows(app) == {
+                "user2@example.com",
+                "user3@example.com",
+            }
+
+    async def test_unreadable_rows_still_sort_last_under_consume_first(
+        self, tmp_path, fake_engine
+    ):
+        """Mixed key shapes in one list: a sentinel row and an unknown-usage
+        row keep their 998/999 buckets next to consume-first's tiered tuple —
+        they sort last and comparing the two shapes raises nothing."""
+        app = self._consume_first_app(
+            tmp_path,
+            [
+                make_account(
+                    1, active=True, entry=make_entry(20.0, 20.0, reset7_in=86400 * 9)
+                ),
+                make_account(2, entry=make_entry(sentinel=USAGE_TOKEN_EXPIRED)),
+                make_account(3, entry=make_entry(None, None)),
+                make_account(4, entry=make_entry(10.0, 10.0, reset7_in=86400)),
+            ],
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            plain = self._candidates(app)
+            assert plain.index("user4@example.com") < plain.index(
+                "user2@example.com"
+            )
+            assert plain.index("user4@example.com") < plain.index(
+                "user3@example.com"
+            )
+            assert "usage unknown" in plain
+
+    async def test_session_threshold_survives_the_strategy_toggle(
+        self, tmp_path, fake_engine
+    ):
+        """The two session overrides are independent: `s` rebuilds the engine
+        from `self._settings`, which still carries the adjusted threshold —
+        rebuilding from the file would silently drop it."""
+        app = self._consume_first_app(
+            tmp_path, [make_account(1, active=True), make_account(2)]
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await pilot.press("t", "right", "enter")
+            await pilot.pause()
+            screen = app.screen
+            assert screen._settings.threshold == 91.0
+            await pilot.press("s")
+            await settle(pilot)
+            assert screen._settings.threshold == 91.0
+            engine = fake_engine.instances[-1]
+            assert engine.settings.threshold == 91.0
+            assert engine.settings.strategy == "best"
+            from textual.widgets import Static
+
+            summary = screen.query_one("#auto-summary", Static).render().plain
+            assert "threshold 91% (session)" in summary
+            assert "best (session)" in summary
+
+    async def test_strategy_toggle_is_inert_in_threshold_adjust_mode(
+        self, tmp_path, fake_engine
+    ):
+        app = self._consume_first_app(
+            tmp_path, [make_account(1, active=True), make_account(2)]
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await pilot.press("t", "s")
+            await pilot.pause()
+            screen = app.screen
+            assert screen._settings.strategy == "consume-first"
+            assert len(fake_engine.instances) == 1  # no restart
 
 
 class TestEventText:

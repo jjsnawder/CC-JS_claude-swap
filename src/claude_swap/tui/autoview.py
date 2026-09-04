@@ -14,6 +14,7 @@ snapshot poller runs store-only: the engine is the only fetcher.
 
 from __future__ import annotations
 
+import time
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -24,10 +25,12 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Footer, RichLog, Static
 
+from claude_swap import oauth
 from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
     binding_pct,
+    consume_first_key,
     pct_label,
 )
 from claude_swap.models import AccountsSnapshot
@@ -66,6 +69,7 @@ class AutoScreen(Screen):
     BINDINGS = [
         Binding("l", "toggle_live", "Go live / dry-run"),
         Binding("t", "adjust_threshold", "Threshold"),
+        Binding("s", "toggle_strategy", "Strategy"),
         Binding("left", "threshold_step(-1)", "-1%"),
         Binding("right", "threshold_step(1)", "+1%"),
         Binding("enter", "adjust_done", "Done"),
@@ -86,6 +90,11 @@ class AutoScreen(Screen):
         self._adjusting = False
         self._configured_threshold: float | None = None
         self._entry_threshold: float | None = None
+        # Session-only strategy toggle (s), same memory-only contract as the
+        # threshold: ``_configured_strategy`` is the mount-time file value,
+        # and the summary tags the difference so a session override can never
+        # be mistaken for the persisted one (`cswap config set` is that path).
+        self._configured_strategy: str | None = None
 
     def compose(self) -> ComposeResult:
         yield AccountsPanel(show_minis=False, id="auto-active-panel")
@@ -107,6 +116,7 @@ class AutoScreen(Screen):
         # and remember that value: unmount restores it (only the session
         # adjustment reverts, not this correction).
         self._configured_threshold = self._settings.threshold
+        self._configured_strategy = self._settings.strategy
         self.app.threshold_pct = self._settings.threshold
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
@@ -141,6 +151,8 @@ class AutoScreen(Screen):
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         if action in ("threshold_step", "adjust_done") and not self._adjusting:
             return False  # hidden and inert until adjust mode is armed
+        if action == "toggle_strategy" and self._adjusting:
+            return False  # the keys belong to the threshold while it is armed
         return True
 
     def action_adjust_threshold(self) -> None:
@@ -189,6 +201,41 @@ class AutoScreen(Screen):
         self.query_one("#auto-active-panel", AccountsPanel).refresh()
         self._update_summary()
 
+    # -- strategy toggle ------------------------------------------------------
+
+    def action_toggle_strategy(self) -> None:
+        """Flip best <-> consume-first for this session only.
+
+        Nothing is written to settings.json (`cswap config set
+        autoswitch.strategy` stays the persistent path) -- but the engine
+        reads its settings at CONSTRUCTION, so the flip only reaches the
+        decision by rebuilding it, preserving the dry-run/live state.
+        """
+        if self._settings is None or self._adjusting:
+            return
+        # Cycle the configured choices, so a third upstream strategy needs
+        # no change here (an unknown value lands on the first choice).
+        choices = SETTING_SPECS["autoswitch.strategy"].choices
+        current = (
+            choices.index(self._settings.strategy)
+            if self._settings.strategy in choices
+            else -1
+        )
+        flipped = choices[(current + 1) % len(choices)]
+        self._settings = replace(self._settings, strategy=flipped)
+        if self._engine is not None:
+            self._restart_engine(dry_run=self._engine.dry_run)
+        self._update_summary()
+        snap = self.app.snapshot
+        if snap is not None:
+            self._on_snapshot(snap)  # "Next best" ranks by the new strategy
+        self.query_one("#event-log", RichLog).write(
+            Text(
+                f"— strategy set to {flipped} for this session —",
+                style=Palette.from_theme(self.app.current_theme).muted,
+            )
+        )
+
     def _update_summary(self) -> None:
         palette = Palette.from_theme(self.app.current_theme)
         text = Text()
@@ -200,6 +247,15 @@ class AutoScreen(Screen):
         if self._settings.threshold != self._configured_threshold:
             text.append(" (session)", style=palette.muted)
         text.append(f" · poll every {self._settings.interval_seconds:.0f}s")
+        # The other two decision inputs, on screen: which windows the
+        # threshold is measured against, and how the target is chosen.
+        models = parse_model_names(self._settings.model)
+        text.append(
+            f" · model {', '.join(models)}" if models else " · model account-wide"
+        )
+        text.append(f" · {self._settings.strategy}")
+        if self._settings.strategy != self._configured_strategy:
+            text.append(" (session)", style=palette.muted)
         if self._adjusting:
             text.append("   ← → adjust · enter done", style=palette.muted)
         self.query_one("#auto-summary", Static).update(text)
@@ -294,12 +350,64 @@ class AutoScreen(Screen):
     def _candidates_text(
         self, snap: AccountsSnapshot, active_number: str | None
     ) -> Text:
-        """Switch targets ranked by remaining headroom (best first)."""
-        # Same window set as the engine (autoswitch.model included), so the
-        # displayed ranking can never disagree with the account it picks.
+        """Switch targets in the order the PROACTIVE trigger would take.
+
+        ``best`` ranks by remaining headroom (least-used first).
+        ``consume-first`` ranks by ``autoswitch.consume_first_key`` -- the
+        engine's own key, imported rather than reimplemented -- inside a
+        health tier that mirrors the engine's landing gate, and annotates
+        each row with the weekly reset it ranks on, a ``5h hot`` marker for
+        the demoted tier, and muting for any row the proactive trigger
+        would not take right now, so "why did it not move" answers itself.
+
+        Scoped to that ONE trigger on purpose, and it is the common case
+        rather than the whole engine: an ``at-limit``/``failover`` escape
+        ranks by headroom whatever the strategy, and with every account
+        at/over the threshold the engine ranks by binding-window recovery
+        time instead. Neither is rendered here; a panel claiming to
+        predict all three would be wrong two ways.
+        """
+        # Same window set as the engine (autoswitch.model included), so a
+        # displayed pct can never disagree with the one it decides on.
         palette = Palette.from_theme(self.app.current_theme)
         models = parse_model_names(self._settings.model) if self._settings else ()
-        ranked: list[tuple[float, str]] = []  # (sort key: pct used, number)
+        consume_first = (
+            self._settings is not None
+            and self._settings.strategy == "consume-first"
+        )
+        now = time.time()
+        key_kwargs: dict = {}
+        threshold = self._settings.threshold if self._settings else 100.0
+        active_reset_ts = float("inf")
+        active_below = False
+        idle = False
+        if consume_first:
+            key_kwargs = dict(
+                threshold=threshold,
+                hysteresis_pct=self._settings.hysteresis_pct,
+                now=now,
+            )
+            active = next(
+                (a for a in snap.accounts if a.number == active_number), None
+            )
+            active_usage = active.usage.last_good if active is not None else None
+            active_pct = binding_pct(active_usage, models)
+            # Read through the same key so "sooner than the active account"
+            # inherits its past-is-unknown handling (a stale resets_at must
+            # not read as imminent).
+            active_reset_ts = consume_first_key(active_usage, None, **key_kwargs)[1]
+            # The reset comparison is the BELOW-threshold gate only: from
+            # at/over the threshold the engine must move and takes any healthy
+            # account, so muting on reset there would contradict it.
+            active_below = active_pct is not None and active_pct < threshold
+            # ...and below the threshold with the active reset unmeasured, the
+            # engine's gate can never pass ("reset-unknown"): nothing here is
+            # takeable until that number is reported.
+            idle = active_below and active_reset_ts == float("inf")
+        # (sort key, number) with a TUPLE key, so `best`'s single pct and
+        # consume-first's tiered key share one list. Unreadable rows keep
+        # their 998/999 buckets and sort after every keyed row.
+        ranked: list[tuple[tuple, str]] = []
         lines: dict[str, Text] = {}
         for acc in snap.accounts:
             if acc.number == active_number or not acc.switchable:
@@ -312,13 +420,44 @@ class AutoScreen(Screen):
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
                 )
-                ranked.append((998.0, acc.number))
+                ranked.append(((998.0,), acc.number))
             elif pct is None:
                 entry.append("  usage unknown", style=palette.muted)
-                ranked.append((999.0, acc.number))
+                ranked.append(((999.0,), acc.number))
+            elif consume_first:
+                entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
+                key = consume_first_key(
+                    acc.usage.last_good,
+                    # The engine's own headroom, not `100 - pct`: identical
+                    # today and immune to a future binding_pct that measures
+                    # something the headroom does not.
+                    oauth.account_headroom(acc.usage.last_good, models),
+                    **key_kwargs,
+                )
+                resets = data.window_reset_text(
+                    acc.usage.last_good, "seven_day", now
+                )
+                if resets is not None:
+                    entry.append(f" · {resets}", style=palette.muted)
+                if key[0]:
+                    entry.append("  5h hot", style=palette.muted)
+                # The engine's landing gate runs BEFORE its key: a candidate
+                # at/over the threshold re-triggers on the next tick, so it is
+                # never a proactive target however soon its week resets. The
+                # panel tiers on the same test rather than only greying the
+                # row — untiered, an unhealthy account still rendered first
+                # and read as the engine's next pick.
+                unhealthy = pct >= threshold
+                if unhealthy or (active_below and key[1] >= active_reset_ts):
+                    # Muted, still RANKED: this is the order the engine would
+                    # use the moment the account becomes eligible.
+                    entry.stylize(palette.muted)
+                ranked.append(((0.0, 1 if unhealthy else 0) + key, acc.number))
             else:
                 entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
-                ranked.append((pct, acc.number))
+                ranked.append(((pct,), acc.number))
+            if idle:
+                entry.stylize(palette.muted)  # nothing here is takeable
             lines[acc.number] = entry
 
         text = Text()
@@ -326,6 +465,16 @@ class AutoScreen(Screen):
         if not ranked:
             text.append("\n  no other switchable accounts", style=palette.muted)
             return text
-        for _pct, number in sorted(ranked):
+        if idle:
+            text.append(
+                "\n  consume-first idle until the active account's weekly "
+                "reset is reported",
+                style=palette.muted,
+            )
+        # Key only: `ranked` is in snapshot (sequence) order and sort is
+        # stable, so a full tie falls through to sequence order exactly as the
+        # engine's does. Sorting the pairs compared the account NUMBER as a
+        # string on ties, where "10" precedes "2".
+        for _key, number in sorted(ranked, key=lambda t: t[0]):
             text.append(lines[number])
         return text

@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_swap.autoswitch import NoSwitchEvent, SwitchEvent
+from claude_swap.autoswitch import NoSwitchEvent, PollEvent, SwitchEvent
 from claude_swap.json_output import USAGE_API_KEY, USAGE_TOKEN_EXPIRED
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -1947,6 +1947,50 @@ class TestEventText:
         )
         text = event_text(event, palette=Palette.from_theme(CSWAP_LIGHT))
         assert any(ACCENT_LIGHT in str(s.style) for s in text.spans)
+
+    @staticmethod
+    def _styles_at(text, needle: str) -> set[str]:
+        at = text.plain.index(needle)
+        return {
+            str(s.style).lower()
+            for s in text.spans
+            if s.start <= at and s.end >= at + len(needle)
+        }
+
+    def test_poll_line_lifts_stamp_and_used_out_of_the_grey(self):
+        """Clock stamp and the active account's `N% used` are foreground;
+        everything else on a poll line is muted, so key times and the one
+        number that matters can be picked out of a scrolling log."""
+        from claude_swap.tui.autoview import event_text
+        from claude_swap.tui.theme import Palette
+
+        palette = Palette.DARK
+        event = PollEvent(
+            active={"number": 1, "email": "a@x.com"},
+            headroom={"1": 63.0, "2": 90.0},
+            threshold=95.0,
+        )
+        text = event_text(event, palette=palette)
+        fg, muted = palette.foreground.lower(), palette.muted.lower()
+        stamp = text.plain.split("  ", 1)[0]
+        assert fg in self._styles_at(text, stamp)
+        assert self._styles_at(text, "37% used") == {fg}
+        assert self._styles_at(text, "(switch at 95%)") == {muted}
+        assert self._styles_at(text, "Account-1 (a@x.com)") == {muted}
+        assert muted not in self._styles_at(text, "37% used")
+
+    def test_non_poll_lines_keep_a_foreground_stamp_and_muted_body(self):
+        from claude_swap.tui.autoview import event_text
+        from claude_swap.tui.theme import Palette
+
+        palette = Palette.DARK
+        text = event_text(
+            NoSwitchEvent(reason="below-threshold", detail="37% < 95%"),
+            palette=palette,
+        )
+        stamp = text.plain.split("  ", 1)[0]
+        assert palette.foreground.lower() in self._styles_at(text, stamp)
+        assert self._styles_at(text, "below-threshold") == {palette.muted.lower()}
 
 
 # ---------------------------------------------------------------------------

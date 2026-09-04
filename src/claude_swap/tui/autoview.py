@@ -14,6 +14,7 @@ snapshot poller runs store-only: the engine is the only fetcher.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import replace
 from typing import TYPE_CHECKING
@@ -49,19 +50,31 @@ _EVENT_ROLES = {
     "account-quarantined": "sev_warn",
     "all-exhausted": "sev_crit",
 }
-_QUIET_KINDS = {"poll", "no-switch", "sleep", "account-unquarantined"}
+
+
+_USED_RE = re.compile(r"\): (\d+% used) ")
 
 
 def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Text:
-    """Log line for one engine event, styled like the CLI's human renderer."""
+    """Log line for one engine event, styled like the CLI's human renderer.
+
+    The clock stamp is always foreground so key times stand out of a scrolling
+    log; the body is muted unless the event kind carries a role colour
+    (switch, error, quarantine, exhausted). A poll line's active-account
+    ``N% used`` is lifted to foreground too — the one number worth reading.
+    """
     role = _EVENT_ROLES.get(event.kind)
-    if role is not None:
-        style = getattr(palette, role)
-    else:
-        style = palette.muted if event.kind in _QUIET_KINDS else palette.foreground
+    style = getattr(palette, role) if role is not None else palette.muted
     text = Text()
-    text.append(f"{data.clock_stamp()}  ", style=palette.muted)
-    text.append(event.human(), style=style)
+    text.append(f"{data.clock_stamp()}  ", style=palette.foreground)
+    body = event.human()
+    match = _USED_RE.search(body) if event.kind == "poll" else None
+    if match is None:
+        text.append(body, style=style)
+        return text
+    text.append(body[: match.start(1)], style=style)
+    text.append(match.group(1), style=palette.foreground)
+    text.append(body[match.end(1) :], style=style)
     return text
 
 

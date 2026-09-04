@@ -1,3 +1,4 @@
+# --- upstream (realiti4/claude-swap) ---
 # Python-generated files
 __pycache__/
 *.py[oc]
@@ -11,3 +12,16 @@ wheels/
 
 # superpowers session planning artifacts (not part of the project)
 docs/superpowers/
+
+# --- fork additions (WAT scaffold, 2026-09-04) ---
+# Scratch - regenerable, never committed
+.tmp/
+.pytest_cache/
+
+# Secrets - none expected in this project, blocked defensively (WAT rule)
+.env
+credentials.json
+token.json
+
+# This repo is PUBLIC: per-session usage/cost recaps stay local
+docs/model-usage.md

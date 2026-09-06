@@ -1,6 +1,6 @@
 # Plan — Warmup: staggered 5-hour windows across all accounts
 
-Date: 2026-09-06 · Branch: `jeremy` · Status: **planned — building**
+Date: 2026-09-06 · Branch: `jeremy` · Status: **built — awaiting Jeremy's live slot trial**
 Depends on: `2026-09-04-auto-screen-switch-now.md` (shipped).
 
 ## Ask (Jeremy, 2026-09-06 evening)
@@ -40,8 +40,12 @@ Answers that shaped the design (asked and answered 2026-09-06):
 - Launch (`session.py`): `SessionManager.setup_session(identifier, share)` does
   the whole gate / validate / bootstrap / share-copy sequence and returns
   `(session_dir, num, email)` **without** exec'ing — the entry point for a
-  headless spawn. It **refuses the active default login** (a slot copy of the
-  live login would drift). Credential sync is one-way store → slot; the slot's
+  headless spawn. ~~It refuses the active default login~~ **Corrected by
+  `deep` 2026-09-06:** the refusal lives in `run()` (`session.py:546-560`) and
+  only when `CLAUDE_CONFIG_DIR` is unset; `setup_session` itself would happily
+  build a slot for the live login, so the warmup's own `number == active`
+  comparison is the only thing keeping the active hello out of a slot dir.
+  Credential sync is one-way store → slot; the slot's
   `.credentials.json` rotates its own token family; usage fetch already prefers
   the slot file read-only. `AUTH_OVERRIDE_ENV_VARS` are scrubbed; env gets
   `CLAUDE_CONFIG_DIR=<slot>`. Nothing in the package runs Claude headless or
@@ -97,7 +101,8 @@ Three parts, all unit-testable without a network or a child process:
    - Worked case (4 cold at 08:00): pings at 08:00, 10:30, 09:15, 11:45 →
      resets 13:00 / 14:15 / 15:30 / 16:45, 75 min apart. Steady state: an
      account whose window lapses on phase has `|d| ≈ ping latency` → pings
-     immediately. Worst-case cold wait = `period·(N−1)/N` = 3 h 45 for N=4;
+     immediately. Worst-case cold wait = `period·(1 − 1/2N)` = 4 h 22 for
+     N=4 (3 h 45 in the bootstrap case; corrected by review 2026-09-06);
      a cold account is still fully usable (a switch onto it starts a fresh
      window), so the wait costs reset-nearness, never quota.
    - `stagger=False` → every cold account is `ping_now` (keep-alive).
@@ -149,10 +154,17 @@ Three parts, all unit-testable without a network or a child process:
      `WarmupEvent(action="would-ping")` only. `wait_until` → remember the
      earliest deadline; `_next_delay` clamps the sleep to it, and to the
      nearest eligible 5h stamp expiry + 60 s so lapses are confirmed promptly.
-- Active account: pinged through `paths.get_claude_config_home()` (the default
-  login), never a slot — `setup_session` refuses it by design. Other accounts:
-  `SessionManager(switcher).setup_session(num, share=True)` → slot dir. Note
-  this reuses the exact `cswap run` preparation (bootstrap + share copy).
+- Active account: pinged through `paths.get_claude_config_home()` (follows
+  `CLAUDE_CONFIG_DIR`, exactly like `current_account_number()` does, so identity
+  and destination agree — `deep` ruled the env-ignoring default path would
+  *create* a wrong-account bug), never a slot. Other accounts:
+  `SessionManager(switcher).setup_session(num, share=…)` → slot dir, reusing
+  the `cswap run` preparation. Two guards added after verification: warmup is
+  refused inside a `cswap run` session shell (`switcher._refuse_session_shell`,
+  the same guard every live-store mutation carries), and the spawn phase runs
+  **after** the tick's switch decision with `_freshen_target` skipping any
+  account whose hello is in flight — otherwise the hello's token refresh can
+  race `_perform_switch` and leave the live login on a spent refresh token.
 - Failure policy per account: 30 min backoff after a failed ping; three
   consecutive failures → 24 h backoff + `WarmupEvent(action="failed")` at
   warn severity. Never raises out of the tick (`tick()` already shields).
@@ -223,5 +235,45 @@ prove the hidden spawn + JSON parse. 5. The first real slot pings are Jeremy's
 in the morning: relaunch the TUI, `cswap config set autoswitch.warmupEnabled
 true`, `p` on the auto screen in dry-run, then live.
 
+## Review and verification findings (applied before commit)
+- `review` (Opus 5): the post-hello forced refetch cannot beat the serve TTL
+  for a row fetched in the same tick (`UsageStore.reserve` has no force path),
+  so a cold account would re-ping every tick → `PING_COOLDOWN_S` (15 min) keyed
+  on `lastPingAt`, also honoured by `p` and `cswap warm` (`--all` overrides).
+  A switch during an in-flight hello could warm the wrong account through the
+  live config dir → the worker re-reads the active account and aborts
+  (`skipped`, no strike) when this account's role changed. Error text and
+  child stderr are redacted (`safe_error`, `redact_child_output`); an operator
+  name was removed from the public module; a vacuous test was replaced.
+- `deep` (Fable 5.1): (1) the hello's slot preparation rotates the token
+  family outside the lock, so spawning before the tick's switch decision could
+  leave the live login on a spent refresh token → spawn moved after the
+  decision (`tick()` → `_spawn_planned_warmups`), `_freshen_target` skips
+  in-flight accounts, and `switcher._perform_switch` refuses any target with a
+  hello in flight (`_refuse_hello_in_flight`, process-wide registry in
+  `warmup.py`; the dashboard pre-checks for a friendlier toast). (2) Inside a
+  `cswap run` shell the "active" account is the slot's, so the real default
+  login would have been prepared as a slot → `_refuse_session_shell()` on both
+  surfaces. (3) `setup_session` never refused the active login; docs corrected.
+  (4) `share=False` would *unshare* a slot's copies, so `share=True` stays.
+  Final call: ship. Residual: a `cswap switch` in another terminal cannot see
+  the in-process registry (same class as upstream's `run` vs `switch` race).
+- In-flight accounts stay in the planner as virtually warm (decision logged).
+
+## Verification results (2026-09-06 night, orchestrator)
+1. Suite: 2261 passed / 78 skipped at `-n 4`, BELOW_NORMAL (baseline 2132/77).
+2. `cswap status` live: OK.
+3. `cswap warm --dry-run` live: all four accounts already warm, exit 2, JSON
+   shape clean; spawned nothing.
+4. One real hello through `SubprocessPingRunner` against the **active login**:
+   ok, 259 in / 234 out tokens, 5.5 s; no `~/.claude/projects/` entry, no
+   `history.jsonl` entry, no new backup-root path.
+5. **Owed to Jeremy:** the first real slot hellos. Relaunch the TUI, `cswap
+   config set autoswitch.warmupEnabled true`, `p` on the auto screen in
+   dry-run, then live; check the terminal stays clean (the slot preparation
+   runs a `claude auth status` probe with the TUI's console) and that no
+   window flashes.
+
 ## Status log
 - 2026-09-06 evening — plan written; Jeremy asleep, build proceeds autonomously.
+- 2026-09-06 night — built, reviewed, deep-verified, committed on `jeremy`.

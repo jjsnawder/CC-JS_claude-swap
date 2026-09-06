@@ -6536,6 +6536,27 @@ class ClaudeAccountSwitcher:
             "or run from a normal shell."
         )
 
+    def _refuse_hello_in_flight(self, account_num: str) -> None:
+        """Refuse activating a slot whose warmup hello is still running.
+
+        A warmup (``claude_swap.warmup``) prepares the slot exactly like
+        ``cswap run`` does, and that preparation's consume gate POSTs a
+        refresh outside the backup lock before persisting the successor by
+        CAS. Activating the slot in that window reads the pre-rotation
+        generation and installs it as the LIVE login, which the gate then
+        supersedes — leaving the default login on a spent refresh token that
+        fails at its next expiry with nothing naming the cause.
+
+        In-process only, and deliberately so: the window is seconds wide.
+        """
+        from claude_swap import warmup
+
+        if str(account_num) in warmup.active_hellos():
+            raise SwitchError(
+                f"Account-{account_num} has a warmup ping in flight; its "
+                f"credentials are rotating right now. Retry in a few seconds."
+            )
+
     def _perform_switch(
         self,
         target_account: str,
@@ -6561,6 +6582,7 @@ class ClaudeAccountSwitcher:
         callbacks inside list_accounts() can re-acquire it.
         """
         self._refuse_session_shell()
+        self._refuse_hello_in_flight(target_account)
         warnings_out: list[str] = []
         # Session-mode drift warning (warn, never block): switching the
         # default login to an account that also has a live session profile

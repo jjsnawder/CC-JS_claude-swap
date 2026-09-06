@@ -27,6 +27,7 @@ from claude_swap.autoswitch import (
     SwitchEvent,
     TickOutcome,
     UnquarantineEvent,
+    WarmupEvent,
     _recovery_is_useful,
     consume_first_key,
     pct_label,
@@ -7438,3 +7439,613 @@ class TestManualSwitch:
         assert sw.dry_run is True and sw.trigger == "manual"
         assert h.active_number() == 1
         assert h.state() == {}
+
+
+class TestWarmup:
+    """The engine's warmup hook (`warmup.py` driven from `_tick_inner`).
+
+    Two invariants sit above every individual case. **No test may spawn a
+    real ``claude``** — the runner is injected here and never the real
+    :class:`SubprocessPingRunner` (a real child escapes the real-store audit
+    hook entirely and would authenticate as whoever is logged in on the
+    machine running the suite). And a warmup problem must never cost a
+    switch decision: the hook is shielded inside the tick, which the last
+    test pins.
+    """
+
+    class FakeRunner:
+        """Records what it was asked to hello; never touches a process."""
+
+        def __init__(self, ok: bool = True, gate: threading.Event | None = None):
+            self.ok = ok
+            self.gate = gate
+            self.calls: list[tuple[Path, str]] = []
+            self.started = threading.Event()
+
+        def ping(self, config_dir, model, cwd, timeout_s=120.0):
+            from claude_swap.warmup import PingResult
+
+            self.calls.append((Path(config_dir), model))
+            self.started.set()
+            if self.gate is not None:
+                self.gate.wait(5)
+            return PingResult(
+                ok=self.ok, model=model, input_tokens=431, output_tokens=79,
+                error="" if self.ok else "rc=1: boom",
+            )
+
+    # -- harness helpers ---------------------------------------------------
+
+    def _warm_harness(self, temp_home: Path, monkeypatch, **kwargs) -> EngineHarness:
+        """Three accounts, warmup on, the spawn seam and the slot lookup faked."""
+        from claude_swap import warmup as warmup_mod
+
+        kwargs.setdefault("warmup_enabled", True)
+        h = EngineHarness(temp_home, **kwargs)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        h.runner = self.FakeRunner()
+        h.engine.ping_runner = h.runner
+        monkeypatch.setattr(
+            warmup_mod,
+            "config_dir_for",
+            lambda sw, num, active: temp_home / f"cfg-{num}",
+        )
+        return h
+
+    def _tick(self, h, usage):
+        """One tick against a canned usage dict; returns (outcome, mock)."""
+        entries = {
+            num: _entry_for(value, h.clock.now) for num, value in usage.items()
+        }
+        with patch.object(
+            h.switcher, "usage_entries_by_account", return_value=entries
+        ) as mock:
+            outcome = h.engine.tick()
+        return outcome, mock
+
+    @staticmethod
+    def _settle(engine, timeout: float = 5.0) -> None:
+        """Wait for every in-flight hello thread to hand its result back."""
+        import time as _time
+
+        deadline = _time.monotonic() + timeout
+        while _time.monotonic() < deadline:
+            with engine._warm_lock:
+                if not engine._warm_inflight:
+                    return
+            _time.sleep(0.005)
+        raise AssertionError("warmup thread did not finish")
+
+    @staticmethod
+    def _cold() -> dict:
+        return {"1": _usage(30), "2": _usage(30), "3": _usage(30)}
+
+    # -- the default ---------------------------------------------------------
+
+    def test_warmup_is_off_by_default(self, harness, monkeypatch):
+        """An upgrade may not start spending tokens and spawning children on
+        its own: `warmupEnabled` defaults to false and nothing runs."""
+        harness.runner = self.FakeRunner()
+        harness.engine.ping_runner = harness.runner
+        assert harness.tick_with_usage(self._cold()) is TickOutcome.NO_ACTION
+        assert harness.runner.calls == []
+        assert "warmup" not in harness.state()
+
+    # -- the happy path ------------------------------------------------------
+
+    def test_a_cold_account_is_warmed_and_the_result_lands_next_tick(
+        self, temp_home, monkeypatch
+    ):
+        """Tick 1 spawns the hello; the thread hands the result back and
+        tick 2 reports it. The event carries a token summary and nothing
+        else."""
+        h = self._warm_harness(temp_home, monkeypatch)
+        self._tick(h, self._cold())
+        self._settle(h.engine)
+        assert [model for _, model in h.runner.calls] == ["haiku"]
+        h.events.clear()
+
+        self._tick(h, self._cold())
+        warmed = [e for e in h.events if isinstance(e, WarmupEvent)]
+        assert [e.action for e in warmed] == ["pinged"]
+        assert warmed[0].number == "1"
+        assert warmed[0].email == "a@example.com"
+        assert "431 in / 79 out" in warmed[0].detail
+
+    def test_the_landed_hello_forces_a_refetch_of_that_account(
+        self, temp_home, monkeypatch
+    ):
+        """The whole point is the new reset stamp — it has to show within one
+        tick, not whenever the candidate rotation gets around to that slot."""
+        h = self._warm_harness(temp_home, monkeypatch)
+        self._tick(h, self._cold())
+        self._settle(h.engine)
+        _, mock = self._tick(h, self._cold())
+        forced = [
+            call for call in mock.call_args_list if call.kwargs.get("fetch")
+        ]
+        assert any(
+            call.kwargs["fetch"] == {"1"} and call.kwargs.get("scheduled") is False
+            for call in forced
+        )
+
+    def test_the_ping_is_recorded_in_the_state_file(self, temp_home, monkeypatch):
+        h = self._warm_harness(temp_home, monkeypatch)
+        self._tick(h, self._cold())
+        self._settle(h.engine)
+        self._tick(h, self._cold())
+        record = h.state()["warmup"]["1"]
+        assert record["lastPingModel"] == "haiku"
+        assert record["lastResult"] == "ok"
+        assert record["failures"] == 0
+        assert record["lastPingAt"] == h.clock.now
+
+    def test_only_one_hello_per_account_is_ever_in_flight(
+        self, temp_home, monkeypatch
+    ):
+        """A slow hello must not accumulate one child per tick."""
+        gate = threading.Event()
+        h = self._warm_harness(temp_home, monkeypatch)
+        h.runner = self.FakeRunner(gate=gate)
+        h.engine.ping_runner = h.runner
+        try:
+            self._tick(h, self._cold())
+            assert h.runner.started.wait(5)
+            self._tick(h, self._cold())
+            self._tick(h, self._cold())
+            assert len(h.runner.calls) == 1
+        finally:
+            gate.set()
+            self._settle(h.engine)
+
+    # -- the guards ----------------------------------------------------------
+
+    def test_a_stale_row_is_refetched_instead_of_pinged(
+        self, temp_home, monkeypatch
+    ):
+        """Never spend a token on a stale read: the stamp may have landed
+        since the last fetch, in which case the account is not cold at all.
+
+        Exactly ONE such refetch per tick, stalest first — warmup shares the
+        engine's 429 budget and must not turn a tick into an all-accounts
+        refresh because three rows happen to look cold."""
+        h = self._warm_harness(temp_home, monkeypatch)
+
+        def stale(age: float) -> UsageEntry:
+            return UsageEntry(
+                last_good=_usage(30), fetched_at=h.clock.now - age, age_s=age
+            )
+
+        entries = {"1": stale(200.0), "2": stale(280.0), "3": stale(240.0)}
+        with patch.object(
+            h.switcher, "usage_entries_by_account", return_value=entries
+        ) as mock:
+            h.engine.tick()
+        assert h.runner.calls == []
+        warm_fetches = [
+            call.kwargs["fetch"]
+            for call in mock.call_args_list
+            if call.kwargs.get("scheduled") is False
+        ]
+        assert warm_fetches == [{"2"}]  # the stalest of the three
+
+    def test_api_key_token_dead_and_at_limit_accounts_are_left_alone(
+        self, temp_home, monkeypatch
+    ):
+        """#1 is at its limit (a hello would 429 or burn the last of the
+        window), #2's refresh lineage is provably dead, #3 is an API key —
+        which has no quota window to warm and which ``setup_session``
+        refuses (``_ensure_not_api_key``)."""
+        h = self._warm_harness(temp_home, monkeypatch)
+        entries = {
+            "1": _entry_for(_usage(100), h.clock.now),
+            "2": UsageEntry(
+                last_good=_usage(30), fetched_at=h.clock.now, age_s=0.0,
+                auth_dead_strikes=99,
+            ),
+            "3": _entry_for(_usage(30), h.clock.now),
+        }
+        with (
+            patch.object(
+                h.switcher, "account_kind_for",
+                side_effect=lambda n: "api_key" if n == "3" else "oauth",
+            ),
+            patch.object(
+                h.switcher, "usage_entries_by_account", return_value=entries
+            ),
+        ):
+            h.engine.tick()
+        self._settle(h.engine)
+        assert h.runner.calls == []
+
+    def test_dry_run_previews_and_spawns_nothing(self, temp_home, monkeypatch):
+        h = self._warm_harness(temp_home, monkeypatch)
+        h.engine = h._make_engine(dry_run=True)
+        h.engine.ping_runner = h.runner
+        self._tick(h, self._cold())
+        assert h.runner.calls == []
+        previews = [e for e in h.events if isinstance(e, WarmupEvent)]
+        assert [e.action for e in previews] == ["would-ping"]
+        assert "warmup" not in h.state()
+
+    # -- the credential boundary --------------------------------------------
+
+    def test_the_active_account_uses_the_live_config_home_and_others_a_slot(
+        self, temp_home, monkeypatch
+    ):
+        """The two paths look alike in the code and must stay distinct.
+
+        The ACTIVE account is the global login and is pinged through the
+        live config home. Nothing downstream enforces that: ``setup_session``
+        does NOT refuse the active login — the refusal lives in
+        ``SessionManager.run`` (and only when ``CLAUDE_CONFIG_DIR`` is
+        unset), which warmup never calls — so ``config_dir_for``'s
+        ``number == active`` comparison IS the guard against building a slot
+        copy of the live login. Every other account goes through the exact
+        ``cswap run`` preparation.
+        """
+        import claude_swap.session as session_mod
+        from claude_swap import warmup as warmup_mod
+
+        live = temp_home / "live-claude"
+        monkeypatch.setattr(warmup_mod.paths, "get_claude_config_home", lambda: live)
+        seen: list[tuple[str, bool]] = []
+
+        class FakeSessionManager:
+            def __init__(self, switcher):
+                pass
+
+            def setup_session(self, identifier, share):
+                seen.append((identifier, share))
+                return temp_home / f"slot-{identifier}", identifier, "x@example.com"
+
+        monkeypatch.setattr(session_mod, "SessionManager", FakeSessionManager)
+
+        h = EngineHarness(temp_home, warmup_enabled=True, warmup_stagger=False)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        h.runner = self.FakeRunner()
+        h.engine.ping_runner = h.runner
+
+        self._tick(h, {"1": _usage(30), "2": _usage(30)})
+        self._settle(h.engine)
+        dirs = {path for path, _ in h.runner.calls}
+        assert live in dirs
+        assert temp_home / "slot-2" in dirs
+        assert seen == [("2", True)]  # never called for the active account
+
+    # -- failures ------------------------------------------------------------
+
+    def test_a_failed_hello_earns_a_thirty_minute_backoff(
+        self, temp_home, monkeypatch
+    ):
+        h = self._warm_harness(temp_home, monkeypatch)
+        h.runner = self.FakeRunner(ok=False)
+        h.engine.ping_runner = h.runner
+        self._tick(h, self._cold())
+        self._settle(h.engine)
+        h.events.clear()
+        self._tick(h, self._cold())
+
+        failed = [e for e in h.events if isinstance(e, WarmupEvent)]
+        assert [e.action for e in failed] == ["failed"]
+        record = h.state()["warmup"]["1"]
+        assert record["failures"] == 1
+        assert record["backoffUntil"] == pytest.approx(h.clock.now + 30 * 60)
+
+    def test_three_strikes_buy_a_day_off(self, temp_home, monkeypatch):
+        """A structural cause (no `claude` on PATH, a slot that cannot
+        bootstrap) is not worth a child process every half hour."""
+        h = self._warm_harness(temp_home, monkeypatch)
+        h.runner = self.FakeRunner(ok=False)
+        h.engine.ping_runner = h.runner
+        for _ in range(3):
+            self._tick(h, self._cold())
+            self._settle(h.engine)
+            self._tick(h, self._cold())  # drain the result
+            recorded_at = h.clock.now
+            h.clock.advance(31 * 60)     # past the short backoff
+        record = h.state()["warmup"]["1"]
+        assert record["failures"] == 3
+        assert record["backoffUntil"] == pytest.approx(recorded_at + 24 * 3600)
+
+    def test_a_warmup_explosion_never_costs_a_switch_decision(
+        self, temp_home, monkeypatch
+    ):
+        """The hook is shielded inside the tick. A planner that raises must
+        leave the engine's actual job untouched."""
+        from claude_swap import warmup as warmup_mod
+
+        h = self._warm_harness(temp_home, monkeypatch, threshold=90.0)
+        monkeypatch.setattr(
+            warmup_mod,
+            "plan_warmups",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        outcome, _ = self._tick(
+            h, {"1": _usage(95), "2": _usage(10), "3": _usage(10)}
+        )
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_an_unchanged_cold_refetch_does_not_re_ping_every_tick(
+        self, temp_home, monkeypatch
+    ):
+        """The post-hello refetch is BEST EFFORT and normally a no-op:
+        ``UsageStore.reserve(respect_plans=False)`` still gates on
+        `poll_due or stale`, so a row fetched earlier in the same tick keeps
+        its pre-hello (cold) stamp. Cold AND fresh is exactly the state that
+        would re-ping every tick — `warmup.PING_COOLDOWN_S` is the only
+        thing standing between that and a hello a minute."""
+        from claude_swap import warmup as warmup_mod
+
+        h = self._warm_harness(temp_home, monkeypatch)
+        for _ in range(4):
+            self._tick(h, self._cold())  # the entries never change: still cold
+            self._settle(h.engine)
+            h.clock.advance(60)
+        assert len(h.runner.calls) == 1
+
+        h.clock.advance(warmup_mod.PING_COOLDOWN_S)
+        self._tick(h, self._cold())
+        self._settle(h.engine)
+        assert len(h.runner.calls) == 2
+        assert [path.name for path, _ in h.runner.calls] == ["cfg-1", "cfg-1"]
+
+    # -- the role boundary ----------------------------------------------------
+
+    def test_a_switch_mid_tick_aborts_the_active_account_hello(
+        self, temp_home, monkeypatch
+    ):
+        """Warmup plans before the switch decision runs. If the tick then
+        moves 1→2, the "active" config home holds #2's credentials by the
+        time the worker resolves it — pinging it would warm #2 and record
+        the hello under #1. Abort instead, and take no strike."""
+        h = self._warm_harness(temp_home, monkeypatch)
+        with h.engine._warm_lock:
+            h.engine._warm_inflight.add("1")
+        with patch.object(
+            h.switcher, "current_account_number", return_value="2"
+        ):
+            h.engine._ping_worker("1", "a@example.com", "haiku", "1")
+
+        assert h.runner.calls == []
+        drained = h.engine._drain_pings()
+        assert len(drained) == 1
+        result = drained[0][3]
+        assert result.skipped is True
+        assert "active account changed" in result.error
+        h.engine._record_ping_result("1", "haiku", result)
+        assert "backoffUntil" not in h.state().get("warmup", {}).get("1", {})
+
+    def test_becoming_active_mid_tick_aborts_the_slot_hello(
+        self, temp_home, monkeypatch
+    ):
+        """The mirror case. Only `config_dir_for`'s `number == active` check
+        keeps the live login out of a slot dir, so a stale capture would build
+        one and rotate a second token family; abort instead of striking."""
+        h = self._warm_harness(temp_home, monkeypatch)
+        with h.engine._warm_lock:
+            h.engine._warm_inflight.add("2")
+        with patch.object(
+            h.switcher, "current_account_number", return_value="2"
+        ):
+            h.engine._ping_worker("2", "b@example.com", "haiku", "1")
+
+        assert h.runner.calls == []
+        assert h.engine._drain_pings()[0][3].skipped is True
+
+    def test_a_switch_that_does_not_change_THIS_account_still_pings(
+        self, temp_home, monkeypatch
+    ):
+        """1→2 while #3's hello is in flight changes nothing about #3: it
+        was a slot before and it is a slot now. Aborting there would be a
+        needless miss."""
+        h = self._warm_harness(temp_home, monkeypatch)
+        with h.engine._warm_lock:
+            h.engine._warm_inflight.add("3")
+        with patch.object(
+            h.switcher, "current_account_number", return_value="2"
+        ):
+            h.engine._ping_worker("3", "c@example.com", "haiku", "1")
+
+        assert [path.name for path, _ in h.runner.calls] == ["cfg-3"]
+        assert h.engine._drain_pings()[0][3].skipped is False
+
+    def test_a_skip_is_reported_and_never_becomes_a_strike(
+        self, temp_home, monkeypatch
+    ):
+        h = self._warm_harness(temp_home, monkeypatch)
+        with h.engine._warm_lock:
+            h.engine._warm_inflight.add("1")
+        with patch.object(
+            h.switcher, "current_account_number", return_value="2"
+        ):
+            h.engine._ping_worker("1", "a@example.com", "haiku", "1")
+        h.events.clear()
+        self._tick(h, self._cold())
+        self._settle(h.engine)
+        skipped = [
+            e for e in h.events
+            if isinstance(e, WarmupEvent) and e.number == "1"
+        ]
+        assert skipped[0].action == "skipped"
+        assert "warmup skipped" in skipped[0].human()
+
+    def test_a_slot_preparation_failure_never_leaks_a_path(
+        self, temp_home, monkeypatch
+    ):
+        """`setup_session` errors can embed slot and config-dir paths, and
+        these lines are logged, scrolled and pasted into issues."""
+        from claude_swap import warmup as warmup_mod
+
+        def boom(sw, num, active):
+            raise RuntimeError(f"cannot bootstrap {temp_home / 'slot-1-secret'}")
+
+        monkeypatch.setattr(warmup_mod, "config_dir_for", boom)
+        h = self._warm_harness(temp_home, monkeypatch)
+        monkeypatch.setattr(warmup_mod, "config_dir_for", boom)
+        self._tick(h, self._cold())
+        self._settle(h.engine)
+        h.events.clear()
+        self._tick(h, self._cold())
+        failed = [e for e in h.events if isinstance(e, WarmupEvent)]
+        assert failed[0].action == "failed"
+        assert "slot-1-secret" not in failed[0].detail
+        assert "RuntimeError" in failed[0].detail
+        assert "slot-1-secret" not in h.state()["warmup"]["1"]["lastResult"]
+
+    # -- the switch/warmup race -----------------------------------------------
+
+    def test_a_target_with_a_hello_in_flight_is_never_activated(
+        self, temp_home, monkeypatch
+    ):
+        """A hello runs the full ``setup_session`` preparation, whose consume
+        gate POSTs a refresh OUTSIDE the backup lock and persists the
+        successor by CAS. Activating that slot mid-flight installs
+        generation N as the LIVE login while the gate lands N+1 — the
+        default login then holds a spent refresh token and finds out at its
+        next expiry, with nothing anywhere naming the cause."""
+        h = self._warm_harness(temp_home, monkeypatch, threshold=90.0)
+        with h.engine._warm_lock:
+            h.engine._warm_inflight.add("2")
+
+        assert h.engine._freshen_target("2", "b@example.com") == "warmup-in-flight"
+        self._tick(h, {"1": _usage(95), "2": _usage(5), "3": _usage(96)})
+        h.engine._warm_inflight.discard("2")
+        self._settle(h.engine)  # hellos are daemon threads: never leak one
+        assert h.active_number() != 2
+        assert not any(
+            isinstance(e, SwitchEvent) and (e.to_ref or {}).get("number") == 2
+            for e in h.events
+        )
+
+    def test_a_tick_that_switches_never_spawns_a_hello_for_the_new_login(
+        self, temp_home, monkeypatch
+    ):
+        """The other end of the same window: the account we just landed on
+        had its credentials installed moments ago (with a ~30s Keychain
+        pickup tail on macOS). A hello racing that is all risk — it will be
+        reconsidered next tick."""
+        h = self._warm_harness(temp_home, monkeypatch, threshold=90.0)
+        outcome, _ = self._tick(
+            h, {"1": _usage(95), "2": _usage(5), "3": _usage(96)}
+        )
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        self._settle(h.engine)
+        assert "cfg-2" not in [path.name for path, _ in h.runner.calls]
+
+    def test_hellos_spawn_only_after_the_decision(self, temp_home, monkeypatch):
+        """Ordering pinned directly: nothing may be in flight while the
+        decision runs, because that window IS the race."""
+        h = self._warm_harness(temp_home, monkeypatch, threshold=90.0)
+        seen: list[set] = []
+        real = h.engine._freshen_target
+
+        def spy(number, email):
+            with h.engine._warm_lock:
+                seen.append(set(h.engine._warm_inflight))
+            return real(number, email)
+
+        monkeypatch.setattr(h.engine, "_freshen_target", spy)
+        self._tick(h, {"1": _usage(95), "2": _usage(5), "3": _usage(96)})
+        self._settle(h.engine)
+        assert seen and all(not s for s in seen)
+        assert h.runner.calls  # ...and hellos did go out afterwards
+
+    # -- the session shell ------------------------------------------------------
+
+    def test_warmup_is_disabled_inside_a_cswap_run_shell(
+        self, temp_home, monkeypatch
+    ):
+        """There, ``current_account_number()`` reports the SESSION's account,
+        so the machine's real default login reads as a plain candidate and
+        would be handed to ``setup_session``: a slot copy of the live login,
+        rotating the backup while ``~/.claude`` keeps the predecessor."""
+        from claude_swap.exceptions import SwitchError
+
+        h = self._warm_harness(temp_home, monkeypatch)
+        monkeypatch.setattr(
+            h.switcher,
+            "_refuse_session_shell",
+            lambda: (_ for _ in ()).throw(SwitchError("inside a session profile")),
+        )
+        self._tick(h, self._cold())
+        self._settle(h.engine)
+        assert h.runner.calls == []
+        warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1
+        assert "warmup disabled" in warnings[0].message
+
+        # A standing condition, not an event: warned once per engine.
+        h.events.clear()
+        self._tick(h, self._cold())
+        assert [e for e in h.events if isinstance(e, ConfigWarningEvent)] == []
+
+    # -- the manual request ---------------------------------------------------
+
+    def test_request_warm_pings_every_cold_account_now(
+        self, temp_home, monkeypatch
+    ):
+        """`p` is a request for DATA now, so the stagger — the thing that
+        would otherwise leave three of four accounts waiting hours — is
+        exactly what it overrides."""
+        h = self._warm_harness(temp_home, monkeypatch, warmup_enabled=False)
+        h.engine.request_warm()
+        assert h.engine._wake.is_set()
+        self._tick(h, self._cold())
+        self._settle(h.engine)
+        assert sorted(path.name for path, _ in h.runner.calls) == [
+            "cfg-1", "cfg-2", "cfg-3"
+        ]
+
+    def test_the_warm_request_is_consumed_by_exactly_one_tick(
+        self, temp_home, monkeypatch
+    ):
+        h = self._warm_harness(temp_home, monkeypatch, warmup_enabled=False)
+        h.engine.request_warm()
+        self._tick(h, self._cold())
+        self._settle(h.engine)
+        first = len(h.runner.calls)
+        self._tick(h, self._cold())
+        self._settle(h.engine)
+        assert len(h.runner.calls) == first  # no standing order
+
+    # -- scheduling -----------------------------------------------------------
+
+    def test_a_staggered_deadline_shortens_the_sleep(self, temp_home, monkeypatch):
+        """A hello due in 30s is useless if the loop is asleep for 5 minutes
+        on a BLOCKED outcome."""
+        h = self._warm_harness(temp_home, monkeypatch)
+        h.engine._blocked_wait_long = True
+        assert h.engine._next_delay(TickOutcome.BLOCKED) == pytest.approx(
+            NO_RESET_FALLBACK_S
+        )
+        h.engine._warm_deadline_ts = h.clock.now + 30
+        assert h.engine._next_delay(TickOutcome.BLOCKED) == pytest.approx(30)
+
+    def test_the_clamp_never_lengthens_a_sleep_or_returns_zero(
+        self, temp_home, monkeypatch
+    ):
+        h = self._warm_harness(temp_home, monkeypatch)
+        h.engine._warm_deadline_ts = h.clock.now + 10_000
+        assert h.engine._next_delay(TickOutcome.NO_ACTION) <= 66.0
+        h.engine._warm_deadline_ts = h.clock.now - 500
+        assert h.engine._next_delay(TickOutcome.NO_ACTION) == pytest.approx(1.0)
+
+    def test_a_lapsing_stamp_is_confirmed_promptly(self, temp_home, monkeypatch):
+        """A window that expires during the next sleep would otherwise leave
+        the account cold and invisible until the following poll."""
+        h = self._warm_harness(temp_home, monkeypatch)
+        soon = h.clock.now + 900
+        self._tick(h, {
+            "1": _usage(30, _iso_at(soon)),
+            "2": _usage(30, _iso_at(h.clock.now + 99_999)),
+            "3": _usage(30, _iso_at(h.clock.now + 88_888)),
+        })
+        assert h.engine._warm_deadline_ts == pytest.approx(soon + 60)

@@ -42,7 +42,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import oauth, poll_policy
+from claude_swap import oauth, poll_policy, warmup
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
@@ -492,6 +492,44 @@ class ConfigWarningEvent(AutoSwitchEvent):
         return f"warning: {self.message}"
 
 
+@dataclass(frozen=True)
+class WarmupEvent(AutoSwitchEvent):
+    """One warmup hello: performed, refused, or previewed.
+
+    ``detail`` is deliberately narrow — a token/cost summary on success, an
+    exit code plus a truncated stderr tail on failure. Nothing from the
+    child's environment or its config dir ever reaches an event, because
+    these lines are logged, scrolled, and pasted into issues.
+    """
+
+    kind: ClassVar[str] = "warmup"
+    action: str  # "pinged" | "failed" | "would-ping" | "skipped"
+    number: str
+    email: str = ""
+    model: str = warmup.DEFAULT_MODEL
+    detail: str = ""
+
+    def _fields(self) -> dict:
+        return {
+            "action": self.action,
+            "number": self.number,
+            "email": self.email,
+            "model": self.model,
+            "detail": self.detail,
+        }
+
+    def human(self) -> str:
+        who = f"Account-{self.number}" + (f" ({self.email})" if self.email else "")
+        tail = f" ({self.detail})" if self.detail else ""
+        if self.action == "would-ping":
+            return f"[dry-run] would warm {who} with {self.model}"
+        if self.action == "skipped":
+            return f"{who} warmup skipped{tail}"
+        if self.action == "failed":
+            return f"{who} warmup failed{tail or f' ({self.model})'}"
+        return f"{who} warmed{tail or f' ({self.model})'}"
+
+
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
@@ -735,6 +773,7 @@ class AutoSwitchEngine:
         dry_run: bool = False,
         state_path: Path | None = None,
         clock: Callable[[], float] = time.time,
+        ping_runner: "warmup.PingRunner | None" = None,
     ):
         self.switcher = switcher
         self.settings = settings
@@ -759,6 +798,28 @@ class AutoSwitchEngine:
         # One-shot "switch now" request from the TUI (see ``request_switch``).
         # Consumed by the next tick, which then decides with trigger "manual".
         self._switch_now = threading.Event()
+        # -- warmup (claude_swap/warmup.py) --------------------------------
+        # The spawn seam, injected so tests never run a real `claude`.
+        self.ping_runner = ping_runner or warmup.SubprocessPingRunner()
+        # One-shot "ping/warm now" request from the TUI (``request_warm``).
+        self._warm_now = threading.Event()
+        # Numbers with a hello in flight, and the results those threads hand
+        # back. Both under ``_warm_lock``: the threads are daemons that can
+        # outlive the tick that started them.
+        self._warm_lock = threading.Lock()
+        self._warm_inflight: set[str] = set()
+        self._warm_results: list[tuple[str, str, str, warmup.PingResult]] = []
+        # Earliest instant this tick wants to be awake for (a staggered
+        # warmup deadline, or a 5h stamp about to lapse). Per-tick, like
+        # ``_sleep_until_ts``; ``_next_delay`` clamps the sleep to it.
+        self._warm_deadline_ts: float | None = None
+        # Planner inputs handed from ``_tick_inner`` to the post-decision
+        # spawn phase (see ``_spawn_planned_warmups``): (now, candidates,
+        # stagger). None = nothing to spawn this tick.
+        self._warm_plan: tuple | None = None
+        # ``_refuse_session_shell`` is a standing condition, not an event —
+        # warn once per engine, not once per tick.
+        self._warm_shell_warned = False
         self._unhealthy_ticks = 0
         # Both set per tick: a known-reset sleep target, and whether a BLOCKED
         # outcome is static enough (truly exhausted / no candidates) to wait
@@ -864,12 +925,28 @@ class AutoSwitchEngine:
         Returns ``"ok"``, ``"invalid_grant"`` (dead lineage — quarantine),
         ``"identity-conflict"`` (alive but authenticates as a different
         account — quarantine, do not activate), ``"transient"`` (network
-        trouble — try again next tick) or ``"skip-live-session"``. Only ever
-        touches the slot's *backup* store; the active credential belongs to
-        Claude Code.
+        trouble — try again next tick), ``"skip-live-session"`` or
+        ``"warmup-in-flight"``. Only ever touches the slot's *backup* store;
+        the active credential belongs to Claude Code.
         """
         if self.switcher.account_kind_for(number) == "api_key":
             return "ok"  # API keys don't expire/refresh
+        with self._warm_lock:
+            warming = number in self._warm_inflight
+        if warming:
+            # A warmup hello for this slot is mid-``setup_session``, whose
+            # consume gate POSTs a refresh OUTSIDE the backup lock and then
+            # persists the successor by fingerprint CAS. Activating the slot
+            # now reads generation N under ``lock_file`` and installs it as
+            # the live login, and the gate's CAS lands generation N+1 a
+            # moment later — leaving the DEFAULT LOGIN holding a spent
+            # refresh token, which fails ``invalid_grant`` at its next
+            # expiry with no warning anywhere.
+            #
+            # The window is one tick wide and the remedy is free: a warmup
+            # takes seconds, so the next tick can activate this same slot
+            # safely. Never trade a live login for it.
+            return "warmup-in-flight"
         if self.switcher.live_session_pids_for(number, email):
             # A live `cswap run` session owns this account's token in its own
             # profile. Auto-activating it as the default login too would put
@@ -970,15 +1047,24 @@ class AutoSwitchEngine:
     def tick(self) -> TickOutcome:
         """Evaluate once: poll usage, maybe switch. Never raises."""
         try:
-            return self._tick_inner()
+            outcome = self._tick_inner()
         except ClaudeSwitchError as e:
             self._emit(ErrorEvent(message=str(e), transient=True))
-            return TickOutcome.ERROR
+            outcome = TickOutcome.ERROR
         except Exception as e:  # pragma: no cover - safety net
             self._emit(
                 ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
             )
-            return TickOutcome.ERROR
+            outcome = TickOutcome.ERROR
+        # Warmup hellos spawn HERE, never inside the decision. A hello runs
+        # the full ``setup_session`` preparation, whose consume gate rotates
+        # the slot's refresh token; starting one before the decision means a
+        # switch onto that same slot can install a generation the gate is
+        # about to supersede (see ``_freshen_target``). Draining and
+        # refetching still happen up front, inside ``_tick_inner``, because
+        # the decision wants that data.
+        self._spawn_planned_warmups(outcome)
+        return outcome
 
     def _tick_inner(self) -> TickOutcome:
         # Consume the one-shot request FIRST and unconditionally: whatever this
@@ -987,7 +1073,13 @@ class AutoSwitchEngine:
         # several ticks later.
         manual = self._switch_now.is_set()
         self._switch_now.clear()
+        # Same one-shot contract for `p` ("ping/warm now"): consumed by this
+        # tick whatever it decides, so a keypress can never fire a surprise
+        # round of hellos several ticks later.
+        warm_request = self._warm_now.is_set()
+        self._warm_now.clear()
         self._sleep_until_ts = None
+        self._warm_deadline_ts = None
         self._blocked_wait_long = False
         self._idle_hold_slow = False
         settings = self.settings
@@ -1034,6 +1126,16 @@ class AutoSwitchEngine:
         entries, usage, headroom = self._collect_scheduled_usage(
             current, quarantined, threshold=settings.threshold
         )
+        # Warmup runs BEFORE the poll event so any refetch it forces (a
+        # hello that just landed, a stale-looking cold row) is what this
+        # tick both reports and decides on. Fully shielded: a warmup problem
+        # must never cost a switch decision.
+        try:
+            entries, usage, headroom = self._run_warmup(
+                current, quarantined, entries, usage, headroom, warm_request
+            )
+        except Exception as e:  # pragma: no cover - safety net
+            _logger.debug("warmup step failed: %r", e)
         self._emit(
             PollEvent(
                 active=active_ref,
@@ -1516,7 +1618,7 @@ class AutoSwitchEngine:
                 ) < _SYSTEMIC_STATUSES.index(systemic):
                     systemic = status
                 continue
-            if status == "skip-live-session":
+            if status in ("skip-live-session", "warmup-in-flight"):
                 continue
             return self._perform(num, email, trigger, left_snapshot)
 
@@ -2197,6 +2299,345 @@ class AutoSwitchEngine:
         qualifying.sort(key=lambda t: t[0])
         return [num for _, num in qualifying], any_known, active_reset_ts
 
+    # -- warmup ----------------------------------------------------------------
+
+    def _warmup_section(self, state: dict) -> dict:
+        section = state.get("warmup")
+        return section if isinstance(section, dict) else {}
+
+    def _drain_pings(self) -> list[tuple[str, str, str, "warmup.PingResult"]]:
+        """Take whatever the ping threads have finished since the last tick."""
+        with self._warm_lock:
+            drained = self._warm_results
+            self._warm_results = []
+        return drained
+
+    def _record_ping_result(
+        self, number: str, model: str, result: "warmup.PingResult"
+    ) -> None:
+        """Persist one outcome under ``warmup.<num>`` and set the backoff.
+
+        Three consecutive failures buy a day off rather than a half hour: at
+        that point the cause is structural (no ``claude`` on PATH, a slot
+        that cannot bootstrap, a revoked account), and retrying it every 30
+        minutes spawns a process to learn nothing.
+        """
+        if self.dry_run or result.skipped:
+            # A skip means nothing was spawned, so there is no outcome to
+            # record and — critically — no strike to earn. ``lastPingAt``
+            # from the start stamp stands, which holds the anti-loop
+            # cooldown; the account is reconsidered when it lifts.
+            return
+        now = self.clock()
+
+        def note(state: dict) -> None:
+            record = warmup.warmup_record(state, number)
+            record["lastPingModel"] = model
+            record["lastResult"] = (
+                "ok" if result.ok else (result.error or "failed")[: warmup.STDERR_CAP]
+            )
+            if result.ok:
+                record["failures"] = 0
+                record.pop("backoffUntil", None)
+                return
+            failures = record.get("failures")
+            failures = int(failures) + 1 if isinstance(failures, int) else 1
+            record["failures"] = failures
+            record["backoffUntil"] = now + (
+                warmup.FAILURE_LONG_BACKOFF_S
+                if failures >= warmup.FAILURE_STRIKES
+                else warmup.FAILURE_BACKOFF_S
+            )
+
+        self._mutate_state(note)
+
+    def _note_warm_deadline(self, ts: float) -> None:
+        if ts <= self.clock():
+            return
+        if self._warm_deadline_ts is None or ts < self._warm_deadline_ts:
+            self._warm_deadline_ts = ts
+
+    def _start_ping(
+        self, number: str, email: str, model: str, label: str | None
+    ) -> None:
+        """Spawn one hello on a daemon thread. One in flight per account."""
+        with self._warm_lock:
+            if number in self._warm_inflight:
+                return
+            self._warm_inflight.add(number)
+        now = self.clock()
+        try:
+            # Same stamps the manual path writes (``warmup.note_ping_started``)
+            # — the per-day model guard and the anti-loop cooldown belong to
+            # the ACCOUNT, not to the surface that sent the hello.
+            self._mutate_state(
+                lambda state: warmup.stamp_ping_started(
+                    state, number, model, label, now
+                )
+            )
+        except Exception as e:  # bookkeeping must not block the hello
+            _logger.debug("warmup state write failed for %s: %r", number, e)
+        active = self.switcher.current_account_number()
+        threading.Thread(
+            target=self._ping_worker,
+            args=(number, email, model, active),
+            daemon=True,
+            name=f"cswap-warmup-{number}",
+        ).start()
+
+    def _ping_worker(
+        self, number: str, email: str, model: str, active: str | None
+    ) -> None:
+        """Resolve the config dir and hello, on a daemon thread.
+
+        The ROLE is re-checked here, not trusted from the plan. Warmup runs
+        before the switch decision in the same tick, so a tick that plans a
+        hello and then switches would leave this thread resolving the
+        "active" path to :func:`paths.get_claude_config_home` — which by
+        then holds the NEW account's credentials. That warms the wrong
+        account and records it under the old one's number. The mirror case
+        is as bad: an account that BECOMES active loses its slot profile
+        (``setup_session`` refuses the active login), so the hello would die
+        with a SessionError and earn an undeserved strike.
+
+        Either way the answer is the same — abort, report ``skipped``, take
+        no strike.
+        """
+        try:
+            current = self.switcher.current_account_number()
+            if (number == active) != (number == current):
+                self._finish_ping(
+                    number, email, model,
+                    warmup.PingResult(
+                        ok=False, model=model, skipped=True,
+                        error="active account changed mid-tick",
+                    ),
+                )
+                return
+            cwd = warmup.warmup_cwd(self.switcher)
+            # Registers in the process-wide live-hello registry for the whole
+            # preparation + child, so a switch from ANY surface (not just
+            # this engine's own decision) can refuse the slot meanwhile.
+            result = warmup.perform_hello(
+                self.switcher, number, model, current, self.ping_runner, cwd,
+                warmup.PING_TIMEOUT_S,
+            )
+        except Exception as e:
+            # Type only: a SessionError from the slot preparation can embed
+            # slot and config-dir paths, and these strings are logged,
+            # scrolled and pasted into issues.
+            _logger.debug("warmup failed for account %s: %r", number, e)
+            result = warmup.PingResult(
+                ok=False,
+                model=model,
+                error=f"{warmup.safe_error(e)} preparing the account's profile",
+            )
+        self._finish_ping(number, email, model, result)
+
+    def _finish_ping(
+        self, number: str, email: str, model: str, result: "warmup.PingResult"
+    ) -> None:
+        with self._warm_lock:
+            self._warm_inflight.discard(number)
+            self._warm_results.append((number, email, model, result))
+        # A landed hello is worth a tick: the next one drains it and asks
+        # for a refetch of that account.
+        self._wake.set()
+
+    def _run_warmup(
+        self,
+        current: str,
+        quarantined: set[str],
+        entries: dict,
+        usage: dict,
+        headroom: dict,
+        warm_request: bool,
+    ) -> tuple[dict, dict, dict]:
+        """Drain finished hellos and refetch; PLAN, but do not spawn.
+
+        The spawn half runs after the switch decision
+        (:meth:`_spawn_planned_warmups`); this half runs before it, because
+        a landed hello's account is worth refetching before the tick
+        decides. Draining runs even when warmup is disabled — a hello
+        started before the setting was flipped still has a result to record.
+        """
+        refetch: set[str] = set()
+        for number, email, model, result in self._drain_pings():
+            self._record_ping_result(number, model, result)
+            self._emit(
+                WarmupEvent(
+                    action=(
+                        "skipped" if result.skipped
+                        else "pinged" if result.ok
+                        else "failed"
+                    ),
+                    number=number,
+                    email=email,
+                    model=model,
+                    detail=result.summary(),
+                )
+            )
+            if result.ok:
+                # Best effort only: ``UsageStore.reserve(respect_plans=False)``
+                # still gates on `poll_due or stale`, so a row fetched
+                # earlier in this same tick will NOT be refetched here. The
+                # new stamp then arrives whenever the row next goes stale or
+                # due, and `warmup.PING_COOLDOWN_S` is what keeps the
+                # meanwhile-still-cold row from being re-pinged every tick.
+                refetch.add(number)
+
+        enabled = bool(self.settings.warmup_enabled) or warm_request
+        if enabled and not self._session_shell_ok():
+            enabled = False
+        if not enabled and not refetch:
+            # The common case with warmup off: touch nothing, and in
+            # particular do not read the clock (ticks are tested against
+            # exact clock() call sequences).
+            return entries, usage, headroom
+        now = self.clock()
+        # One read for the whole step: `_warm_candidates` may run twice.
+        warm_state = self._warmup_section(self._read_state())
+        candidates = None
+        if enabled:
+            candidates = self._warm_candidates(entries, quarantined, now, warm_state)
+            if candidates.stale:
+                # ONE extra fetch per tick, stalest first — warmup shares the
+                # engine's 429 budget and must not turn a tick into an
+                # all-accounts refresh just because several rows look cold.
+                refetch.add(
+                    min(
+                        candidates.stale,
+                        key=lambda n: (
+                            entries[n].fetched_at
+                            if entries.get(n) is not None
+                            and entries[n].fetched_at is not None
+                            else 0.0
+                        ),
+                    )
+                )
+        if refetch:
+            entries = self.switcher.usage_entries_by_account(
+                fetch=refetch, scheduled=False
+            )
+            usage = {num: entry.decision_value() for num, entry in entries.items()}
+            headroom = _headroom_by_account(usage, self._models)
+            if enabled:
+                candidates = self._warm_candidates(
+                    entries, quarantined, now, warm_state
+                )
+        if not enabled or candidates is None:
+            return entries, usage, headroom
+
+        # Handed to the post-decision spawn phase.
+        self._warm_plan = (
+            now,
+            candidates,
+            # A manual request is a request for DATA now — the stagger is
+            # exactly the thing the user is overriding by pressing `p`.
+            bool(self.settings.warmup_stagger) and not warm_request,
+        )
+        return entries, usage, headroom
+
+    def _session_shell_ok(self) -> bool:
+        """False (once-warned) inside a ``cswap run`` shell.
+
+        There, ``CLAUDE_CONFIG_DIR`` points at a session profile, so
+        ``current_account_number()`` reports the SESSION's account — and the
+        machine's real default login reads as just another candidate.
+        ``config_dir_for`` would then hand it to ``setup_session``: a slot
+        copy of the live login, rotating the backup while ``~/.claude``
+        keeps the predecessor. Upstream refuses every live-store mutation
+        from such a shell for exactly this reason; a warmup rotates
+        credentials, so it is one.
+        """
+        try:
+            self.switcher._refuse_session_shell()
+            return True
+        except ClaudeSwitchError as e:
+            if not self._warm_shell_warned:
+                self._warm_shell_warned = True
+                self._emit(
+                    ConfigWarningEvent(message=f"warmup disabled: {e}")
+                )
+            return False
+
+    def _spawn_planned_warmups(self, outcome: TickOutcome) -> None:
+        """Start the hellos this tick planned, now that the switch is done.
+
+        Excludes the account the tick just switched TO: it has become the
+        default login, its credentials were installed moments ago, and on
+        macOS the Keychain pickup has a ~30s tail — a hello racing that is
+        all risk and no benefit, and it will be reconsidered next tick. The
+        account switched away FROM is fine: it is an ordinary slot again.
+
+        Never raises: a warmup problem must not escape into the loop.
+        """
+        plan = self._warm_plan
+        self._warm_plan = None
+        if plan is None:
+            return
+        try:
+            now, candidates, stagger = plan
+            exclude: set[str] = set()
+            if outcome is TickOutcome.SWITCHED and not self.dry_run:
+                landed = self.switcher.current_account_number()
+                if landed:
+                    exclude.add(str(landed))
+            labels = {
+                acct.number: (
+                    acct.state.cold_models[0] if acct.state.cold_models else None
+                )
+                for acct in candidates.eligible
+            }
+            for decision in warmup.plan_warmups(
+                now, candidates.eligible, stagger=stagger
+            ):
+                if not decision.is_now:
+                    if decision.at_ts is not None:
+                        self._note_warm_deadline(decision.at_ts)
+                    continue
+                if decision.number in exclude:
+                    continue
+                email = self.switcher.account_email(decision.number)
+                if self.dry_run:
+                    self._emit(
+                        WarmupEvent(
+                            action="would-ping",
+                            number=decision.number,
+                            email=email,
+                            model=decision.model,
+                            detail=decision.reason,
+                        )
+                    )
+                    continue
+                self._start_ping(
+                    decision.number, email, decision.model,
+                    labels.get(decision.number),
+                )
+            # Confirm a lapse promptly: a window whose stamp expires during
+            # the next sleep leaves the account cold and invisible until the
+            # following poll.
+            for acct in candidates.eligible:
+                if acct.state.reset_ts is not None:
+                    self._note_warm_deadline(acct.state.reset_ts + 60.0)
+        except Exception as e:  # pragma: no cover - safety net
+            _logger.debug("warmup spawn phase failed: %r", e)
+
+    def _warm_candidates(
+        self, entries: dict, quarantined: set[str], now: float, warm_state: dict
+    ) -> "warmup.Candidates":
+        with self._warm_lock:
+            in_flight = set(self._warm_inflight)
+        return warmup.collect_candidates(
+            self.switcher,
+            entries,
+            now,
+            models=self._models,
+            quarantined=quarantined,
+            warmup_state=warm_state,
+            in_flight=in_flight,
+        )
+
     # -- adaptive usage scheduling ---------------------------------------------
 
     def _collect_scheduled_usage(
@@ -2534,6 +2975,17 @@ class AutoSwitchEngine:
         self._switch_now.set()
         self._wake.set()
 
+    def request_warm(self) -> None:
+        """One-shot "ping/warm now" request from the TUI's `p`.
+
+        The next tick hellos EVERY cold eligible account immediately — the
+        stagger is ignored on purpose, because the point of the keypress is
+        to get the missing reset stamps on screen now. Warmup does not have
+        to be enabled in settings for this: an explicit request is its own
+        authorization, the same way `n` switches below the threshold."""
+        self._warm_now.set()
+        self._wake.set()
+
     def apply_threshold(self, threshold: float) -> None:
         """Session override from the TUI: retarget the trigger and poll
         cadence mid-run. Threshold only — the model axes (and their derived
@@ -2543,6 +2995,19 @@ class AutoSwitchEngine:
         self.switcher.set_poll_policy_inputs(threshold, self._models)
 
     def _next_delay(self, outcome: TickOutcome) -> float:
+        """The cadence delay, then clamped to any pending warmup deadline.
+
+        A staggered hello is due at a specific instant, and a 5-hour stamp
+        lapses at one — both are useless if the loop is asleep past them,
+        and the BLOCKED/idle branches below can sleep for tens of minutes.
+        The clamp only ever SHORTENS, and never below a second (a zero sleep
+        would spin the loop)."""
+        delay = self._cadence_delay(outcome)
+        if self._warm_deadline_ts is None:
+            return delay
+        return min(delay, max(self._warm_deadline_ts - self.clock(), 1.0))
+
+    def _cadence_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds
         if outcome is TickOutcome.BLOCKED:
             if self._sleep_until_ts is not None:

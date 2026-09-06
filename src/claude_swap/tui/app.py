@@ -64,6 +64,8 @@ class CswapApp(App):
         self.source = SnapshotSource(switcher)
         self._store_only = False
         self._full_next = False
+        # Single-flight guard for the `p` warmup worker (see action_warm_ping).
+        self._warming = False
         self._normal_refreshing = False
         self._store_refreshing = False
         self._normal_started_at: float | None = None
@@ -238,6 +240,9 @@ class CswapApp(App):
                 f"Auto-switch engine stopped: {event.worker.error}",
                 severity="error",
             )
+        elif event.worker.group == "warm":
+            self._warming = False
+            self.notify(f"Warmup failed: {event.worker.error}", severity="error")
 
     # -- mutating actions (single-flight, captured, off-thread) ---------------
 
@@ -283,13 +288,43 @@ class CswapApp(App):
 
     # -- account operations ----------------------------------------------------
 
+    def _hello_blocks_switch(self, number: str | None) -> bool:
+        """A toast instead of an error modal when a warmup is mid-rotation.
+
+        ``_perform_switch`` refuses this case outright (the slot's refresh
+        token is rotating; activating it would strand the live login on a
+        spent generation), but a raised SwitchError surfaces here as a
+        failure modal for something that resolves itself in seconds. Check
+        first and say so kindly. ``number=None`` means the target is not
+        known yet (the "best pick" action lets the switcher choose), so ANY
+        hello in flight blocks it.
+        """
+        from claude_swap import warmup
+
+        in_flight = warmup.active_hellos()
+        if not in_flight:
+            return False
+        if number is not None and str(number) not in in_flight:
+            return False
+        who = ", ".join(f"Account-{n}" for n in sorted(in_flight))
+        self.notify(
+            f"Warmup ping in flight for {who}; retry in a few seconds",
+            title="Switch",
+            severity="warning",
+        )
+        return True
+
     def do_switch(self, number: str) -> None:
+        if self._hello_blocks_switch(number):
+            return
         self._start_action(
             f"Switch to account {number}",
             partial(self.switcher.switch_to, number, json_output=True),
         )
 
     def action_switch_best(self) -> None:
+        if self._hello_blocks_switch(None):
+            return
         self._start_action(
             "Switch (best)",
             partial(self.switcher.switch, strategy="best", json_output=True),
@@ -393,6 +428,53 @@ class CswapApp(App):
     def action_refresh_full(self) -> None:
         self.request_refresh(full=True)
         self.notify("Refreshing usage…", timeout=2)
+
+    # -- warmup ----------------------------------------------------------------
+
+    def action_warm_ping(self) -> None:
+        """`p`: hello every cold account, then refresh the usage panel.
+
+        Off-thread like every other blocking switcher call — a hello can
+        take seconds, and the UI loop never waits on a child process. Cold
+        accounts only: ``cswap warm --all`` is the deliberate spelling for
+        warming an account whose window is already running.
+        """
+        if self._warming:
+            self.notify("A warmup is already running", severity="warning")
+            return
+        self._warming = True
+        self.notify("Warming cold accounts…", timeout=3)
+        self.run_worker(
+            self._warm_blocking,
+            thread=True,
+            group="warm",
+            exit_on_error=False,
+            name="warm",
+        )
+
+    def _warm_blocking(self) -> None:
+        from claude_swap import warmup
+        from claude_swap.settings import parse_model_names
+
+        settings = load_settings(self.switcher.backup_dir)
+        summary = warmup.warm_now(
+            self.switcher, models=parse_model_names(settings.model)
+        )
+        self.call_from_thread(self._warm_done, summary)
+
+    def _warm_done(self, summary) -> None:
+        self._warming = False
+        if summary.failures:
+            self.notify(
+                f"{summary.failures} warmup ping(s) failed",
+                title="Warmup",
+                severity="warning",
+            )
+        elif summary.attempted:
+            self.notify(f"Warmed {summary.attempted} account(s)", title="Warmup")
+        else:
+            self.notify("Nothing to warm", title="Warmup")
+        self.action_refresh_full()
 
     def action_open_auto(self) -> None:
         if isinstance(self.screen, AutoScreen):

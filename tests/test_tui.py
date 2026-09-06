@@ -1302,6 +1302,7 @@ class _FakeEngine:
         self.applied_thresholds: list[float] = []
         self.wakes = 0
         self.switch_requests = 0
+        self.warm_requests = 0
         self._stop = threading.Event()
         _FakeEngine.instances.append(self)
 
@@ -1323,6 +1324,9 @@ class _FakeEngine:
 
     def request_switch(self) -> None:
         self.switch_requests += 1
+
+    def request_warm(self) -> None:
+        self.warm_requests += 1
 
 
 @pytest.fixture
@@ -2015,6 +2019,219 @@ class TestAutoScreen:
             await pilot.pause()
             assert "switch now requested (best)" in self._log_text(app)
             assert fake_engine.instances[-1].switch_requests == 1
+
+
+    async def test_ping_warm_asks_the_engine_and_logs_it(
+        self, tmp_path, fake_engine
+    ):
+        """`p` never spawns from the screen: the engine's tick owns the
+        eligibility predicates, the slot preparation and the state file."""
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            engine = fake_engine.instances[0]
+            assert engine.warm_requests == 0
+            await pilot.press("p")
+            await pilot.pause()
+            assert engine.warm_requests == 1
+            assert fake.calls == []  # a warmup is not a switch
+            assert "warmup requested" in self._log_text(app)
+
+    async def test_ping_warm_is_inert_in_threshold_adjust_mode(
+        self, tmp_path, fake_engine
+    ):
+        """Mirrors `s` and `n`: while the threshold is armed the keys belong
+        to it."""
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await pilot.press("t", "p")
+            await pilot.pause()
+            assert fake_engine.instances[0].warm_requests == 0
+            assert "warmup requested" not in self._log_text(app)
+
+
+class TestWarmupEventRendering:
+    """`WarmupEvent` is background noise until it stops working."""
+
+    def test_a_successful_warmup_renders_muted(self):
+        from claude_swap.autoswitch import WarmupEvent
+        from claude_swap.tui.autoview import event_text
+        from claude_swap.tui.theme import Palette
+
+        text = event_text(
+            WarmupEvent(action="pinged", number="1", email="a@example.com"),
+            palette=Palette.DARK,
+        )
+        styles = {span.style for span in text.spans}
+        assert Palette.DARK.muted in styles
+        assert Palette.DARK.sev_warn not in styles
+
+    def test_a_failed_warmup_renders_as_a_warning(self):
+        from claude_swap.autoswitch import WarmupEvent
+        from claude_swap.tui.autoview import event_text
+        from claude_swap.tui.theme import Palette
+
+        text = event_text(
+            WarmupEvent(
+                action="failed", number="1", email="a@example.com",
+                detail="rc=1: boom",
+            ),
+            palette=Palette.DARK,
+        )
+        assert Palette.DARK.sev_warn in {span.style for span in text.spans}
+
+    def test_a_warmup_line_never_carries_a_config_path(self):
+        from claude_swap.autoswitch import WarmupEvent
+
+        event = WarmupEvent(
+            action="failed", number="1", email="a@example.com",
+            model="haiku", detail="rc=1: boom",
+        )
+        assert "CLAUDE_CONFIG_DIR" not in event.human()
+        assert event.to_json()["action"] == "failed"
+
+
+@pytest.mark.asyncio
+class TestDashboardWarmup:
+    async def test_p_runs_warm_now_off_thread_and_refreshes(
+        self, tmp_path, monkeypatch
+    ):
+        """The UI loop never waits on a child process, and the panel must
+        show the stamps the hellos just created."""
+        from claude_swap import warmup
+
+        calls: list[dict] = []
+
+        def fake_warm_now(switcher, **kwargs):
+            calls.append(kwargs)
+            return warmup.WarmSummary(
+                rows=[warmup.WarmRow(number="1", email="a@example.com",
+                                     action="pinged")]
+            )
+
+        monkeypatch.setattr(warmup, "warm_now", fake_warm_now)
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("p")
+            await settle(pilot)
+            assert len(calls) == 1
+            assert app._warming is False
+
+    async def test_a_second_press_while_warming_is_refused(
+        self, tmp_path, monkeypatch
+    ):
+        from claude_swap import warmup
+
+        gate = threading.Event()
+        started = threading.Event()
+        runs: list[int] = []
+
+        def slow_warm_now(switcher, **kwargs):
+            runs.append(1)
+            started.set()
+            gate.wait(5)
+            return warmup.WarmSummary()
+
+        monkeypatch.setattr(warmup, "warm_now", slow_warm_now)
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        try:
+            async with app.run_test(size=(100, 40)) as pilot:
+                await settle(pilot)
+                app.action_warm_ping()
+                await pilot.pause()  # let the worker thread actually start
+                assert started.wait(5)
+                assert app._warming is True
+                app.action_warm_ping()  # refused, no second worker
+                await pilot.pause()
+                gate.set()
+                await settle(pilot)
+                assert app._warming is False
+                assert runs == [1]
+        finally:
+            gate.set()
+
+
+@pytest.mark.asyncio
+class TestSwitchRefusedWhileWarming:
+    """A switch onto a slot whose hello is still running would install the
+    pre-rotation credential as the live login and let the warmup's consume
+    gate supersede it — a spent refresh token in ``~/.claude``.
+
+    ``_perform_switch`` refuses it outright; the dashboard checks first so
+    the user gets a toast instead of a failure modal for something that
+    clears itself in seconds.
+    """
+
+    async def test_a_targeted_switch_is_refused_and_allowed_after(
+        self, tmp_path
+    ):
+        from claude_swap import warmup
+
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            with warmup.hello_in_flight("2"):
+                app.do_switch("2")
+                await settle(pilot)
+                assert fake.calls == []
+            app.do_switch("2")
+            await settle(pilot)
+            assert [c[0] for c in fake.calls] == ["switch_to"]
+
+    async def test_another_accounts_hello_does_not_block_the_switch(
+        self, tmp_path
+    ):
+        """Only the TARGET matters for a targeted switch."""
+        from claude_swap import warmup
+
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2), make_account(3)],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            with warmup.hello_in_flight("3"):
+                app.do_switch("2")
+                await settle(pilot)
+            assert [c[0] for c in fake.calls] == ["switch_to"]
+
+    async def test_best_pick_is_blocked_by_any_hello(self, tmp_path):
+        """`b` lets the switcher choose, so the target is unknown until it
+        has already landed — any hello in flight has to block it."""
+        from claude_swap import warmup
+
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            with warmup.hello_in_flight("2"):
+                app.action_switch_best()
+                await settle(pilot)
+                assert fake.calls == []
+            app.action_switch_best()
+            await settle(pilot)
+            assert [c[0] for c in fake.calls] == ["switch"]
 
 
 class TestEventText:

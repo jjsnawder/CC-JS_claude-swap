@@ -64,6 +64,10 @@ def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Te
     ``N% used`` is lifted to foreground too — the one number worth reading.
     """
     role = _EVENT_ROLES.get(event.kind)
+    if event.kind == "warmup" and getattr(event, "action", "") == "failed":
+        # Warmup is background noise until it stops working: a hello that
+        # cannot run means an account's window will keep lapsing unseen.
+        role = "sev_warn"
     style = getattr(palette, role) if role is not None else palette.muted
     text = Text()
     text.append(f"{data.clock_stamp()}  ", style=palette.foreground)
@@ -84,6 +88,7 @@ class AutoScreen(Screen):
         Binding("t", "adjust_threshold", "Threshold"),
         Binding("s", "toggle_strategy", "Strategy"),
         Binding("n", "switch_now", "Switch now"),
+        Binding("p", "ping_warm", "Ping/warm"),
         Binding("left", "threshold_step(-1)", "-1%"),
         Binding("right", "threshold_step(1)", "+1%"),
         Binding("enter", "adjust_done", "Done"),
@@ -165,7 +170,7 @@ class AutoScreen(Screen):
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         if action in ("threshold_step", "adjust_done") and not self._adjusting:
             return False  # hidden and inert until adjust mode is armed
-        if action in ("toggle_strategy", "switch_now") and self._adjusting:
+        if action in ("toggle_strategy", "switch_now", "ping_warm") and self._adjusting:
             return False  # the keys belong to the threshold while it is armed
         return True
 
@@ -275,6 +280,31 @@ class AutoScreen(Screen):
         self.query_one("#event-log", RichLog).write(
             Text(
                 f"— switch now requested ({self._settings.strategy}) —",
+                style=Palette.from_theme(self.app.current_theme).muted,
+            )
+        )
+
+    # -- ping / warm ----------------------------------------------------------
+
+    def action_ping_warm(self) -> None:
+        """Ask the engine to warm every cold account on its next tick.
+
+        Like `n`, the ENGINE does it: the hello has to go through the slot
+        preparation, the eligibility predicates and the state file, none of
+        which this screen owns. Unlike the automatic warmup, the request
+        ignores the stagger and does not require ``warmupEnabled`` — the
+        keypress is the authorization, and the point of it is to fill in the
+        reset stamps that an Anthropic-side reset left blank.
+
+        Inert in threshold-adjust mode, like `s` and `n`. In DRY-RUN the
+        engine previews (``would warm ...``) instead of spawning.
+        """
+        if self._settings is None or self._adjusting or self._engine is None:
+            return
+        self._engine.request_warm()
+        self.query_one("#event-log", RichLog).write(
+            Text(
+                "— warmup requested —",
                 style=Palette.from_theme(self.app.current_theme).muted,
             )
         )

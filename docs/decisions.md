@@ -190,3 +190,48 @@ correctly: a slot copy of the live login would rotate a second token family
 and drift from the store.
 **Why it matters:** the two paths look alike in the code and must stay distinct;
 `deep` is briefed to attack exactly this boundary.
+
+## 2026-09-06 - In-flight hellos count as virtually warm in the stagger planner
+**Chose:** an account whose hello is still running stays in the eligible set
+with a virtual reset phase of `now + period`, and receives no new decision.
+**Rejected:** dropping it from the set for the duration (the plan's wording).
+Measured during the build: that shrank N and let the next cold account
+bootstrap into the very slot the running hello was about to claim - one slow
+ping produced three immediate pings across three ticks.
+**Why it matters:** `test_only_one_hello_per_account_is_ever_in_flight` pins
+it; "simplifying" the planner to skip in-flight accounts reintroduces the burst.
+
+## 2026-09-06 - Correction: worst-case cold wait under stagger is period·(1 − 1/2N)
+**Chose:** state the bound as `period·(1 − 1/2N)`: 4 h 22 for four accounts.
+The earlier entry's `period·(N−1)/N` (3 h 45) is only the bootstrap case;
+review found a non-bootstrap phase set (warm at 24.8 / 100 / 200 min, cold at
+0) that waits 4 h 22.
+**Rejected:** editing the earlier entry (this log is append-only).
+**Why it matters:** the behaviour is unchanged and still Jeremy's pick; only
+the promise was wrong, and a wrong bound is what gets quoted later.
+
+## 2026-09-06 - Correction: `setup_session` does not refuse the active login
+**Chose:** record that the "active login is pinged through the default config
+dir" rule is enforced only by the warmup's own `number == active` check. The
+earlier entry credited `setup_session` with refusing the active login; the
+`deep` verifier showed that refusal lives in the interactive `run()` and only
+when `CLAUDE_CONFIG_DIR` is unset. Also confirmed: `get_claude_config_home()`
+(follows the env var) is the right read for the active hello because
+`current_account_number()` follows the same var; the env-ignoring default path
+would send the hello as one account and record it as another.
+**Rejected:** editing the earlier entry (append-only log).
+**Why it matters:** anyone removing the comparison "because the session layer
+already guards it" would rotate a second token family for the live login.
+
+## 2026-09-06 - Warmup spawns after the switch decision, and is refused in a session shell
+**Chose:** the tick drains finished hellos and refetches before deciding, but
+plans and spawns new hellos only after the switch outcome is known, never for
+the account just switched to; `_freshen_target` skips an account whose hello is
+in flight; `warm_now` and the engine hook call `_refuse_session_shell()` like
+every other live-store mutation.
+**Rejected:** spawning before the decision (the built order). `deep` found the
+race: a hello's consume-gate token POST runs outside the lock while
+`_perform_switch` copies the previous credential generation into the live
+login, which then holds a spent refresh token.
+**Why it matters:** the two halves look independent (a ping is "just a read")
+and are not - the slot preparation rotates tokens.

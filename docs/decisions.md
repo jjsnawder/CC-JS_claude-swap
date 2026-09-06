@@ -142,3 +142,51 @@ the ranking outside the engine — the panel/engine drift the shared key just
 removed).
 **Why it matters:** one decision path, one log, one state file. A manual move
 is recorded like any other so the engine cannot immediately undo it.
+
+## 2026-09-06 - Warmup pings are real Claude Code `-p` sessions, not raw API calls
+**Chose:** start an account's 5-hour window by spawning the installed `claude`
+binary headless (`-p`, one turn, no tools, no settings, no session persistence,
+stub system prompt) with `CLAUDE_CONFIG_DIR` pointed at the slot dir — the same
+preparation `cswap run` uses (`SessionManager.setup_session`).
+**Rejected:** calling the messages API directly with the account's OAuth token
+(cheaper to implement, no child process). Anthropic has cut off accounts for
+third-party use of Claude Code OAuth tokens; cswap already lives on the edge by
+reading the usage endpoint, and a message call is a different category of risk
+for a fork whose whole value is four working accounts.
+**Why it matters:** the runner's command line is the contract (measured at ~430
+input / <100 output tokens per hello). Anyone "optimizing" it into an HTTP call
+reopens the account-risk question.
+
+## 2026-09-06 - Warmup policy is staggered phases, not keep-alive
+**Chose:** a cold account (5h stamp absent or past) is pinged when its new reset
+would land at the midpoint of the largest gap between the other warm accounts'
+reset phases (tolerance half a spacing, spacing = 5h / eligible accounts);
+otherwise it waits for that moment. `autoswitch.warmupStagger=false` degrades
+to plain keep-alive. Jeremy's pick, 2026-09-06.
+**Rejected:** keep-alive on expiry (simplest; leaves the four resets wherever
+history bunched them). Fixed clock times (today's Task Scheduler pattern;
+accounts sit cold between times and phases drift off the clock).
+**Why it matters:** the worst-case cold wait is 3 h 45 for four accounts. A cold
+account is still fully usable, so the wait costs reset-nearness, never quota.
+The manual `p` / `cswap warm` deliberately ignores the stagger.
+
+## 2026-09-06 - Model-window pings ride the existing `autoswitch.model` setting
+**Chose:** when a label in `autoswitch.model` (Fable today) has no reset stamp on
+an account, the next hello for that account uses that model (alias = lowercased
+label; `--model fable` verified), at most once per account per label per day.
+**Rejected:** a separate `warmupModels` knob (a second list to keep in sync with
+the windows the engine already ranks on). Haiku-only (leaves the Fable stamp
+blank until real use — the exact gap Jeremy asked to close).
+**Why it matters:** a Fable hello measured 494 input / 15 output tokens — noise
+against a weekly window — but it is still a Fable call; the per-day guard is
+what keeps an API quirk from looping it.
+
+## 2026-09-06 - The active login is pinged through the default config dir
+**Chose:** for the account that is the current global login, the hello runs with
+`CLAUDE_CONFIG_DIR` = the live Claude config home (today's Task Scheduler job's
+path); every other account goes through its slot dir.
+**Rejected:** a slot dir for the active account — `setup_session` refuses it,
+correctly: a slot copy of the live login would rotate a second token family
+and drift from the store.
+**Why it matters:** the two paths look alike in the code and must stay distinct;
+`deep` is briefed to attack exactly this boundary.

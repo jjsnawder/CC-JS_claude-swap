@@ -1,6 +1,6 @@
 # Plan — Warmup: staggered 5-hour windows across all accounts
 
-Date: 2026-09-06 · Branch: `jeremy` · Status: **built — awaiting Jeremy's live slot trial**
+Date: 2026-09-06 · Branch: `jeremy` · Status: **live (first hello 2026-09-06 16:38) — countdown panel shipped; stagger tuning open**
 Depends on: `2026-09-04-auto-screen-switch-now.md` (shipped).
 
 ## Ask (Jeremy, 2026-09-06 evening)
@@ -277,3 +277,12 @@ true`, `p` on the auto screen in dry-run, then live.
 ## Status log
 - 2026-09-06 evening — plan written; Jeremy asleep, build proceeds autonomously.
 - 2026-09-06 night — built, reviewed, deep-verified, committed on `jeremy`.
+- 2026-09-06 16:38 — first live staggered hello: Account-3, haiku, ok, no
+  window flash reported yet (Jeremy to confirm). 37 min earlier than the
+  17:15 target: `tolerance = spacing/2` fires on the first tick inside the
+  window. See decisions.md (two open stagger findings: tolerance, next-up order).
+- 2026-09-06 — TUI warmup countdown panel shipped (`04e6539`, `2d743c2`):
+  `build_schedule`/`WarmupSlot`, `engine.warmup_schedule()`, `#warmup-panel`
+  on the auto screen, 1 s countdown, stale marker. Suite 2281 passed / 78
+  skipped. Needs a TUI relaunch to appear (editable install; PID 6220 predates it).
+

@@ -235,3 +235,32 @@ race: a hello's consume-gate token POST runs outside the lock while
 login, which then holds a spent refresh token.
 **Why it matters:** the two halves look independent (a ping is "just a read")
 and are not - the slot preparation rotates tokens.
+
+## 2026-09-06 - Warmup countdown panel reads a schedule mirror, not the state file
+**Chose:** the engine keeps the per-account plan it already computes each tick
+(`build_schedule` → frozen `WarmupSlot` rows under `_warm_lock`,
+`warmup_schedule()` to read) and the auto screen renders it on a 1 s timer as
+a `WARMUP` panel under the candidates list. Cleared only when the warmup step
+ran and found itself disabled with no hello in flight; otherwise early-return
+ticks keep the last plan. Marked `(stale)` past two poll intervals because the
+spawn phase's `except` can swallow a failure and leave old rows standing.
+**Rejected:** persisting the schedule into `autoswitch_state.json` (a second
+writer of a file the tick already owns, for a display need) and recomputing
+`plan_warmups` in the TUI thread (a second planner that could disagree with
+the one that spawns).
+**Why it matters:** the panel must never claim a time the engine did not
+plan; the mirror is the engine's own decision list, verbatim.
+
+## 2026-09-06 - First live hello observed 37 min early; two stagger findings, not yet changed
+**Chose:** record, not fix, in this change. Account-3 was pinged at 16:38
+against a 17:15 target because `tolerance = spacing / 2` (37.5 min at N=4) fires
+on the first tick inside the window; its reset lands 38 min after the anchor
+instead of 75. Separately, cold accounts are assigned phase slots in slot-number
+order, so the switch ranking ("next up") never influences which account is
+warmed first. Candidate fixes for Jeremy's call: tolerance ≈ one poll interval
++ 60 s; order cold accounts by the engine's own switch key (strategy-aware),
+slot order as tie-break, next-up taking the earliest slot.
+**Rejected:** folding either into the countdown-panel commit (different concern;
+both change the pinned stagger math and its tests).
+**Why it matters:** the spread is the feature; a half-spacing tolerance halves
+it at bootstrap, and an order that ignores next-up wastes a free win.

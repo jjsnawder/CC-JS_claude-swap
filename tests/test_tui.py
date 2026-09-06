@@ -1303,6 +1303,10 @@ class _FakeEngine:
         self.wakes = 0
         self.switch_requests = 0
         self.warm_requests = 0
+        # What the warmup countdown panel renders (`warmup_schedule()`),
+        # and the setting it reads for the "off" line.
+        self.schedule: dict = {}
+        self.warmup_enabled = bool(getattr(settings, "warmup_enabled", False))
         self._stop = threading.Event()
         _FakeEngine.instances.append(self)
 
@@ -1327,6 +1331,9 @@ class _FakeEngine:
 
     def request_warm(self) -> None:
         self.warm_requests += 1
+
+    def warmup_schedule(self) -> dict:
+        return dict(self.schedule)
 
 
 @pytest.fixture
@@ -2097,6 +2104,199 @@ class TestWarmupEventRendering:
         )
         assert "CLAUDE_CONFIG_DIR" not in event.human()
         assert event.to_json()["action"] == "failed"
+
+
+class TestWarmupPanel:
+    """`warmup_panel_text` — the auto screen's per-account countdown block.
+
+    Pure by construction (a schedule dict plus a clock in, a `Text` out), so
+    every format below is pinned without a running app or an engine.
+    """
+
+    @staticmethod
+    def _slot(number, status, **kw):
+        from claude_swap.warmup import WarmupSlot
+
+        return WarmupSlot(number=number, status=status, **kw)
+
+    @staticmethod
+    def _panel(schedule, now=1000.0, enabled=True):
+        from claude_swap.tui.autoview import warmup_panel_text
+        from claude_swap.tui.theme import Palette
+
+        return warmup_panel_text(
+            schedule, now=now, enabled=enabled, palette=Palette.DARK
+        )
+
+    def test_the_countdown_format_switches_at_an_hour(self):
+        from claude_swap.tui.autoview import countdown_text
+
+        assert countdown_text(3552) == "59:12"
+        assert countdown_text(3600) == "1:00:00"
+        assert countdown_text(17_040) == "4:44:00"
+        assert countdown_text(9) == "00:09"
+        assert countdown_text(-5) == "00:00"  # never a negative countdown
+
+    def test_a_scheduled_row_carries_the_countdown_the_clock_and_the_model(self):
+        now = 1000.0
+        at = now + 3552
+        text = self._panel(
+            {"3": self._slot("3", "scheduled", email="c@example.com",
+                             at_ts=at, model="haiku")},
+            now=now,
+        )
+        stamp = time.strftime("%H:%M", time.localtime(at))
+        assert f"next hello in 59:12 ({stamp}) · haiku" in text.plain
+        assert "next: Account-3 in 59:12" in text.plain
+
+    def test_a_warm_row_shows_the_reset_it_is_counting_down_to(self):
+        now = 1000.0
+        reset = now + 17_040
+        text = self._panel(
+            {"4": self._slot("4", "warm", email="d@example.com", reset_ts=reset)},
+            now=now,
+        )
+        stamp = time.strftime("%H:%M", time.localtime(reset))
+        assert f"warm · 5h resets {stamp} (in 4:44:00)" in text.plain
+        assert "nothing scheduled" in text.plain  # nothing is upcoming
+
+    def test_a_lapsed_schedule_reads_as_due_now(self):
+        text = self._panel(
+            {"2": self._slot("2", "scheduled", at_ts=900.0, model="haiku")},
+            now=1000.0,
+        )
+        assert "hello due now · haiku" in text.plain
+        assert "next: Account-2 due now" in text.plain
+
+    def test_in_flight_and_skipped_rows_say_so(self):
+        text = self._panel({
+            "1": self._slot("1", "in-flight", email="a@example.com"),
+            "2": self._slot("2", "skipped", email="b@example.com",
+                            reason="at limit"),
+        })
+        assert "hello in flight" in text.plain
+        assert "skipped: at limit" in text.plain
+
+    def test_the_soonest_row_is_accented(self):
+        from claude_swap.tui.theme import Palette
+
+        now = 1000.0
+        text = self._panel(
+            {
+                "2": self._slot("2", "scheduled", at_ts=now + 7200),
+                "3": self._slot("3", "scheduled", at_ts=now + 3552),
+            },
+            now=now,
+        )
+        accented = [
+            text.plain[span.start : span.end]
+            for span in text.spans
+            if span.style == Palette.DARK.accent
+        ]
+        assert any("59:12" in run for run in accented)
+        assert not any("2:00:00" in run for run in accented)
+
+    def test_a_dry_run_row_says_it_is_a_preview(self):
+        """A dry-run engine re-previews the same decision every tick and
+        spawns nothing: an unqualified "due now" would read as stuck."""
+        text = self._panel(
+            {"1": self._slot("1", "due", model="haiku", dry_run=True)}
+        )
+        assert "would hello now (dry-run) · haiku" in text.plain
+
+    def test_an_all_in_flight_panel_counts_the_hellos(self):
+        text = self._panel({
+            "1": self._slot("1", "in-flight"),
+            "2": self._slot("2", "in-flight"),
+        })
+        assert "2 hellos in flight" in text.plain
+        assert "nothing scheduled" not in text.plain
+
+    def test_a_schedule_older_than_the_window_is_marked_stale(self):
+        """The engine's spawn phase swallows its own exceptions, so a dead
+        pass leaves countdowns running on a plan nobody is acting on."""
+        now = 1000.0
+        slot = self._slot("3", "scheduled", at_ts=now + 60, computed_ts=now - 500)
+        assert "(stale)" not in self._panel(
+            {"3": slot}, now=now
+        ).plain  # no window given: nothing to judge against
+        from claude_swap.tui.autoview import warmup_panel_text
+        from claude_swap.tui.theme import Palette
+
+        fresh = warmup_panel_text(
+            {"3": self._slot("3", "scheduled", at_ts=now + 60, computed_ts=now - 30)},
+            now=now, enabled=True, palette=Palette.DARK, stale_after_s=120.0,
+        )
+        assert "(stale)" not in fresh.plain
+        stale = warmup_panel_text(
+            {"3": slot}, now=now, enabled=True, palette=Palette.DARK,
+            stale_after_s=120.0,
+        )
+        assert "(stale)" in stale.plain
+
+    def test_warmup_off_says_how_to_turn_it_on(self):
+        text = self._panel({}, enabled=False)
+        assert "cswap config set autoswitch.warmupEnabled true" in text.plain
+        assert "WARMUP" in text.plain
+
+    def test_an_empty_schedule_while_enabled_is_a_waiting_line(self):
+        text = self._panel({}, enabled=True)
+        assert "waiting for first tick" in text.plain
+
+
+@pytest.mark.asyncio
+class TestAutoScreenWarmupPanel:
+    async def _open(self, pilot):
+        await settle(pilot)
+        await pilot.press("g")
+        await pilot.pause()
+
+    async def test_the_panel_mounts_and_renders_the_engine_schedule(
+        self, tmp_path, fake_engine
+    ):
+        from claude_swap.warmup import WarmupSlot
+
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            from textual.widgets import Static
+
+            panel = app.screen.query_one("#warmup-panel", Static)
+            assert "WARMUP" in panel.render().plain
+            engine = fake_engine.instances[0]
+            engine.schedule = {
+                "2": WarmupSlot(
+                    number="2", email="b@example.com", status="scheduled",
+                    at_ts=time.time() + 3552, model="haiku",
+                )
+            }
+            # An engine event repaints immediately, without waiting a second.
+            app.screen._on_engine_event(NoSwitchEvent(reason="cooldown"))
+            await pilot.pause()
+            assert "next hello in 59:1" in panel.render().plain
+
+    async def test_the_off_line_follows_the_engines_setting(
+        self, tmp_path, fake_engine
+    ):
+        """Not the screen's mount-time copy: `l`/`s` rebuild the engine, and
+        that rebuild is where a changed setting takes effect."""
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            from textual.widgets import Static
+
+            panel = app.screen.query_one("#warmup-panel", Static)
+            assert "warmupEnabled" in panel.render().plain  # off by default
+            fake_engine.instances[0].warmup_enabled = True
+            app.screen._on_engine_event(NoSwitchEvent(reason="cooldown"))
+            await pilot.pause()
+            assert "waiting for first tick" in panel.render().plain
 
 
 @pytest.mark.asyncio

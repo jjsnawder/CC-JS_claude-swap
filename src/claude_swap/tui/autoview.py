@@ -26,7 +26,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Footer, RichLog, Static
 
-from claude_swap import oauth
+from claude_swap import oauth, warmup
 from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
@@ -82,6 +82,125 @@ def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Te
     return text
 
 
+def countdown_text(seconds: float) -> str:
+    """``H:MM:SS`` from an hour up, ``MM:SS`` below it. Never negative."""
+    s = int(max(0.0, seconds))
+    hours, rem = divmod(s, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _clock_at(ts: float) -> str:
+    """Local-time ``HH:MM`` for an absolute instant."""
+    return time.strftime("%H:%M", time.localtime(ts))
+
+
+def _slot_status_text(slot: "warmup.WarmupSlot", *, now: float) -> tuple[str, str]:
+    """One slot's status phrase, plus the palette role it defaults to."""
+    if slot.upcoming:
+        if slot.at_ts is not None and slot.at_ts > now:
+            return (
+                f"next hello in {countdown_text(slot.at_ts - now)} "
+                f"({_clock_at(slot.at_ts)}) · {slot.model}",
+                "foreground",
+            )
+        # A dry-run engine previews the same decision every tick and spawns
+        # nothing — "due now" forever would read as a stuck warmup.
+        if slot.dry_run:
+            return f"would hello now (dry-run) · {slot.model}", "foreground"
+        return f"hello due now · {slot.model}", "foreground"
+    if slot.status == "in-flight":
+        return "hello in flight", "accent"
+    if slot.status == "warm":
+        if slot.reset_ts is not None:
+            return (
+                f"warm · 5h resets {_clock_at(slot.reset_ts)} "
+                f"(in {countdown_text(slot.reset_ts - now)})",
+                "muted",
+            )
+        return "warm", "muted"
+    if slot.status == "excluded":
+        return f"held: {slot.reason or 'switched to this tick'}", "muted"
+    return f"skipped: {slot.reason or 'not eligible'}", "muted"
+
+
+def warmup_panel_text(
+    schedule: dict,
+    *,
+    now: float,
+    enabled: bool,
+    palette: Palette = Palette.DARK,
+    stale_after_s: float | None = None,
+) -> Text:
+    """The warmup panel: when every managed account is next warmed.
+
+    Pure — takes the engine's :meth:`AutoSwitchEngine.warmup_schedule`
+    snapshot and a clock, returns the rendered block. The soonest upcoming
+    hello is summarized on the header line and its row is accented, so "when
+    do 1/2/3 get warmed" is answerable at a glance rather than by reading
+    back through the event log.
+
+    ``stale_after_s`` guards the one failure this panel cannot otherwise
+    show: the engine's spawn phase swallows its own exceptions, so a pass
+    that dies mid-flight leaves the PREVIOUS pass's schedule standing and
+    its countdowns run to "due now" and sit there. Past that age (the
+    caller's poll interval with room to spare) the header says so rather
+    than presenting arithmetic on a dead plan as fact.
+    """
+    text = Text()
+    text.append("WARMUP", style=f"bold {palette.accent}")
+    if not enabled:
+        text.append(
+            "  off — cswap config set autoswitch.warmupEnabled true",
+            style=palette.muted,
+        )
+        return text
+    slots = list(schedule.values())
+    if not slots:
+        text.append("\n  waiting for first tick…", style=palette.muted)
+        return text
+    # The soonest hello still ahead of us: a `due` row (this tick) outranks
+    # any scheduled one, and among scheduled rows the earliest `at_ts` wins.
+    upcoming = [s for s in slots if s.upcoming]
+    soonest = min(
+        upcoming,
+        key=lambda s: (s.at_ts if s.status == "scheduled" and s.at_ts else 0.0),
+        default=None,
+    )
+    in_flight = sum(1 for s in slots if s.status == "in-flight")
+    if soonest is not None and soonest.at_ts is not None and soonest.at_ts > now:
+        text.append(
+            f"  ·  next: Account-{soonest.number} in "
+            f"{countdown_text(soonest.at_ts - now)}",
+            style=palette.muted,
+        )
+    elif soonest is not None:
+        text.append(f"  ·  next: Account-{soonest.number} due now", style=palette.muted)
+    elif in_flight:
+        text.append(
+            f"  ·  {in_flight} hello{'s' if in_flight > 1 else ''} in flight",
+            style=palette.muted,
+        )
+    else:
+        text.append("  ·  nothing scheduled", style=palette.muted)
+    if stale_after_s is not None:
+        computed = max((s.computed_ts for s in slots), default=0.0)
+        if computed and now - computed > stale_after_s:
+            text.append(" (stale)", style=palette.muted)
+    for slot in slots:
+        text.append(f"\n  {slot.number:>2}  ", style=palette.foreground)
+        if slot.email:
+            text.append(slot.email, style=palette.foreground)
+        status, role = _slot_status_text(slot, now=now)
+        if soonest is not None and slot.number == soonest.number:
+            role = "accent"
+        text.append("  ")
+        text.append(status, style=getattr(palette, role))
+    return text
+
+
 class AutoScreen(Screen):
     BINDINGS = [
         Binding("l", "toggle_live", "Go live / dry-run"),
@@ -114,6 +233,9 @@ class AutoScreen(Screen):
         # and the summary tags the difference so a session override can never
         # be mistaken for the persisted one (`cswap config set` is that path).
         self._configured_strategy: str | None = None
+        self._warm_timer = None
+        # Last warmup panel text rendered, to skip no-op repaints.
+        self._warm_rendered: str | None = None
 
     def compose(self) -> ComposeResult:
         yield AccountsPanel(show_minis=False, id="auto-active-panel")
@@ -122,6 +244,7 @@ class AutoScreen(Screen):
                 yield Static(" DRY-RUN ", id="mode-badge", classes="dry")
                 yield Static("", id="auto-summary")
             yield Static("", id="candidates")
+            yield Static("", id="warmup-panel")
         yield RichLog(id="event-log", highlight=False, markup=False, wrap=True)
         yield Footer()
 
@@ -141,8 +264,17 @@ class AutoScreen(Screen):
         self.watch(self.app, "snapshot", self._on_snapshot)
         self.watch(self.app, "theme", self._on_theme_change)
         self._start_engine(dry_run=True)
+        # A countdown has to move on its own: the engine only speaks on a
+        # tick (up to a minute apart) and the panel's whole job is telling
+        # you how long until the next hello. Screen-owned, so it stops with
+        # the screen; the render is a dict copy plus a few strings.
+        self._warm_timer = self.set_interval(1.0, self._refresh_warmup_panel)
+        self._refresh_warmup_panel()
 
     def on_unmount(self) -> None:
+        if self._warm_timer is not None:
+            self._warm_timer.stop()
+            self._warm_timer = None
         if self._engine is not None:
             self._engine.stop()
         # A session threshold must not outlive the engine it steered: unpin
@@ -155,6 +287,10 @@ class AutoScreen(Screen):
     def _on_theme_change(self, _theme: str) -> None:
         self._update_summary()
         self._update_badge()
+        # Same text, different colours: the repaint cache must not swallow a
+        # theme change.
+        self._warm_rendered = None
+        self._refresh_warmup_panel()
         snap = self.app.snapshot
         if snap is not None:
             self._on_snapshot(snap)
@@ -373,6 +509,9 @@ class AutoScreen(Screen):
             return
         palette = Palette.from_theme(self.app.current_theme)
         self.query_one("#event-log", RichLog).write(event_text(event, palette=palette))
+        # A `pinged`/`failed`/`would-ping` line and the panel must agree the
+        # moment it lands, not up to a second later.
+        self._refresh_warmup_panel()
         if event.kind == "switch":
             self.app.request_refresh()
 
@@ -401,6 +540,49 @@ class AutoScreen(Screen):
         if self._engine is not None:
             self._engine.stop()
         self._start_engine(dry_run=dry_run)
+        # The new engine has planned nothing yet: show that rather than the
+        # dead one's schedule.
+        self._refresh_warmup_panel()
+
+    # -- warmup panel ---------------------------------------------------------
+
+    def _refresh_warmup_panel(self) -> None:
+        """Re-render the countdown block from the engine's schedule.
+
+        Called on a 1s timer, on every engine event, and on a theme change.
+        Reads only ``warmup_schedule()`` — a copy taken under the engine's
+        own lock — so it never touches engine state from this thread.
+        """
+        if not self.is_attached:
+            return
+        engine = self._engine
+        schedule = engine.warmup_schedule() if engine is not None else {}
+        # The ENGINE's setting, not the screen's mount-time copy: `s` and `l`
+        # rebuild the engine, and that rebuild is where a changed setting
+        # takes effect. `p` (request_warm) also plans without
+        # `warmupEnabled`, so a schedule on hand outranks the setting —
+        # never hide a live plan behind an "off" line.
+        enabled = bool(schedule) or bool(
+            engine is not None and engine.warmup_enabled
+        )
+        interval = (
+            self._settings.interval_seconds if self._settings is not None else 60.0
+        )
+        text = warmup_panel_text(
+            schedule,
+            now=time.time(),
+            enabled=enabled,
+            palette=Palette.from_theme(self.app.current_theme),
+            # Two polls: one missed pass is a hiccup, two is a dead plan.
+            stale_after_s=2.0 * interval,
+        )
+        # A second-by-second countdown is the only thing that normally
+        # changes here; when even that is static (nothing scheduled, warmup
+        # off) skip the update so an idle screen does not repaint at 1 Hz.
+        if text.plain == self._warm_rendered:
+            return
+        self._warm_rendered = text.plain
+        self.query_one("#warmup-panel", Static).update(text)
 
     def _update_badge(self) -> None:
         badge = self.query_one("#mode-badge", Static)

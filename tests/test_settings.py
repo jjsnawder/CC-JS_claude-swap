@@ -213,6 +213,28 @@ class TestSetUnsetSetting:
         with pytest.raises(ConfigError, match="true or false"):
             set_setting(tmp_path, "autoswitch.includeApiKeyAccounts", "falsy")
 
+    def test_warmup_keys_round_trip(self, tmp_path: Path):
+        """Warmup is OFF by default (it spends tokens and spawns a child
+        process; an upgrade may not start doing that unasked) and staggered
+        when on."""
+        defaults = AutoSwitchSettings()
+        assert defaults.warmup_enabled is False
+        assert defaults.warmup_stagger is True
+
+        assert set_setting(tmp_path, "autoswitch.warmupEnabled", "true") is True
+        assert set_setting(tmp_path, "autoswitch.warmupStagger", "no") is False
+        loaded = load_settings(tmp_path)
+        assert loaded.warmup_enabled is True
+        assert loaded.warmup_stagger is False
+
+    def test_garbage_warmup_values_clamp_to_bools(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"warmupEnabled": "yes", "warmupStagger": 0}})
+        )
+        loaded = load_settings(tmp_path)
+        assert loaded.warmup_enabled is True
+        assert loaded.warmup_stagger is False
+
     def test_set_on_corrupt_file_raises_and_preserves_it(self, tmp_path: Path):
         settings_path(tmp_path).write_text("{not json")
         with pytest.raises(ConfigError, match="not valid JSON"):

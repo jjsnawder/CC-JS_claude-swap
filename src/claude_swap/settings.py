@@ -61,6 +61,15 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Warmup (see claude_swap/warmup.py): send a tiny headless `claude -p`
+    # hello to any managed account whose 5-hour window has lapsed, so its
+    # reset stamp exists and the accounts' resets end up spread across the
+    # day. Default OFF — it spends (a few hundred) tokens and spawns a child
+    # process, neither of which an upgrade may start doing unasked.
+    # ``warmup_stagger`` off degrades to plain keep-alive: every cold
+    # account is warmed as soon as it lapses, wherever that lands its reset.
+    warmup_enabled: bool = False
+    warmup_stagger: bool = True
 
 
 @dataclass(frozen=True)
@@ -138,6 +147,14 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "warmupEnabled", "warmup_enabled", "bool",
+            help="Keep every account's 5h window alive with a tiny headless ping",
+        ),
+        SettingSpec(
+            "autoswitch", "warmupStagger", "warmup_stagger", "bool",
+            help="Space warmup pings so the accounts' 5h resets spread across the day",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),

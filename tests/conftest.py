@@ -7,6 +7,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import types
 from pathlib import Path
 from unittest.mock import patch
@@ -878,3 +879,29 @@ def pytest_collection_modifyitems(items):
     for item in items:
         if item.get_closest_marker("no_keychain_fake"):
             item.add_marker(pytest.mark.xdist_group("real-keychain"))
+
+
+@pytest.fixture(autouse=True)
+def _drain_live_hellos():
+    """Leave ``claude_swap.warmup``'s live-hello registry empty per test.
+
+    A warmup hello registers PROCESS-WIDE for the length of its slot
+    preparation plus child (``warmup.hello_in_flight``), and the engine
+    spawns them on DAEMON threads. A thread that outlives its own test's
+    teardown therefore keeps a registration alive into the NEXT test in the
+    same xdist worker — where it makes ``_perform_switch`` refuse an
+    unrelated switch, or makes a registry assertion see a stranger's entry.
+    Measured: three flaky failures across test_autoswitch/test_warmup at
+    ``-n 4`` that never reproduced file-by-file.
+
+    Wait briefly for a genuine hello to finish (so a real leak still shows
+    up as a slow test rather than being silently papered over), then clear.
+    """
+    yield
+    from claude_swap import warmup
+
+    deadline = time.monotonic() + 5.0
+    while warmup.active_hellos() and time.monotonic() < deadline:
+        time.sleep(0.005)
+    with warmup._HELLOS_LOCK:
+        warmup._HELLOS.clear()

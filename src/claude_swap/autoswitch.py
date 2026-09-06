@@ -2548,13 +2548,18 @@ class AutoSwitchEngine:
         if not enabled or candidates is None:
             return entries, usage, headroom
 
-        # Handed to the post-decision spawn phase.
+        # Handed to the post-decision spawn phase. `usage`/`headroom` ride
+        # along so the spawn phase can rank the cold accounts with the
+        # engine's own switch ranking without refetching anything.
         self._warm_plan = (
             now,
             candidates,
             # A manual request is a request for DATA now — the stagger is
             # exactly the thing the user is overriding by pressing `p`.
             bool(self.settings.warmup_stagger) and not warm_request,
+            current,
+            usage,
+            headroom,
         )
         return entries, usage, headroom
 
@@ -2611,13 +2616,18 @@ class AutoSwitchEngine:
                     self._set_warm_schedule({})
             return
         try:
-            now, candidates, stagger = plan
+            now, candidates, stagger, current, usage, headroom = plan
             spawned: set[str] = set()
             exclude: set[str] = set()
             if outcome is TickOutcome.SWITCHED and not self.dry_run:
                 landed = self.switcher.current_account_number()
                 if landed:
                     exclude.add(str(landed))
+                    # `current` was captured before the decision. The account
+                    # we switched AWAY from is an ordinary slot now and must
+                    # rank as one; the ranking's "active account" is the one
+                    # we actually landed on.
+                    current = str(landed)
             labels = {
                 acct.number: (
                     acct.state.cold_models[0] if acct.state.cold_models else None
@@ -2625,7 +2635,19 @@ class AutoSwitchEngine:
                 for acct in candidates.eligible
             }
             decisions = warmup.plan_warmups(
-                now, candidates.eligible, stagger=stagger
+                now,
+                # Priority order, not slot order: `plan_warmups` hands the
+                # earliest instant to the first cold account it is given.
+                self._warmup_order(
+                    candidates, current, usage, headroom, now, exclude
+                ),
+                stagger=stagger,
+                # One poll interval plus slack: the tolerance answers "is the
+                # next tick close enough to the target", nothing wider.
+                tolerance_s=(
+                    self.settings.interval_seconds
+                    + warmup.DEFAULT_TOLERANCE_MARGIN_S
+                ),
             )
             for decision in decisions:
                 if not decision.is_now:
@@ -2678,6 +2700,90 @@ class AutoSwitchEngine:
             )
         except Exception as e:  # pragma: no cover - safety net
             _logger.debug("warmup spawn phase failed: %r", e)
+
+    def _warmup_order(
+        self,
+        candidates: "warmup.Candidates",
+        current: str,
+        usage: dict,
+        headroom: dict,
+        now: float,
+        exclude: frozenset[str] | set[str] = frozenset(),
+    ) -> list["warmup.WarmupAccount"]:
+        """Eligible accounts with the COLD ones in switch-target order.
+
+        `plan_warmups` gives its earliest instant to the first cold account
+        it is handed, so this is what makes "next up gets warmed first" true:
+        the account you are most likely to move to next is the one whose
+        window is started first. The ranking is `_rank_candidates` itself —
+        the engine's own, for the configured strategy — never a second
+        implementation of it that could disagree with the switch it is
+        supposed to anticipate.
+
+        THE TRIGGER IS ``manual``, which is the CANDIDATES PANEL's ranking,
+        not the switch decision's. Ordering is not a decision to move, so
+        the anti-flap margins have nothing to protect here — and they are
+        precisely what would empty the list: under `best` the proactive path
+        drops every candidate that does not beat the ACTIVE account by the
+        hysteresis margin, and under consume-first it drops every candidate
+        that does not reset strictly sooner than the active. In the ordinary
+        "healthy active, several cold peers" case that leaves nothing ranked
+        and the order silently collapses to slot order — the exact failure
+        this method exists to fix. `manual` ranks like the strategy's own
+        proactive path, waives those margins and KEEPS the landing-health
+        gate (see :meth:`_rank_candidates`), so the queue matches what the
+        "Next best" panel shows.
+
+        Order of the cold accounts, in tiers: ranked candidates first, then
+        anything the ranking filtered out (slot order), then the ACTIVE
+        account, then ``exclude``. The active account is not a switch target
+        and must not take an instant off one just because its slot number is
+        low. ``exclude`` (the account this tick switched TO) goes last: it is
+        exactly the account the ranking likes best, so left at the front it
+        would take the earliest instant — which the spawn loop then drops,
+        spending the bootstrap anchor on a hello that never happens and
+        leaving the tick with nothing warmed.
+
+        Warm accounts contribute phases only, and keep their place at the
+        back. A ranking that raises costs the ORDER, never the warmup: slot
+        order is a perfectly good plan, just a less useful one.
+        """
+        eligible = list(candidates.eligible)
+        cold = [acct for acct in eligible if acct.state.five_hour_cold]
+        warm = [acct for acct in eligible if not acct.state.five_hour_cold]
+        if len(cold) < 2:
+            return eligible
+        order: dict[str, int] = {}
+        try:
+            ranked, _known, _reset = self._rank_candidates(
+                # Ordering, not deciding: the strategy's proactive ranking
+                # WITHOUT the anti-flap margins (see the docstring).
+                trigger="manual",
+                consume_first=self.settings.strategy == "consume-first",
+                oauth_candidates=[
+                    acct.number for acct in cold if acct.number != current
+                ],
+                no_return=None,
+                usage=usage,
+                headroom=headroom,
+                current=current,
+                active_headroom=headroom.get(current),
+                settings=self.settings,
+                now=now,
+            )
+            order = {number: i for i, number in enumerate(ranked)}
+        except Exception as e:  # pragma: no cover - safety net
+            _logger.debug("warmup ranking failed, using slot order: %r", e)
+            return eligible
+        cold.sort(
+            key=lambda acct: (
+                acct.number in exclude,
+                acct.number == current,
+                order.get(acct.number, len(order)),
+                warmup.slot_sort_key(acct.number),
+            )
+        )
+        return cold + warm
 
     def _set_warm_schedule(self, schedule: dict[str, "warmup.WarmupSlot"]) -> None:
         with self._warm_lock:

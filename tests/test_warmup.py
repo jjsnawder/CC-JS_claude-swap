@@ -181,13 +181,16 @@ def by_number(decisions) -> dict:
 class TestPlanWarmups:
     def test_the_worked_case_four_cold_accounts_spread_75_minutes_apart(self):
         """The plan's worked example, pinned: four cold accounts at 08:00
-        ping at 08:00 / 10:30 / 09:15 / 11:45, so their new 5-hour windows
+        warm at 08:00 / 09:15 / 10:30 / 11:45, so their new 5-hour windows
         reset at 13:00 / 14:15 / 15:30 / 16:45 — 75 minutes apart, which is
         exactly ``period / N``.
 
-        The order is not a bug: #2 takes the antipode of the only phase that
-        exists, #3 halves the first of the two equal gaps that leaves, #4
-        halves the remaining big one.
+        The CHAIN still produces those instants out of order (#2 takes the
+        antipode of the only phase that exists, #3 halves the first of the
+        two equal gaps that leaves, #4 halves the remaining big one) — but
+        the instants are sorted before they are handed out, and the caller's
+        order is the priority order, so the first account listed gets the
+        earliest one.
         """
         accounts = [cold(str(n)) for n in (1, 2, 3, 4)]
         decisions = by_number(plan_warmups(NOW, accounts))
@@ -197,8 +200,8 @@ class TestPlanWarmups:
             n: decisions[n].at_ts - NOW for n in ("2", "3", "4")
         }
         assert decisions["2"].action == "wait_until"
-        assert waits["2"] == pytest.approx(150 * MINUTE)
-        assert waits["3"] == pytest.approx(75 * MINUTE)
+        assert waits["2"] == pytest.approx(75 * MINUTE)
+        assert waits["3"] == pytest.approx(150 * MINUTE)
         assert waits["4"] == pytest.approx(225 * MINUTE)
 
         resets = sorted(
@@ -221,9 +224,12 @@ class TestPlanWarmups:
         assert by_number(plan_warmups(NOW, accounts))["4"].action == "ping_now"
 
     def test_small_drift_inside_the_tolerance_still_pings_now(self):
-        """Ping latency and poll jitter must not push an on-phase account
-        into a nearly-full-period wait: anything within half a spacing of
-        the target is close enough."""
+        """The LEGACY default (``tolerance_s=None`` → half a spacing), which
+        no caller uses any more: the engine always passes a tick-sized
+        tolerance. Kept because the fallback is still in the signature —
+        half a spacing is far too wide to be "close enough" in production,
+        and `test_a_hair_outside_the_tick_tolerance_waits` is the rule that
+        actually runs."""
         spacing = PERIOD_S / 4
         drift = spacing / 2 - 60  # just inside tolerance
         accounts = [
@@ -257,10 +263,12 @@ class TestPlanWarmups:
         assert decision.at_ts == pytest.approx(NOW + PERIOD_S / 2)
 
     def test_fewer_eligible_accounts_widen_the_tolerance(self):
-        """N is the eligible COUNT, so an account leaving rotation widens
-        both the spacing and the tolerance rather than leaving a hole in the
-        day. The same 50-minute drift is a wait at N=4 (tolerance 37m30)
-        and close enough to ping now at N=2 (tolerance 1h15)."""
+        """Also the LEGACY default, and the reason it was replaced: N is the
+        eligible COUNT, so under ``tolerance_s=None`` the same 50-minute
+        drift is a wait at N=4 (37m30) and a ping at N=2 (1h15) — a
+        tolerance that tracks fleet size rather than tick cadence, which is
+        what fired an account 37 minutes early in the field. Pinned as the
+        fallback's behaviour, not as the intended one."""
         drift = 50 * MINUTE
         s4 = PERIOD_S / 4
         four = [
@@ -305,6 +313,125 @@ class TestPlanWarmups:
 
     def test_no_accounts_no_decisions(self):
         assert plan_warmups(NOW, []) == []
+
+    # -- the tolerance -------------------------------------------------------
+    #
+    # The tolerance answers ONE question: "is the next tick close enough to
+    # the target that waiting for it buys nothing?". It is therefore a poll
+    # interval wide, not a share of the spacing — and it is asymmetric.
+    # Fixtures below use the antipode property: with a single warm peer at
+    # ``NOW + P/2 + off`` the cold account's target instant is ``NOW + off``,
+    # so ``off`` IS the signed wait (positive = early, negative = late).
+
+    @staticmethod
+    def _one_peer(off: float, tolerance_s: float | None = 120.0):
+        return by_number(
+            plan_warmups(
+                NOW,
+                [warm("1", NOW + PERIOD_S / 2 + off), cold("2")],
+                tolerance_s=tolerance_s,
+            )
+        )["2"]
+
+    def test_inside_the_tick_tolerance_pings_now(self):
+        assert self._one_peer(119.0).action == "ping_now"
+
+    def test_a_hair_outside_the_tick_tolerance_waits(self):
+        """The live bug: at ``spacing / 2`` (1h15 at N=2) this pinged, and
+        the account's window started an hour before its target."""
+        decision = self._one_peer(121.0)
+        assert decision.action == "wait_until"
+        assert decision.at_ts == pytest.approx(NOW + 121.0)
+        # ...and the old, wide default is what let it through.
+        assert self._one_peer(121.0, tolerance_s=None).action == "ping_now"
+
+    def test_the_tolerance_can_never_exceed_half_a_spacing(self):
+        """A poll interval longer than the spacing must not turn the
+        tolerance into "ping whenever": the cap keeps the phase within half
+        a spacing of its target however the engine is configured."""
+        spacing = PERIOD_S / 2
+        assert self._one_peer(spacing / 2 + 60, tolerance_s=PERIOD_S).action == (
+            "wait_until"
+        )
+
+    def test_being_late_pings_now_rather_than_waiting_a_period(self):
+        """An overslept loop (machine sleep, a long tick) is past the target
+        by definition. Waiting for the phase to come round again would cost
+        hours for an account that is cold right now."""
+        assert self._one_peer(-60.0).action == "ping_now"
+        assert self._one_peer(-(PERIOD_S / 4) + 60).action == "ping_now"
+
+    def test_late_by_more_than_half_a_spacing_takes_the_next_slot(self):
+        """The late side is bounded, and the bound is load-bearing: a
+        ping-now lands its phase at ``now + period``, so allowing it further
+        than half a spacing from the target lets two accounts land on the
+        SAME phase and the day ends up with fewer windows than accounts."""
+        spacing = PERIOD_S / 2
+        decision = self._one_peer(-(spacing / 2) - 60)
+        assert decision.action == "wait_until"
+
+    def test_no_two_planned_phases_coincide(self):
+        """The property the bound exists to protect, from a cold start."""
+        for n in (3, 4, 5):
+            accounts = [cold(str(i)) for i in range(1, n + 1)]
+            decisions = plan_warmups(NOW, accounts, tolerance_s=120.0)
+            phases = {
+                round((NOW if d.at_ts is None else d.at_ts) + PERIOD_S)
+                for d in decisions
+            }
+            assert len(phases) == n
+
+    def test_a_target_far_behind_us_does_not_land_on_a_peers_phase(self):
+        """The case the late bound exists for, built directly: two warm
+        peers leave a gap whose midpoint sits well over half a spacing
+        BEHIND ``now + period``. Unbounded, the cold account would ping now
+        and its window would start on top of a peer's; bounded, it takes the
+        next slot instead."""
+        spacing = PERIOD_S / 3
+        # Peers at +P/12 and +P/2 from `now + period`: the largest gap runs
+        # from +P/2 round to +P/12, and its midpoint lands 62m30 BEHIND us —
+        # past half a spacing (50 minutes at N=3), so the slot is missed.
+        peers = [
+            warm("1", NOW + PERIOD_S + PERIOD_S / 12),
+            warm("2", NOW + PERIOD_S + PERIOD_S / 2),
+        ]
+        decisions = plan_warmups(NOW, peers + [cold("3")], tolerance_s=120.0)
+        decision = by_number(decisions)["3"]
+        assert decision.action == "wait_until"
+        assert decision.at_ts - NOW > spacing / 2
+        phases = {round(p.state.reset_ts % PERIOD_S) for p in peers}
+        assert round((decision.at_ts + PERIOD_S) % PERIOD_S) not in phases
+
+    # -- who gets which instant ----------------------------------------------
+
+    def test_the_caller_order_is_the_priority_order(self):
+        """The engine passes its own switch ranking, so "the account you are
+        most likely to switch to next" is the one warmed first. Same instants
+        whichever order they arrive in — only the pairing moves."""
+        instants = []
+        for order in (("1", "2", "3", "4"), ("4", "3", "2", "1")):
+            decisions = by_number(
+                plan_warmups(NOW, [cold(n) for n in order], tolerance_s=120.0)
+            )
+            first = decisions[order[0]]
+            assert first.action == "ping_now"  # earliest instant, always
+            waits = [
+                decisions[n].at_ts - NOW for n in order[1:]
+            ]
+            assert waits == sorted(waits)  # ascending, in caller order
+            instants.append(sorted([0.0] + waits))
+        assert instants[0] == pytest.approx(instants[1])
+
+    def test_each_account_keeps_its_own_model_pick(self):
+        decisions = by_number(
+            plan_warmups(
+                NOW,
+                [cold("1"), cold("2", models=("Fable",))],
+                tolerance_s=120.0,
+            )
+        )
+        assert decisions["1"].model == DEFAULT_MODEL
+        assert decisions["2"].model == "fable"
 
     def test_a_scheduled_account_counts_as_warm_for_the_next_one(self):
         """Two cold accounts must not be planned into the same slot: #2's

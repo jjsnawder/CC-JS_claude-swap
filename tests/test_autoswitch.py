@@ -7477,7 +7477,13 @@ class TestWarmup:
     # -- harness helpers ---------------------------------------------------
 
     def _warm_harness(self, temp_home: Path, monkeypatch, **kwargs) -> EngineHarness:
-        """Three accounts, warmup on, the spawn seam and the slot lookup faked."""
+        """Three accounts, warmup on, the spawn seam and the slot lookup faked.
+
+        #1 is the ACTIVE account, so with three equally cold accounts the
+        warmup anchor is #2: the active account is not a switch target and
+        `_warmup_order` gives it the LAST instant, not the first. Fixtures
+        below name #2 for that reason, not by accident.
+        """
         from claude_swap import warmup as warmup_mod
 
         kwargs.setdefault("warmup_enabled", True)
@@ -7551,8 +7557,8 @@ class TestWarmup:
         self._tick(h, self._cold())
         warmed = [e for e in h.events if isinstance(e, WarmupEvent)]
         assert [e.action for e in warmed] == ["pinged"]
-        assert warmed[0].number == "1"
-        assert warmed[0].email == "a@example.com"
+        assert warmed[0].number == "2"
+        assert warmed[0].email == "b@example.com"
         assert "431 in / 79 out" in warmed[0].detail
 
     def test_the_landed_hello_forces_a_refetch_of_that_account(
@@ -7568,7 +7574,7 @@ class TestWarmup:
             call for call in mock.call_args_list if call.kwargs.get("fetch")
         ]
         assert any(
-            call.kwargs["fetch"] == {"1"} and call.kwargs.get("scheduled") is False
+            call.kwargs["fetch"] == {"2"} and call.kwargs.get("scheduled") is False
             for call in forced
         )
 
@@ -7577,7 +7583,7 @@ class TestWarmup:
         self._tick(h, self._cold())
         self._settle(h.engine)
         self._tick(h, self._cold())
-        record = h.state()["warmup"]["1"]
+        record = h.state()["warmup"]["2"]
         assert record["lastPingModel"] == "haiku"
         assert record["lastResult"] == "ok"
         assert record["failures"] == 0
@@ -7733,7 +7739,7 @@ class TestWarmup:
 
         failed = [e for e in h.events if isinstance(e, WarmupEvent)]
         assert [e.action for e in failed] == ["failed"]
-        record = h.state()["warmup"]["1"]
+        record = h.state()["warmup"]["2"]
         assert record["failures"] == 1
         assert record["backoffUntil"] == pytest.approx(h.clock.now + 30 * 60)
 
@@ -7749,7 +7755,7 @@ class TestWarmup:
             self._tick(h, self._cold())  # drain the result
             recorded_at = h.clock.now
             h.clock.advance(31 * 60)     # past the short backoff
-        record = h.state()["warmup"]["1"]
+        record = h.state()["warmup"]["2"]
         assert record["failures"] == 3
         assert record["backoffUntil"] == pytest.approx(recorded_at + 24 * 3600)
 
@@ -7794,7 +7800,7 @@ class TestWarmup:
         self._tick(h, self._cold())
         self._settle(h.engine)
         assert len(h.runner.calls) == 2
-        assert [path.name for path, _ in h.runner.calls] == ["cfg-1", "cfg-1"]
+        assert [path.name for path, _ in h.runner.calls] == ["cfg-2", "cfg-2"]
 
     # -- the role boundary ----------------------------------------------------
 
@@ -7897,7 +7903,7 @@ class TestWarmup:
         assert failed[0].action == "failed"
         assert "slot-1-secret" not in failed[0].detail
         assert "RuntimeError" in failed[0].detail
-        assert "slot-1-secret" not in h.state()["warmup"]["1"]["lastResult"]
+        assert "slot-1-secret" not in h.state()["warmup"]["2"]["lastResult"]
 
     # -- the switch/warmup race -----------------------------------------------
 
@@ -8078,11 +8084,24 @@ class TestWarmup:
         ):
             h.engine.tick()
 
+        # Re-run the planner exactly as the engine calls it: the same
+        # priority order and the same tick-sized tolerance, or this mirrors
+        # a plan nobody made.
+        candidates = h.engine._warm_candidates(entries, set(), h.clock.now, {})
+        headroom = {
+            num: 100.0 - value["five_hour"]["pct"] for num, value in usage.items()
+        }
         expected = {
             d.number: d
             for d in warmup_mod.plan_warmups(
                 h.clock.now,
-                h.engine._warm_candidates(entries, set(), h.clock.now, {}).eligible,
+                h.engine._warmup_order(
+                    candidates, "1", usage, headroom, h.clock.now
+                ),
+                tolerance_s=(
+                    h.engine.settings.interval_seconds
+                    + warmup_mod.DEFAULT_TOLERANCE_MARGIN_S
+                ),
             )
         }
         schedule = h.engine.warmup_schedule()
@@ -8139,6 +8158,28 @@ class TestWarmup:
         assert f"cfg-{landed}" not in [path.name for path, _ in h.runner.calls]
         assert h.runner.calls  # the OTHER cold account was warmed
 
+    def test_the_account_switched_away_from_ranks_as_an_ordinary_slot(
+        self, temp_home, monkeypatch
+    ):
+        """`current` was captured before the decision. Ranking against it
+        would demote the account we just LEFT — which is a plain candidate
+        again the moment the switch lands — and hand its instant to a worse
+        one."""
+        h = self._warm_harness(temp_home, monkeypatch, threshold=90.0)
+        # #1 (active) is over the threshold and must move; #2 is the healthy
+        # landing; among the remaining cold accounts #1 has the most
+        # headroom, so with `current` updated it takes the earliest instant.
+        outcome, _ = self._tick(
+            h, {"1": _usage(91), "2": _usage(10), "3": _usage(95)}
+        )
+        self._settle(h.engine)
+        assert outcome is TickOutcome.SWITCHED
+        assert str(h.active_number()) == "2"
+        schedule = h.engine.warmup_schedule()
+        assert schedule["2"].status == "excluded"
+        assert schedule["1"].status == "in-flight"  # ranked first, spawned
+        assert schedule["3"].status == "scheduled"
+
     def test_a_hello_still_running_from_a_previous_tick_reads_as_in_flight(
         self, temp_home, monkeypatch
     ):
@@ -8177,6 +8218,108 @@ class TestWarmup:
         with patch.object(h.switcher, "current_account_number", return_value=None):
             assert h.engine.tick() is TickOutcome.NO_ACTION
         assert h.engine.warmup_schedule() == before
+
+    # -- who gets warmed first ------------------------------------------------
+    #
+    # `plan_warmups` hands its earliest instant to the first cold account it
+    # is given, so the ENGINE's ordering is what makes "next up gets warmed
+    # first" true. It ranks with `_rank_candidates` — its own switch
+    # ranking, for the configured strategy — so the panel's "Next best" and
+    # the warmup queue can never disagree.
+
+    def test_best_warms_the_account_with_the_most_headroom_first(
+        self, temp_home, monkeypatch
+    ):
+        h = self._warm_harness(temp_home, monkeypatch)
+        h.engine = h._make_engine(dry_run=True)  # order only: spawn nothing
+        h.engine.ping_runner = h.runner
+        # #3 has the most headroom, #2 the least; #1 is the active account.
+        # `manual` waives the anti-flap margins, so BOTH candidates rank —
+        # under the proactive trigger #2 (less headroom than the active)
+        # would be dropped and the order would collapse to slot order.
+        self._tick(h, {"1": _usage(30), "2": _usage(80), "3": _usage(10)})
+        schedule = h.engine.warmup_schedule()
+        assert schedule["3"].status == "due"  # the earliest instant
+        # Full order: ranked candidates, then the ACTIVE account last — it
+        # is not a switch target and must not take an instant off one just
+        # because its slot number is low.
+        assert schedule["3"].at_ts is None
+        assert schedule["2"].at_ts < schedule["1"].at_ts
+        assert schedule["1"].status == "scheduled"
+
+    def test_consume_first_warms_the_soonest_weekly_reset_first(
+        self, temp_home, monkeypatch
+    ):
+        """Same fixture shape as `TestConsumeFirstStrategy`: the strategy's
+        own key decides, not headroom."""
+        h = self._warm_harness(temp_home, monkeypatch, strategy="consume-first")
+        h.engine = h._make_engine(dry_run=True)
+        h.engine.ping_runner = h.runner
+        self._tick(h, {
+            "1": _usage7(20, 20, _R_LATER),    # active
+            "2": _usage7(10, 10, _R_LATEST),
+            "3": _usage7(10, 10, _R_SOON),     # consumed first -> warmed first
+        })
+        schedule = h.engine.warmup_schedule()
+        assert schedule["3"].status == "due"
+        assert schedule["2"].at_ts < schedule["1"].at_ts
+
+    def test_a_ranking_failure_falls_back_to_slot_order(
+        self, temp_home, monkeypatch
+    ):
+        """Ordering is a nicety; warming is not. A ranking that raises costs
+        the priority, never the plan."""
+        h = self._warm_harness(temp_home, monkeypatch)
+        h.engine = h._make_engine(dry_run=True)
+        h.engine.ping_runner = h.runner
+        monkeypatch.setattr(
+            h.engine,
+            "_rank_candidates",
+            lambda **kw: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        self._tick(h, {"1": _usage(30), "2": _usage(80), "3": _usage(10)})
+        schedule = h.engine.warmup_schedule()
+        assert schedule["1"].status == "due"  # slot order: #1 anchors
+        assert schedule["2"].at_ts < schedule["3"].at_ts
+
+    def test_a_scheduled_hello_fires_on_the_tick_at_its_deadline(
+        self, temp_home, monkeypatch
+    ):
+        """The stagger is only worth anything if the loop wakes for it: the
+        deadline clamps the sleep, and the tick that lands there finds the
+        account on phase and hellos immediately."""
+        from claude_swap import warmup as warmup_mod
+
+        h = self._warm_harness(temp_home, monkeypatch)
+        first = h.clock.now
+        self._tick(h, {"1": _usage(30), "2": _usage(10), "3": _usage(80)})
+        self._settle(h.engine)
+        schedule = h.engine.warmup_schedule()
+        assert schedule["2"].status == "in-flight"  # most headroom, anchors
+        # The next instant in the plan. WHICH account fills it is decided
+        # afresh each tick (instants are assigned by priority, not owned by
+        # an account) — what is pinned here is that the instant is honoured
+        # on time.
+        due_at = min(
+            slot.at_ts for slot in schedule.values() if slot.at_ts is not None
+        )
+        # The loop is woken for it rather than sleeping through it: the
+        # deadline is recorded, and `_next_delay` never sleeps past it.
+        assert h.engine._warm_deadline_ts == pytest.approx(due_at)
+        assert h.engine._next_delay(TickOutcome.NO_ACTION) <= due_at - first
+
+        h.clock.advance(due_at - first)
+        h.events.clear()
+        self._tick(h, {
+            # #2's hello landed: it is warm at the phase it just created.
+            "1": _usage(30),
+            "2": _usage(10, _iso_at(first + warmup_mod.PERIOD_S)),
+            "3": _usage(80),
+        })
+        self._settle(h.engine)
+        spawned = [path.name for path, _ in h.runner.calls]
+        assert len(spawned) == 2  # the anchor, then this deadline's hello
+        assert "cfg-2" not in spawned[1:]  # ...and not the warm one again
 
     def test_no_schedule_while_warmup_is_off(self, temp_home, monkeypatch):
         h = self._warm_harness(temp_home, monkeypatch, warmup_enabled=False)

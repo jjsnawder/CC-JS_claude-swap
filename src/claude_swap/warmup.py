@@ -85,6 +85,15 @@ MODEL_PING_INTERVAL_S = 24 * 60 * 60.0
 #: comfortably covers the 3-minute serve TTL and any candidate poll plan.
 PING_COOLDOWN_S = 15 * 60.0
 
+#: Slack added to the engine's poll interval to build the stagger
+#: tolerance: a target instant is "reached" once the tick that lands on it
+#: runs, and ticks arrive one interval apart plus scheduling jitter. Wider
+#: than that is not tolerance, it is aiming early — measured live, a
+#: ``spacing / 2`` tolerance (37m30 at N=4) fired an account 37 minutes
+#: ahead of its target and left its reset 38 minutes after the anchor
+#: instead of 75.
+DEFAULT_TOLERANCE_MARGIN_S = 60.0
+
 #: Per-account backoff after a failed hello, and the escalation after
 #: ``FAILURE_STRIKES`` consecutive failures.
 FAILURE_BACKOFF_S = 30 * 60.0
@@ -258,11 +267,12 @@ def _largest_gap_midpoint(phases: Sequence[float], period: float) -> float:
     """Midpoint of the largest circular gap between ``phases`` (mod period).
 
     A single phase yields the antipode. Ties keep the FIRST gap in ascending
-    phase order, so the bootstrap is deterministic for a given ``now``. Which
-    ACCOUNT lands in which slot still depends on ``now mod period`` (at 280
-    minutes the third and fourth cold accounts swap); what is invariant is
-    the resulting phase SET — evenly spaced by ``period / N``, which is the
-    property that matters.
+    phase order, so the chain of targets is deterministic for a given
+    ``now``. The ORDER in which the chain produces its instants depends on
+    ``now mod period`` (at 280 minutes the third and fourth come out
+    swapped) — which is why :func:`plan_warmups` sorts the instants before
+    handing them to accounts. What is invariant either way is the resulting
+    phase SET: evenly spaced by ``period / N``, the property that matters.
     """
     ordered = sorted(p % period for p in phases)
     best_start = ordered[0]
@@ -292,22 +302,63 @@ def plan_warmups(
     *,
     period: float = PERIOD_S,
     stagger: bool = True,
+    tolerance_s: float | None = None,
 ) -> list[WarmupDecision]:
     """Decide, for each eligible account, whether to hello now or later.
 
     ``accounts`` is the ELIGIBLE set E — the caller has already dropped
     disabled, API-key, quarantined, token-dead, in-backoff, at-limit,
-    unreadable, in-flight and warmup-backed-off slots. ``spacing =
-    period / |E|`` and ``tolerance = spacing / 2``.
+    unreadable, in-flight and warmup-backed-off slots — **in priority
+    order**: see "who gets which instant" below. ``spacing = period / |E|``.
 
-    Warm accounts contribute a phase (``reset_ts mod period``). Cold
-    accounts are processed in slot order: the first one, with no warm phase
-    to hang off, pings immediately as the bootstrap anchor; every later one
-    aims its NEW reset (``now + period``) at the midpoint of the largest gap
-    between the phases known so far, and pings now only when it is already
-    within ``tolerance`` of that midpoint. A scheduled account then counts
-    as warm at its planned phase, so the next cold account plans against it
-    rather than against the same gap.
+    Warm accounts contribute a phase (``reset_ts mod period``). The chain of
+    TARGET INSTANTS is built one per cold account: the first, with no warm
+    phase to hang off, is ``now`` (the bootstrap anchor); every later one is
+    the midpoint of the largest gap between the phases known so far, aimed
+    at where a new reset (``now + period``) would land. Each planned target
+    joins the phase set, so the next instant is measured against it rather
+    than against the same gap.
+
+    **Tolerance is early-side only, and tight.** ``tolerance_s`` (default:
+    ``spacing / 2``, the historical value) is capped at ``spacing / 2`` and
+    answers one question — "is the next tick close enough to the target that
+    waiting for it buys nothing?" — so the caller passes its poll interval
+    plus :data:`DEFAULT_TOLERANCE_MARGIN_S`, not a share of the spacing. A
+    wide tolerance does not absorb jitter, it AIMS EARLY: measured live, a
+    ``spacing / 2`` window at N=4 pinged an account 37 minutes before its
+    target and its reset landed 38 minutes after the anchor instead of 75.
+
+    Being LATE is a much weaker reason to wait. With ``d`` the signed offset
+    of ``now + period`` from the target (:func:`_signed_offset`; negative =
+    earlier than the target), the rule is ``-tolerance <= d <= spacing / 2``
+    → ping now. The two sides are deliberately different sizes: arriving
+    early by more than a tick is aiming early and is refused, while arriving
+    late — an overslept loop, a resumed laptop, a long tick — pings anyway,
+    because the account is cold either way and half a spacing of drift costs
+    nothing the next pass cannot re-spread.
+
+    The late side is BOUNDED at half a spacing all the same, and that bound
+    is load-bearing: the phase a ping-now adds is ``now + period``, so
+    allowing it further than half a spacing from its target lets two
+    accounts land on the SAME phase. Concretely, with three cold accounts
+    and an unbounded late side, the third account's target can sit a quarter
+    period behind the anchor's phase; pinging there puts its reset on top of
+    the anchor's and the day ends up with two windows instead of three.
+    Past half a spacing the slot has been missed, and the planner does what
+    it exists to do: take the next one.
+
+    **Who gets which instant.** The instants are sorted ascending and handed
+    to the cold accounts IN THE ORDER THE CALLER PASSED THEM: the first cold
+    account gets the earliest. The caller therefore decides priority — the
+    engine passes its own switch-target ranking, so the account you are most
+    likely to switch to next is the one warmed first. Each account keeps its
+    own model pick. The phase SET is identical either way; only the pairing
+    of account to instant changes.
+
+    Worked case, four cold accounts at 08:00: the chain produces 08:00,
+    10:30, 09:15 and 11:45; sorted, the caller's first four accounts warm at
+    08:00 / 09:15 / 10:30 / 11:45, so their new windows reset 75 minutes
+    apart (exactly ``period / N``).
 
     Worst case for a cold account with at least one warm peer is
     ``period * (1 - 1/(2N))`` — 4h22 at N=4 — since the wait is at most a
@@ -324,14 +375,41 @@ def plan_warmups(
     if not accounts:
         return []
     spacing = period / len(accounts)
-    tolerance = spacing / 2.0
+    tolerance = (
+        spacing / 2.0 if tolerance_s is None else min(tolerance_s, spacing / 2.0)
+    )
 
     phases: list[float] = []
-    decisions: list[WarmupDecision] = []
     for acct in accounts:
         if not acct.state.five_hour_cold and acct.state.reset_ts is not None:
             phases.append(acct.state.reset_ts % period)
 
+    cold = [acct for acct in accounts if acct.state.five_hour_cold]
+    # Phase 1: the target instants, as (at_ts | None for "now", reason).
+    # Built by the chain, so their ORDER here is the chain's, not any
+    # account's — phase 2 sorts them before anyone is assigned one.
+    instants: list[tuple[float | None, str]] = []
+    for _ in cold:
+        if not stagger or not phases:
+            instants.append((None, "keep-alive" if not stagger else "bootstrap"))
+            phases.append((now + period) % period)
+            continue
+        target = _largest_gap_midpoint(phases, period)
+        d = _signed_offset((now + period) % period, target, period)
+        if -tolerance <= d <= spacing / 2.0:
+            # At the target, inside the tick tolerance before it, or late.
+            instants.append((None, "on-phase"))
+            phases.append((now + period) % period)
+        else:
+            wait = (target - ((now + period) % period)) % period
+            instants.append((now + wait, "staggered"))
+            phases.append(target)
+    # Phase 2: earliest instant to the caller's first cold account. Stable,
+    # so equal instants keep the caller's order.
+    instants.sort(key=lambda item: item[0] if item[0] is not None else now)
+    assigned = dict(zip((acct.number for acct in cold), instants))
+
+    decisions: list[WarmupDecision] = []
     for acct in accounts:
         state = acct.state
         model = (
@@ -348,41 +426,16 @@ def plan_warmups(
                     )
                 )
             continue
-        if not stagger or not phases:
-            decisions.append(
-                WarmupDecision(
-                    number=acct.number,
-                    action="ping_now",
-                    model=model,
-                    reason="keep-alive" if not stagger else "bootstrap",
-                )
+        at_ts, reason = assigned[acct.number]
+        decisions.append(
+            WarmupDecision(
+                number=acct.number,
+                action="ping_now" if at_ts is None else "wait_until",
+                model=model,
+                at_ts=at_ts,
+                reason=reason,
             )
-            phases.append((now + period) % period)
-            continue
-        target = _largest_gap_midpoint(phases, period)
-        d = _signed_offset((now + period) % period, target, period)
-        if abs(d) <= tolerance:
-            decisions.append(
-                WarmupDecision(
-                    number=acct.number,
-                    action="ping_now",
-                    model=model,
-                    reason="on-phase",
-                )
-            )
-            phases.append((now + period) % period)
-        else:
-            wait = (target - ((now + period) % period)) % period
-            decisions.append(
-                WarmupDecision(
-                    number=acct.number,
-                    action="wait_until",
-                    model=model,
-                    at_ts=now + wait,
-                    reason="staggered",
-                )
-            )
-            phases.append(target)
+        )
     return decisions
 
 
@@ -993,8 +1046,11 @@ class WarmupSlot:
         return self.status in ("due", "scheduled")
 
 
-def _slot_sort_key(number: str) -> tuple:
-    """Slot order: numerically for real slots, then anything unparseable."""
+def slot_sort_key(number: str) -> tuple:
+    """Slot order: numerically for real slots, then anything unparseable.
+
+    The tie-break wherever warmup has to order accounts and has nothing
+    better to go on (a display schedule, a ranking that came back short)."""
     try:
         return (0, int(number), "")
     except (TypeError, ValueError):
@@ -1026,7 +1082,7 @@ def build_schedule(
     eligible = {a.number: a for a in candidates.eligible}
     numbers = set(eligible) | set(candidates.skipped)
     out: dict[str, WarmupSlot] = {}
-    for number in sorted(numbers, key=_slot_sort_key):
+    for number in sorted(numbers, key=slot_sort_key):
         acct = eligible.get(number)
         decision = by_number.get(number)
         reason = candidates.skipped.get(number, "")

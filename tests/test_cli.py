@@ -1021,6 +1021,136 @@ class TestJsonOutputCli:
         assert captured.err == ""  # nothing on stderr in JSON mode
 
 
+class TestWarmCommand:
+    """`cswap warm` pre-dispatch: flags, exit codes, JSON shape.
+
+    ``warm_now`` is patched in every case — no test may spawn a real
+    ``claude`` or reach the real account store.
+    """
+
+    def _run(self, argv: list[str], summary, temp_home, calls: list | None = None):
+        from claude_swap import warmup
+
+        def fake_warm_now(switcher, **kwargs):
+            if calls is not None:
+                calls.append(kwargs)
+            return summary
+
+        with patch.object(warmup, "warm_now", fake_warm_now), \
+             patch.object(sys, "argv", ["claude-swap", "warm", *argv]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        return excinfo.value.code
+
+    def _summary(self, *rows, dry_run=False):
+        from claude_swap import warmup
+
+        return warmup.WarmSummary(rows=list(rows), dry_run=dry_run)
+
+    def _row(self, action="pinged", number="1"):
+        from claude_swap import warmup
+
+        return warmup.WarmRow(
+            number=number, email=f"{number}@example.com", action=action,
+            detail="haiku: 431 in / 79 out",
+        )
+
+    def test_a_successful_warm_exits_zero(self, temp_home):
+        with patch.object(ClaudeAccountSwitcher, "list_accounts", lambda self: None):
+            assert self._run([], self._summary(self._row()), temp_home) == 0
+
+    def test_a_failure_exits_one(self, temp_home):
+        with patch.object(ClaudeAccountSwitcher, "list_accounts", lambda self: None):
+            code = self._run([], self._summary(self._row(action="failed")), temp_home)
+        assert code == 1
+
+    def test_nothing_to_do_exits_two(self, temp_home):
+        assert self._run([], self._summary(), temp_home) == 2
+
+    def test_dry_run_is_forwarded_and_prints_no_usage_table(
+        self, temp_home, capsys
+    ):
+        calls: list = []
+        code = self._run(
+            ["--dry-run"],
+            self._summary(self._row(action="would-ping"), dry_run=True),
+            temp_home,
+            calls,
+        )
+        assert code == 0
+        assert calls[0]["dry_run"] is True
+        assert "would warm Account-1" in capsys.readouterr().out
+
+    def test_all_is_forwarded(self, temp_home):
+        calls: list = []
+        with patch.object(ClaudeAccountSwitcher, "list_accounts", lambda self: None):
+            self._run(["--all"], self._summary(self._row()), temp_home, calls)
+        assert calls[0]["force_all"] is True
+
+    def test_json_output_is_one_object(self, temp_home, capsys):
+        code = self._run(
+            ["--json", "--dry-run"],
+            self._summary(self._row(action="would-ping"), dry_run=True),
+            temp_home,
+        )
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["schemaVersion"] == 1
+        assert payload["dryRun"] is True
+        assert payload["results"][0]["number"] == 1
+        assert payload["results"][0]["action"] == "would-ping"
+
+    def test_the_configured_models_reach_warm_now(self, temp_home):
+        """Model-window warmups ride ``autoswitch.model`` — there is no
+        second list to keep in sync."""
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        (backup / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"model": "Fable"},
+        }))
+        calls: list = []
+        self._run(["--dry-run"], self._summary(), temp_home, calls)
+        assert calls[0]["models"] == ("Fable",)
+
+    def test_a_session_shell_exits_one_with_the_guard_message(
+        self, temp_home, capsys
+    ):
+        """`warm_now` refuses inside a `cswap run` shell (the "active"
+        account there is the session's, so the real default login would be
+        handed to `setup_session`). The CLI renders that like any other
+        ClaudeSwitchError: message on stderr, exit 1."""
+        from claude_swap import warmup
+        from claude_swap.exceptions import SwitchError
+
+        def refuse(switcher, **kwargs):
+            raise SwitchError("This shell is inside a cswap run session profile")
+
+        with patch.object(warmup, "warm_now", refuse),              patch.object(sys, "argv", ["claude-swap", "warm"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 1
+        captured = capsys.readouterr()
+        assert "inside a cswap run session profile" in captured.out + captured.err
+
+    def test_warm_help(self, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "warm", "--help"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 0
+        out = capsys.readouterr().out
+        assert "--dry-run" in out
+        assert "Exit codes" in out
+
+    def test_unknown_flag_errors(self, temp_home):
+        with patch.object(sys, "argv", ["claude-swap", "warm", "--bogus"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+
+
 class TestAutoCommand:
     """`cswap auto` pre-dispatch: parsing, settings merge, exit codes, JSONL."""
 

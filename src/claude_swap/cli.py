@@ -698,6 +698,13 @@ Defaults live in settings.json in the backup root; flags override them.
             line = accent(line)
         elif event.kind in ("error", "account-quarantined"):
             line = yellowed(line)
+        elif event.kind == "warmup":
+            # Background noise, except when it stops working.
+            line = (
+                yellowed(line)
+                if getattr(event, "action", "") == "failed"
+                else dimmed(line)
+            )
         elif event.kind in ("poll", "no-switch", "sleep"):
             line = dimmed(line)
         print(f"{stamp}  {line}", flush=True)
@@ -742,6 +749,116 @@ Defaults live in settings.json in the backup root; flags override them.
             f"\n{dimmed('Auto-switch stopped')}",
             file=sys.stderr if args.json else sys.stdout,
         )
+        sys.exit(130)
+
+
+def _warm_command(argv: list[str]) -> None:
+    """Handle `cswap warm [--dry-run] [--json] [--all]`.
+
+    Pre-dispatched before the main parser is built, like `run`, `auto` and
+    `config` (same limitation: `warm` must be the first argument). Sends a
+    tiny headless ``claude -p`` hello to every managed account whose 5-hour
+    window has lapsed, which is what makes its reset stamp exist — after an
+    Anthropic-side reset the 5h/7d/per-model stamps stay blank until the
+    account is actually used. Cold accounts only unless ``--all``.
+
+    Exit codes: 0 every attempted hello succeeded, 1 at least one failed,
+    2 nothing to do (no eligible cold account).
+    """
+    parser = argparse.ArgumentParser(
+        prog="cswap warm",
+        description=(
+            "Send a minimal headless Claude Code hello to every managed "
+            "account whose 5-hour window has lapsed, so its reset time is "
+            "known again. Costs a few hundred tokens per account."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Exit codes:
+  0  every attempted ping succeeded
+  1  at least one ping failed
+  2  nothing to do (no eligible cold account)
+
+Examples:
+  cswap warm                 # ping the cold accounts, then show usage
+  cswap warm --dry-run       # say which accounts would be pinged
+  cswap warm --all           # ping every eligible account, cold or not
+  cswap warm --json          # machine-readable result
+        """,
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report which accounts would be pinged; spawn nothing",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit a machine-readable JSON result instead of the tables",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        dest="force_all",
+        help="Ping every eligible account, not only the cold ones",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    from claude_swap import warmup
+    from claude_swap.json_output import SCHEMA_VERSION
+    from claude_swap.settings import load_settings, parse_model_names
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        settings = load_settings(switcher.backup_dir)
+        summary = warmup.warm_now(
+            switcher,
+            models=parse_model_names(settings.model),
+            dry_run=args.dry_run,
+            force_all=args.force_all,
+        )
+        if args.json:
+            print(json.dumps({
+                "schemaVersion": SCHEMA_VERSION,
+                "dryRun": summary.dry_run,
+                "results": [
+                    {
+                        "number": int(row.number),
+                        "email": row.email,
+                        "action": row.action,
+                        "model": row.model,
+                        "detail": row.detail,
+                    }
+                    for row in summary.rows
+                ],
+            }))
+        else:
+            for row in summary.rows:
+                who = f"Account-{row.number}" + (f" ({row.email})" if row.email else "")
+                tail = f" — {row.detail}" if row.detail else ""
+                if row.action == "would-ping":
+                    print(dimmed(f"[dry-run] would warm {who} with {row.model}"))
+                elif row.action == "pinged":
+                    print(f"{accent('Warmed')} {who}{tail}")
+                elif row.action == "failed":
+                    print(warning(f"Warmup failed for {who}{tail}"))
+                else:
+                    print(dimmed(f"Skipped {who}{tail}"))
+            if not summary.attempted:
+                print(dimmed("Nothing to warm."))
+            elif not summary.dry_run:
+                print()
+                switcher.list_accounts()
+        sys.exit(summary.exit_code())
+    except ClaudeSwitchError as e:
+        if args.json:
+            print(json.dumps(error_envelope(e)))
+        else:
+            error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Warmup cancelled')}")
         sys.exit(130)
 
 
@@ -986,6 +1103,9 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
         return
+    if argv and argv[0] == "warm":
+        _warm_command(argv[1:])
+        return
     if argv and argv[0] == "map":
         _map_command(argv[1:])
         return
@@ -1043,6 +1163,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s warm                       ping cold accounts to restart their 5h window
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts

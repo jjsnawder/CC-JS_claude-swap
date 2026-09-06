@@ -135,6 +135,11 @@ def safe_error(e: BaseException) -> str:
     return type(e).__name__
 
 
+#: ``Candidates.skipped`` reason for a slot whose hello is already
+#: running. Hoisted because :func:`build_schedule` MATCHES on it to render
+#: an "in flight" row: two string literals in two functions would drift.
+IN_FLIGHT_REASON = "in-flight"
+
 #: Subdirectory of the backup root used as the hello's cwd. Empty by
 #: design: ``--no-session-persistence`` means no transcript is written, and
 #: giving the child a directory of our own keeps it out of whatever
@@ -878,7 +883,7 @@ def collect_candidates(
 
         if number in in_flight:
             out.eligible.append(park(number, now))
-            out.skipped[number] = "in-flight"
+            out.skipped[number] = IN_FLIGHT_REASON
             continue
         record = warmup_state.get(number)
         record = record if isinstance(record, dict) else {}
@@ -945,6 +950,118 @@ def collect_candidates(
                 readable=state.readable,
             )
         out.eligible.append(WarmupAccount(number=number, state=state))
+    return out
+
+
+@dataclass(frozen=True)
+class WarmupSlot:
+    """One account's warmup standing at the instant a tick planned it.
+
+    Display state, nothing more: :func:`build_schedule` derives it from the
+    same ``Candidates`` and ``WarmupDecision`` list the spawn phase acted on,
+    so the panel can never show a plan the engine did not make. Carries no
+    credential material and no paths — it is rendered on screen.
+
+    ``status`` is one of:
+
+    ``due``        a ``ping_now`` decision this tick (dry-run preview, or a
+                   hello about to be spawned).
+    ``in-flight``  a hello is running for this account right now.
+    ``scheduled``  a ``wait_until`` decision; ``at_ts`` is when it is due.
+    ``warm``       eligible but needing nothing: ``reset_ts`` is its 5-hour
+                   reset (for a parked account, the one its hello creates).
+    ``skipped``    ineligible; ``reason`` is ``Candidates.skipped``'s.
+    ``excluded``   the account this tick switched TO — never warmed here.
+    """
+
+    number: str
+    email: str = ""
+    status: str = "skipped"
+    at_ts: float | None = None
+    model: str = DEFAULT_MODEL
+    reset_ts: float | None = None
+    reason: str = ""
+    computed_ts: float = 0.0
+    #: The pass that produced this slot was a dry run, so a ``due`` row is a
+    #: preview that will be re-previewed next tick — never a hello about to
+    #: happen. Without it the panel reads as permanently stuck.
+    dry_run: bool = False
+
+    @property
+    def upcoming(self) -> bool:
+        """True when a hello is planned but has not started yet."""
+        return self.status in ("due", "scheduled")
+
+
+def _slot_sort_key(number: str) -> tuple:
+    """Slot order: numerically for real slots, then anything unparseable."""
+    try:
+        return (0, int(number), "")
+    except (TypeError, ValueError):
+        return (1, 0, str(number))
+
+
+def build_schedule(
+    now: float,
+    candidates: Candidates,
+    decisions: Sequence[WarmupDecision],
+    *,
+    emails: dict[str, str] | None = None,
+    exclude: Iterable[str] = (),
+    spawned: Iterable[str] = (),
+    dry_run: bool = False,
+) -> dict[str, WarmupSlot]:
+    """Per-account display schedule for one planning pass. Pure.
+
+    Covers EVERY account the pass considered — eligible and skipped alike —
+    so the panel can say why an account is not being warmed, not merely omit
+    it. ``spawned`` are the numbers whose hello this pass actually started
+    (a dry-run preview is not one); ``exclude`` is the spawn phase's
+    switched-to set.
+    """
+    emails = emails or {}
+    exclude = {str(n) for n in exclude}
+    spawned = {str(n) for n in spawned}
+    by_number = {d.number: d for d in decisions}
+    eligible = {a.number: a for a in candidates.eligible}
+    numbers = set(eligible) | set(candidates.skipped)
+    out: dict[str, WarmupSlot] = {}
+    for number in sorted(numbers, key=_slot_sort_key):
+        acct = eligible.get(number)
+        decision = by_number.get(number)
+        reason = candidates.skipped.get(number, "")
+        at_ts: float | None = None
+        model = decision.model if decision is not None else DEFAULT_MODEL
+        if number in exclude:
+            status = "excluded"
+            reason = "switched to this tick"
+        elif number in spawned:
+            status = "in-flight"
+            reason = decision.reason if decision is not None else reason
+        elif decision is not None and decision.is_now:
+            status = "due"
+            reason = decision.reason
+        elif decision is not None:
+            status = "scheduled"
+            at_ts = decision.at_ts
+            reason = decision.reason
+        elif reason == IN_FLIGHT_REASON:
+            status = "in-flight"
+        elif acct is not None:
+            status = "warm"
+        else:
+            status = "skipped"
+        out[number] = WarmupSlot(
+            number=number,
+            email=emails.get(number, ""),
+            status=status,
+            at_ts=at_ts,
+            model=model,
+            reset_ts=acct.state.reset_ts if acct is not None else None,
+            reason=reason,
+            computed_ts=now,
+            dry_run=dry_run,
+        )
     return out
 
 

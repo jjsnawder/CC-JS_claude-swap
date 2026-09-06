@@ -817,6 +817,14 @@ class AutoSwitchEngine:
         # spawn phase (see ``_spawn_planned_warmups``): (now, candidates,
         # stagger). None = nothing to spawn this tick.
         self._warm_plan: tuple | None = None
+        # Display-only mirror of the last planning pass, keyed by account
+        # number (see ``warmup.build_schedule``). Read from the TUI thread
+        # via ``warmup_schedule()``, so it lives under ``_warm_lock`` and is
+        # only ever REPLACED, never mutated in place.
+        self._warm_schedule: dict[str, warmup.WarmupSlot] = {}
+        # Set per tick by ``_run_warmup``; see ``_spawn_planned_warmups``.
+        self._warm_ran = False
+        self._warm_off = False
         # ``_refuse_session_shell`` is a standing condition, not an event —
         # warn once per engine, not once per tick.
         self._warm_shell_warned = False
@@ -1080,6 +1088,12 @@ class AutoSwitchEngine:
         self._warm_now.clear()
         self._sleep_until_ts = None
         self._warm_deadline_ts = None
+        # Per-tick markers for the display schedule (see
+        # ``_spawn_planned_warmups``): whether the warmup step ran at all,
+        # and whether it found warmup switched OFF rather than merely
+        # refused for the moment.
+        self._warm_ran = False
+        self._warm_off = False
         self._blocked_wait_long = False
         self._idle_hold_slow = False
         settings = self.settings
@@ -2461,6 +2475,7 @@ class AutoSwitchEngine:
         decides. Draining runs even when warmup is disabled — a hello
         started before the setting was flipped still has a result to record.
         """
+        self._warm_ran = True
         refetch: set[str] = set()
         for number, email, model, result in self._drain_pings():
             self._record_ping_result(number, model, result)
@@ -2487,6 +2502,11 @@ class AutoSwitchEngine:
                 refetch.add(number)
 
         enabled = bool(self.settings.warmup_enabled) or warm_request
+        # Switched off is a STANDING state the panel should show as "off";
+        # a session-shell refusal is a condition of this process, not a
+        # statement that nothing is planned — recorded before that check so
+        # the two cannot be confused downstream.
+        self._warm_off = not enabled
         if enabled and not self._session_shell_ok():
             enabled = False
         if not enabled and not refetch:
@@ -2575,9 +2595,24 @@ class AutoSwitchEngine:
         plan = self._warm_plan
         self._warm_plan = None
         if plan is None:
+            # A missing plan is NOT the same as "nothing is planned": this
+            # method runs for every tick outcome, including the ones that
+            # returned before the warmup step (no/unmanaged active account,
+            # a usage collection that raised) and the ones where warmup was
+            # refused for this process (a `cswap run` shell). Wiping the
+            # panel on those would report an absence the engine never
+            # established. Only a tick that RAN the step and found warmup
+            # switched off clears it — and not while a hello it planned is
+            # still in flight (`p` warms with the setting off).
+            if self._warm_ran and self._warm_off:
+                with self._warm_lock:
+                    busy = bool(self._warm_inflight)
+                if not busy:
+                    self._set_warm_schedule({})
             return
         try:
             now, candidates, stagger = plan
+            spawned: set[str] = set()
             exclude: set[str] = set()
             if outcome is TickOutcome.SWITCHED and not self.dry_run:
                 landed = self.switcher.current_account_number()
@@ -2589,9 +2624,10 @@ class AutoSwitchEngine:
                 )
                 for acct in candidates.eligible
             }
-            for decision in warmup.plan_warmups(
+            decisions = warmup.plan_warmups(
                 now, candidates.eligible, stagger=stagger
-            ):
+            )
+            for decision in decisions:
                 if not decision.is_now:
                     if decision.at_ts is not None:
                         self._note_warm_deadline(decision.at_ts)
@@ -2614,14 +2650,54 @@ class AutoSwitchEngine:
                     decision.number, email, decision.model,
                     labels.get(decision.number),
                 )
+                spawned.add(decision.number)
             # Confirm a lapse promptly: a window whose stamp expires during
             # the next sleep leaves the account cold and invisible until the
             # following poll.
             for acct in candidates.eligible:
                 if acct.state.reset_ts is not None:
                     self._note_warm_deadline(acct.state.reset_ts + 60.0)
+            # Display only, and strictly downstream of the spawning above —
+            # this mirrors what was just decided, it never feeds it.
+            self._set_warm_schedule(
+                warmup.build_schedule(
+                    now,
+                    candidates,
+                    decisions,
+                    emails={
+                        number: self.switcher.account_email(number)
+                        for number in (
+                            {a.number for a in candidates.eligible}
+                            | set(candidates.skipped)
+                        )
+                    },
+                    exclude=exclude,
+                    spawned=spawned,
+                    dry_run=self.dry_run,
+                )
+            )
         except Exception as e:  # pragma: no cover - safety net
             _logger.debug("warmup spawn phase failed: %r", e)
+
+    def _set_warm_schedule(self, schedule: dict[str, "warmup.WarmupSlot"]) -> None:
+        with self._warm_lock:
+            self._warm_schedule = schedule
+
+    def warmup_schedule(self) -> dict[str, "warmup.WarmupSlot"]:
+        """Snapshot of the last planning pass, per account. Thread-safe.
+
+        For the TUI's warmup panel: a plain copy taken under ``_warm_lock``,
+        of frozen slots, so the caller can render it on another thread while
+        a tick replaces it. Empty when warmup is off or nothing has been
+        planned yet.
+        """
+        with self._warm_lock:
+            return dict(self._warm_schedule)
+
+    @property
+    def warmup_enabled(self) -> bool:
+        """Whether automatic warmup is on in the engine's settings."""
+        return bool(self.settings.warmup_enabled)
 
     def _warm_candidates(
         self, entries: dict, quarantined: set[str], now: float, warm_state: dict

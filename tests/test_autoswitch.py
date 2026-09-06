@@ -8049,3 +8049,137 @@ class TestWarmup:
             "3": _usage(30, _iso_at(h.clock.now + 88_888)),
         })
         assert h.engine._warm_deadline_ts == pytest.approx(soon + 60)
+
+    # -- the display schedule -------------------------------------------------
+    #
+    # `warmup_schedule()` is what the TUI's countdown panel renders. It is a
+    # MIRROR of the pass that just ran, so the panel can never show a plan
+    # the engine did not make: these pin it against `plan_warmups` itself.
+
+    def test_the_schedule_mirrors_the_plan_this_tick_made(
+        self, temp_home, monkeypatch
+    ):
+        """Dry-run so the pass is pure: no hellos, no state writes, and the
+        planner can be re-run on the same inputs for the expected instants."""
+        from claude_swap import warmup as warmup_mod
+
+        h = self._warm_harness(temp_home, monkeypatch)
+        h.engine = h._make_engine(dry_run=True)
+        h.engine.ping_runner = h.runner
+        warm_at = h.clock.now + 3 * 3600
+        usage = {
+            "1": _usage(30),
+            "2": _usage(30),
+            "3": _usage(30, _iso_at(warm_at)),
+        }
+        entries = {n: _entry_for(v, h.clock.now) for n, v in usage.items()}
+        with patch.object(
+            h.switcher, "usage_entries_by_account", return_value=entries
+        ):
+            h.engine.tick()
+
+        expected = {
+            d.number: d
+            for d in warmup_mod.plan_warmups(
+                h.clock.now,
+                h.engine._warm_candidates(entries, set(), h.clock.now, {}).eligible,
+            )
+        }
+        schedule = h.engine.warmup_schedule()
+        assert set(schedule) == {"1", "2", "3"}
+        # The warm account gets no decision at all, and its row carries the
+        # reset the countdown is measured against.
+        assert "3" not in expected
+        assert schedule["3"].status == "warm"
+        assert schedule["3"].reset_ts == pytest.approx(warm_at)
+        assert schedule["3"].email == "c@example.com"
+        for number, decision in expected.items():
+            slot = schedule[number]
+            if decision.is_now:
+                assert slot.status == "due"  # dry-run previews, never spawns
+                assert slot.at_ts is None
+            else:
+                assert slot.status == "scheduled"
+                assert slot.at_ts == pytest.approx(decision.at_ts)
+            assert slot.model == decision.model
+
+    def test_a_spawned_hello_shows_as_in_flight(self, temp_home, monkeypatch):
+        h = self._warm_harness(temp_home, monkeypatch, warmup_stagger=False)
+        self._tick(h, self._cold())
+        self._settle(h.engine)
+        assert h.engine.warmup_schedule()["1"].status == "in-flight"
+
+    def test_an_ineligible_account_keeps_its_row_and_its_reason(
+        self, temp_home, monkeypatch
+    ):
+        """"Why is #1 not being warmed" has to answer itself on screen —
+        an omitted row reads as a bug."""
+        h = self._warm_harness(temp_home, monkeypatch)
+        self._tick(h, {"1": _usage(100), "2": _usage(30), "3": _usage(30)})
+        self._settle(h.engine)
+        slot = h.engine.warmup_schedule()["1"]
+        assert (slot.status, slot.reason) == ("skipped", "at-limit")
+
+    def test_the_account_just_switched_to_is_held_not_warmed(
+        self, temp_home, monkeypatch
+    ):
+        """The spawn phase excludes the landing account (its credentials were
+        installed moments ago); the panel has to say so rather than showing a
+        hello that will never happen."""
+        h = self._warm_harness(temp_home, monkeypatch, warmup_stagger=False)
+        outcome, _ = self._tick(
+            h, {"1": _usage(100), "2": _usage(30), "3": _usage(30)}
+        )
+        self._settle(h.engine)
+        assert outcome is TickOutcome.SWITCHED
+        landed = str(h.active_number())
+        slot = h.engine.warmup_schedule()[landed]
+        assert slot.status == "excluded"
+        # `config_dir_for` is faked to `cfg-<num>`: nothing was spawned for it.
+        assert f"cfg-{landed}" not in [path.name for path, _ in h.runner.calls]
+        assert h.runner.calls  # the OTHER cold account was warmed
+
+    def test_a_hello_still_running_from_a_previous_tick_reads_as_in_flight(
+        self, temp_home, monkeypatch
+    ):
+        """`collect_candidates` writes the reason and `build_schedule` matches
+        on it — one constant, so the two cannot drift apart into a row that
+        silently falls through to "skipped"."""
+        from claude_swap import warmup as warmup_mod
+
+        gate = threading.Event()
+        h = self._warm_harness(temp_home, monkeypatch, warmup_stagger=False)
+        h.runner = self.FakeRunner(gate=gate)
+        h.engine.ping_runner = h.runner
+        try:
+            self._tick(h, self._cold())
+            assert h.runner.started.wait(5)
+            self._tick(h, self._cold())  # plans while the hello is running
+            slot = h.engine.warmup_schedule()["1"]
+            assert slot.status == "in-flight"
+            assert slot.reason == warmup_mod.IN_FLIGHT_REASON
+        finally:
+            gate.set()
+            self._settle(h.engine)
+
+    def test_a_tick_that_never_reached_the_warmup_step_keeps_the_schedule(
+        self, temp_home, monkeypatch
+    ):
+        """`_spawn_planned_warmups` runs for every outcome, including the
+        early returns. "No plan handed over" is not evidence that nothing is
+        planned — wiping the panel there would report an absence the engine
+        never established."""
+        h = self._warm_harness(temp_home, monkeypatch)
+        self._tick(h, self._cold())
+        self._settle(h.engine)
+        before = h.engine.warmup_schedule()
+        assert before
+        with patch.object(h.switcher, "current_account_number", return_value=None):
+            assert h.engine.tick() is TickOutcome.NO_ACTION
+        assert h.engine.warmup_schedule() == before
+
+    def test_no_schedule_while_warmup_is_off(self, temp_home, monkeypatch):
+        h = self._warm_harness(temp_home, monkeypatch, warmup_enabled=False)
+        self._tick(h, self._cold())
+        assert h.engine.warmup_schedule() == {}
+        assert h.engine.warmup_enabled is False

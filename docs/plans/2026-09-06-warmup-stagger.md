@@ -89,17 +89,28 @@ Three parts, all unit-testable without a network or a child process:
    stagger=True) -> list[WarmupDecision]`.
    - Eligible set E = accounts passed in (caller already dropped disabled,
      API-key, quarantined, token-dead, in-backoff, at-limit). N = |E|,
-     `spacing = period / N`, `tolerance = spacing / 2`.
+     `spacing = period / N`. **Revised 2026-09-06 (live finding):** tolerance is
+     the *early-side* tick tolerance `min(interval_seconds + 60 s, spacing / 2)`;
+     the late side keeps the `spacing / 2` bound. Originally `tolerance = spacing / 2`
+     both sides, which fired the first live hello 37 min early (16:38 vs 17:15).
    - Warm accounts contribute a phase `resets_at mod period`.
-   - Cold accounts are processed in slot order. For each: if no warm phases →
+   - **Revised 2026-09-06:** the chain below produces the *set* of target
+     instants; they are then sorted ascending and assigned to the cold accounts
+     in the order the caller passed them — the engine passes them in the
+     candidates panel's ranking (`_rank_candidates(trigger="manual")`: the
+     configured strategy's path with the anti-flap margins waived and the
+     landing-health gate kept), so "next up" gets the
+     earliest hello (unranked accounts last, in slot order; the just-switched-to
+     account last among the cold). Original design walked slot order. For each: if no warm phases →
      `ping_now` (bootstrap anchor). Else find the largest circular gap between
      warm phases; `target` = its midpoint; `d` = signed offset of `now +
      period` from `target` (mod period, in `[-period/2, period/2)`). If
-     `|d| ≤ tolerance` → `ping_now`; else `wait_until(now + ((target - (now +
+     `−tolerance ≤ d ≤ spacing/2` → `ping_now`; else `wait_until(now + ((target - (now +
      period)) mod period))`. A scheduled account then counts as warm with the
      virtual phase `(ping_time + period) mod period` for the next cold one.
-   - Worked case (4 cold at 08:00): pings at 08:00, 10:30, 09:15, 11:45 →
-     resets 13:00 / 14:15 / 15:30 / 16:45, 75 min apart. Steady state: an
+   - Worked case (4 cold at 08:00): the chain yields 08:00, 10:30, 09:15,
+     11:45; sorted and assigned in caller (priority) order → warms at 08:00 /
+     09:15 / 10:30 / 11:45 → resets 13:00 / 14:15 / 15:30 / 16:45, 75 min apart. Steady state: an
      account whose window lapses on phase has `|d| ≈ ping latency` → pings
      immediately. Worst-case cold wait = `period·(1 − 1/2N)` = 4 h 22 for
      N=4 (3 h 45 in the bootstrap case; corrected by review 2026-09-06);
@@ -285,4 +296,9 @@ true`, `p` on the auto screen in dry-run, then live.
   `build_schedule`/`WarmupSlot`, `engine.warmup_schedule()`, `#warmup-panel`
   on the auto screen, 1 s countdown, stale marker. Suite 2281 passed / 78
   skipped. Needs a TUI relaunch to appear (editable install; PID 6220 predates it).
+- 2026-09-06 — stagger tuning shipped: early-side tick tolerance
+  (`interval + 60 s`, capped at spacing/2; late side keeps spacing/2), and
+  targets sorted then assigned in the panel's switch ranking (next-up earliest;
+  active and just-switched-to last). Suite 2295 passed / 78 skipped. Takes
+  effect at the next TUI launch.
 

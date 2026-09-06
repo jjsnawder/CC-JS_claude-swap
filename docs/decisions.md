@@ -264,3 +264,34 @@ slot order as tie-break, next-up taking the earliest slot.
 both change the pinned stagger math and its tests).
 **Why it matters:** the spread is the feature; a half-spacing tolerance halves
 it at bootstrap, and an order that ignores next-up wastes a free win.
+
+## 2026-09-06 - Stagger tolerance is early-side only, and bounded late by half a spacing
+**Chose:** `plan_warmups(tolerance_s=interval_seconds + 60)`, effective
+`min(tolerance_s, spacing/2)`, applied only to being EARLY of the target; the
+late side keeps the `spacing/2` bound. Ping now when `−tolerance ≤ d ≤ spacing/2`.
+**Rejected:** (a) the original symmetric `spacing/2` (37.5 min at N=4) — the
+first live hello fired 37 min early and landed 38 min after the anchor instead
+of 75; (b) an unbounded late side ("late is fine, ping now") — with three cold
+accounts the chain's third target can sit a quarter-period behind the current
+phase, and pinging it immediately put two windows on the anchor's phase
+(measured by tool-runner; pinned by `test_a_target_far_behind_us_does_not_land_on_a_peers_phase`).
+**Why it matters:** the half-spacing late bound is what guarantees no two
+planned phases coincide; the tight early bound is what makes the loop actually
+land on its target. They look like one knob and are two.
+
+## 2026-09-06 - Warmup priority = the candidates panel's ranking, not the switch decision's
+**Chose:** the planner computes the target instants, sorts them, and assigns
+them to cold accounts in caller order; the engine orders cold accounts with
+`_rank_candidates(trigger="manual")` for the configured strategy (margins
+waived, landing-health gate kept), then the active account, then the account
+just switched to — ties and unranked accounts by slot number; a raising
+ranking falls back to slot order with a debug log only.
+**Rejected:** (a) slot order (the built behaviour) — arbitrary with respect to
+use, and with one anchor it hands slot 1 the LATEST hello; (b)
+`trigger="proactive"` — its hysteresis margin drops every cold candidate that
+does not beat the active account, so under `best` the order collapsed to slot
+order in the common case (review finding, fixed before commit);
+(c) reimplementing a ranking in warmup.py.
+**Why it matters:** "next up gets the earliest reset" is free once the phase
+set is fixed, and it must be the same ranking the panel shows or the panel
+lies about who is next.

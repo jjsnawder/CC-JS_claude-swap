@@ -34,3 +34,13 @@ Rules:
 - Do NOT delegate.
 
 Return (<30 lines): Done / Ran (command + result) / Changed (path:line + diff) / Learned (quirks worth recording) / Follow-ups.
+
+## Long-running commands (prompt-cache discipline, 2026-09-19)
+Every tool call that outlives your prompt cache makes your next request re-send your
+entire context at the cache-write rate, and that is what drains the usage window.
+Never sit inside a single tool call for more than ~10 minutes: pass a bounded
+`timeout`, split long test or build runs into chunks, and run anything longer in the
+background (`run_in_background: true`, output redirected to a file), then check that
+file with short bounded calls every few minutes; each check is a cheap cache read
+that keeps the cache warm. Never block on a wait for another agent or a poll loop
+inside one call. If a run cannot fit these limits, report that instead of waiting.

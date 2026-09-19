@@ -61,6 +61,8 @@ opposite: its parallel subagents are dependable and it under-reaches.
   track or is missing context.
 - Prefer **long-lived** subagents that keep their context over spawn-and-block:
   no per-subtask context rebuild, and you are not bottlenecked on the slowest one.
+  (Only while it is still running: see §Sub-agent prompt-cache discipline below
+  before continuing a finished agent, 2026-09-19.)
 - Brief each one precisely the first time.
 - Still true: after a subagent returns, trust its summary. Do not re-open its
   files or re-run its command on the main thread.
@@ -129,6 +131,30 @@ force-with-lease push of `jeremy`) are orchestrator-owned and confirmed with Jer
   ask. Rewrites whole files where a targeted edit would do; **prefer targeted
   edits here** — every rewritten upstream file is a rebase conflict later.
   `medium` effort roughly matches Fable 5 quality at lower cost.
+
+## Sub-agent prompt-cache discipline (2026-09-19)
+
+Measured across this box's sub-agent transcripts 2026-08-20 to 2026-09-19: 31% of all
+sub-agent cache-write tokens were full-context re-writes, and 71% of those came from
+the orchestrator messaging a sub-agent AFTER it had finished. Two rules, both
+orchestrator-owned; the worker-side rule is in every Bash-capable agent body.
+
+- **Never message a finished sub-agent whose context is large.** Claude Code rebuilds
+  a finished agent's history on the first follow-up (API miss reason
+  `messages_changed`), so that one message re-bills nearly its whole context at the
+  cache-write rate, even inside the 1-hour cache lifetime. Send follow-ups WHILE it
+  is still working (cheap: a few thousand tokens). Once it has returned, start a
+  fresh agent with a written brief, or do a small follow-up yourself. This qualifies
+  the "long-lived sub-agents" advice above: it holds only for an agent still running.
+- **No single tool call longer than ~10 minutes, yours or a worker's.** A call that
+  outlives the cache lifetime forces a full context re-write on return. Anything
+  longer (test sweeps, builds, batch jobs, waiting on another agent) runs in the
+  background with output to a file and is polled with short bounded checks; never
+  block a worker on a wait.
+- Sub-agent cache lifetime is 1h box-wide (`subagentPromptCacheTtl` in
+  `~/.claude/settings.json`, set 2026-09-19; the Claude Code default is 5 minutes).
+  Parallelism saves wall-clock, not tokens: every new agent pays a full first write
+  of everything it reads, so fewer, well-briefed agents beat many small ones.
 
 ## Model wiring (desktop app)
 Main = Fable 5.1 via `.claude/settings.json` (exact ID `claude-fable-5-1` —

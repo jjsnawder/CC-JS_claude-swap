@@ -5,7 +5,7 @@ description: >
   Checks correctness, failure handling, secret hygiene, safe re-runs. Findings only.
 tools: Read, Grep, Glob, Bash
 disallowedTools: Write, Edit
-model: claude-opus-5
+model: claude-opus-5-5
 effort: medium
 color: purple
 hooks:

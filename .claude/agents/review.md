@@ -6,7 +6,7 @@ description: >
 tools: Read, Grep, Glob, Bash
 disallowedTools: Write, Edit
 model: claude-opus-5-5
-effort: medium
+effort: high
 color: purple
 hooks:
   PreToolUse:

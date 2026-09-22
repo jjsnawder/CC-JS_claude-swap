@@ -8,7 +8,7 @@ description: >
   chore instead. Returns a summary + diff.
 tools: Read, Write, Edit, Grep, Glob, Bash
 model: claude-opus-5-5
-effort: medium
+effort: high
 color: blue
 hooks:
   PreToolUse:

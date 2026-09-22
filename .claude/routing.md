@@ -159,7 +159,7 @@ orchestrator-owned; the worker-side rule is in every Bash-capable agent body.
 ## Model wiring (desktop app)
 Main = Fable 5.1 via `.claude/settings.json` (exact ID `claude-fable-5-1` —
 house convention is exact IDs so each release is a deliberate step). Workers
-pinned per agent file (`tool-runner`/`review` = `claude-opus-5`, `chore` =
+pinned per agent file (`tool-runner`/`review` = `claude-opus-5-5`, `chore` =
 `claude-sonnet-5`, `scout` = `haiku`, `deep` = `claude-fable-5-1` @ `xhigh`).
 **DO NOT set `CLAUDE_CODE_SUBAGENT_MODEL`** — it overrides frontmatter and
 collapses every worker onto one model. Confirm Fable 5.1 in the startup header;

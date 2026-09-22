@@ -35,6 +35,7 @@ PRICES = {
     "claude-mythos-5-1": (10.00, 50.00),
     "claude-fable-5": (10.00, 50.00),
     "claude-mythos-5": (10.00, 50.00),
+    "claude-opus-5-5": (4.00, 20.00),
     "claude-opus-5": (5.00, 25.00),
     "claude-opus-4-8": (5.00, 25.00),
     "claude-opus-4-7": (5.00, 25.00),
@@ -45,9 +46,11 @@ PRICES = {
 }
 CACHE_READ_MULT = 0.10
 # Flat per-MTok cache-read prices that override the 0.1x-of-input rule.
+# Opus 5.5 (released 2026-09-22) reads cache at $0.20/MTok (0.05x input).
 # Fable 5.1 / Mythos 5.1 (released 2026-09-01) read cache at $0.25/MTok
 # (0.025x input) - 75% below Fable 5's $1.00. Prefix-matched like PRICES.
 CACHE_READ_PRICE = {
+    "claude-opus-5-5": 0.20,
     "claude-fable-5-1": 0.25,
     "claude-mythos-5-1": 0.25,
 }

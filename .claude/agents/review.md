@@ -22,7 +22,9 @@ or credential-shaped landed (emails, slot names, tokens, hostnames); the change
 is minimal and targeted so it rebases onto the next upstream release; tests cover
 it; plus WAT conventions: correctness/input validation; failure handling (retries,
 backoff); no secrets hardcoded or logged; idempotent/safe re-runs.
-Do NOT edit, commit, run git, or run any paid tool to verify. Do NOT delegate.
+Do NOT edit, commit, or run any paid tool to verify. Do NOT delegate.
+Read-only git (diff, status, log, show) is allowed and is how you see the
+change: diff against the base commit or branch the orchestrator names.
 Return findings, worst first (omit empty levels): Critical / Warning / Nit
 (path:line - problem - fix), then Verdict: safe to commit / needs changes.
 

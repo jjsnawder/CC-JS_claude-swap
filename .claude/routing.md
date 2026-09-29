@@ -106,6 +106,28 @@ after a change. Reinstalling the package (`pip install -e .`, only after a
 no-live-`cswap`-process check. Upstream reconciles (fetch, rebase,
 force-with-lease push of `jeremy`) are orchestrator-owned and confirmed with Jeremy.
 
+## Parallelize for speed (2026-09-29)
+Jeremy's box-wide ruling: speed outranks the token cost of extra agents. The canonical
+rules (7-17, incl. the pre-authorized small Workflows and the limits that still bind)
+are in ~/.claude/guides/claude-code-subagent-discipline.md §Parallelize for speed;
+this is the project-level summary.
+
+- Split before dispatch: by independent concern AND file ownership, one agent per
+  track, all dispatched in a single message so they run concurrently.
+- Keep each brief to ~10 minutes of work (split past ~8 items or ~6 files). Name the
+  files each agent owns and the files it must not touch because another agent has them.
+- Use a worktree (`isolation: "worktree"`) when agents' files collide or the main tree
+  must stay clean for a deploy; you merge the branch. Point worktree agents at the main
+  venv by relative path (`../../../.venv/Scripts/python.exe`).
+- One agent per shared live resource (browser profile, logged-in session, lease);
+  everyone else works offline.
+- Overlap review with the next step: commit/deploy the reviewed half while the rest is
+  still being fixed. Never deploy unreviewed code. Give review the base commit or
+  branch and the file list; it may run read-only git.
+- Re-scope a slow agent WHILE it runs (cheap); move the unstarted part to a fresh agent.
+- Stay inline only when inline is faster (a single read or one command) or the work is
+  yours (git, workflows/, decisions, synthesis).
+
 ## Ownership — never delegate these
 - **Git and `workflows/` are yours**, and the guard hook ENFORCES it: a subagent
   that tries `git commit/push/reset/rebase` or a write under `workflows/` is
@@ -154,7 +176,8 @@ orchestrator-owned; the worker-side rule is in every Bash-capable agent body.
 - Sub-agent cache lifetime is 1h box-wide (`subagentPromptCacheTtl` in
   `~/.claude/settings.json`, set 2026-09-19; the Claude Code default is 5 minutes).
   Parallelism saves wall-clock, not tokens: every new agent pays a full first write
-  of everything it reads, so fewer, well-briefed agents beat many small ones.
+  of everything it reads, and since 2026-09-29 speed wins that trade (Jeremy's
+  ruling; ~/.claude/guides/claude-code-subagent-discipline.md §Parallelize for speed).
 
 ## Model wiring (desktop app)
 Main = Fable 5.1 via `.claude/settings.json` (exact ID `claude-fable-5-1` —

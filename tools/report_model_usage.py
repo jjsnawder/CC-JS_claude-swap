@@ -42,6 +42,7 @@ PRICES = {
     "claude-opus-4-6": (5.00, 25.00),
     "claude-sonnet-5": (3.00, 15.00),
     "claude-sonnet-4-6": (3.00, 15.00),
+    "claude-haiku-5-5": (0.10, 0.50),
     "claude-haiku-4-5": (1.00, 5.00),
 }
 CACHE_READ_MULT = 0.10
@@ -49,7 +50,10 @@ CACHE_READ_MULT = 0.10
 # Opus 5.5 (released 2026-09-22) reads cache at $0.20/MTok (0.05x input).
 # Fable 5.1 / Mythos 5.1 (released 2026-09-01) read cache at $0.25/MTok
 # (0.025x input) - 75% below Fable 5's $1.00. Prefix-matched like PRICES.
+# Sonnet 5.5 reads cache at $0.10/MTok (0.05x input) since the 2026-10-07 cut
+# (was $0.20). Haiku 5.5 (2026-10-07) follows the standard multipliers.
 CACHE_READ_PRICE = {
+    "claude-sonnet-5-5": 0.10,
     "claude-opus-5-5": 0.20,
     "claude-fable-5-1": 0.25,
     "claude-mythos-5-1": 0.25,
@@ -226,8 +230,10 @@ def render(buckets, n_msgs, ts_min, ts_max) -> str:
         "## Assumptions",
         "",
         "- Prices are Anthropic API list prices per MTok: Fable 5 and 5.1 $10/$50,",
-        "  Opus 5 and Opus 4.x $5/$25, Sonnet $3/$15, Haiku 4.5 $1/$5.",
-        "- Cache read billed at 0.1x input (Fable 5.1: flat $0.25/MTok); cache writes",
+        "  Opus 5 and Opus 4.x $5/$25, Sonnet $3/$15, Haiku 4.5 $1/$5,",
+        "  Haiku 5.5 $0.10/$0.50 (<=100K-input tier; its >100K $0.50/$2.50 tier is not modeled).",
+        "- Cache read billed at 0.1x input (flat overrides: Opus 5.5 $0.20, Sonnet 5.5 $0.10,",
+        "  Fable 5.1 $0.25 per MTok); cache writes",
         "  at 1.25x (5-min TTL) or",
         "  2x (1-hour TTL) input, using the per-TTL breakdown in the transcripts.",
         "- This session runs on a Claude subscription, not pay-per-token API —",

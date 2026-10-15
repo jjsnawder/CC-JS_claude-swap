@@ -295,3 +295,23 @@ order in the common case (review finding, fixed before commit);
 **Why it matters:** "next up gets the earliest reset" is free once the phase
 set is fixed, and it must be the same ranking the panel shows or the panel
 lies about who is next.
+
+## 2026-10-15 - Auto screen `m` = targeted manual pick through the engine, with a session pin
+**Chose:** `request_switch(target=N)` on the existing `n` path: the manual
+tick's candidate list is exactly `[N]`, so freshening, quarantine and
+`_perform` run as for any switch; refusals are explicit NoSwitch reasons
+(`already-active`, `target-unavailable`, `target-quarantined`,
+`target-over-threshold`, `target-usage-unknown`, `target-busy`). "Stay until
+threshold" is a session-only engine pin that only suppresses the
+consume-first below-threshold nudge (`best` never moves below threshold
+anyway); it clears on an active-account change or at the threshold, never
+blocks at-limit/failover, is never set in dry-run or for an API-key target,
+and is carried across `s`/`l` rebuilds but never persisted.
+**Rejected:** (a) a TUI-side `switch_to` — skips freshening, quarantine and
+the state record; (b) letting `m` land over the threshold in the two states
+where `n` does (active usage unreadable, whole fleet over) — a hand-picked
+account that bounces away on the next tick reads as `m` being broken; the
+refusal names the reason instead; (c) persisting the pin — it would outlive
+the session that made the choice.
+**Why it matters:** the pick has to survive consume-first's own logic without
+ever weakening the escapes that protect a session from hitting the limit.

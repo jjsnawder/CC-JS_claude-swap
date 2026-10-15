@@ -84,6 +84,13 @@ _SYSTEMIC_MESSAGES = {
 # drift apart.
 _SYSTEMIC_STATUSES = tuple(_SYSTEMIC_MESSAGES)
 
+# A manual pick (`m`) the freshen step had to pass over: `target-busy` names
+# the cause instead of the bare `no-viable-target` a ranked list ends on.
+_TARGET_BUSY_DETAIL = {
+    "skip-live-session": "live cswap run session on this account",
+    "warmup-in-flight": "warmup hello in flight — press m again in a few seconds",
+}
+
 # Freshen targets whose access token expires within this window: twice Claude
 # Code's own 5-minute refresh buffer, so its post-lock "abort refresh if not
 # expired" re-read holds with margin after our swap.
@@ -368,15 +375,19 @@ class SwitchEvent(AutoSwitchEvent):
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
     dry_run: bool = False
+    note: str = ""  # muted aside, e.g. why a manual pick is not held
 
     def _fields(self) -> dict:
-        return {
+        fields = {
             "trigger": self.trigger,
             "from": self.from_ref,
             "to": self.to_ref,
             "warnings": self.warnings,
             "dryRun": self.dry_run,
         }
+        if self.note:
+            fields["note"] = self.note
+        return fields
 
     def human(self) -> str:
         src = (
@@ -388,7 +399,8 @@ class SwitchEvent(AutoSwitchEvent):
             else "?"
         )
         prefix = "[dry-run] would switch" if self.dry_run else "Switched"
-        return f"{prefix} {src} -> {dst} ({self.trigger})"
+        tail = f" · {self.note}" if self.note else ""
+        return f"{prefix} {src} -> {dst} ({self.trigger}){tail}"
 
 
 @dataclass(frozen=True)
@@ -774,6 +786,7 @@ class AutoSwitchEngine:
         state_path: Path | None = None,
         clock: Callable[[], float] = time.time,
         ping_runner: "warmup.PingRunner | None" = None,
+        pinned: str | None = None,
     ):
         self.switcher = switcher
         self.settings = settings
@@ -798,6 +811,16 @@ class AutoSwitchEngine:
         # One-shot "switch now" request from the TUI (see ``request_switch``).
         # Consumed by the next tick, which then decides with trigger "manual".
         self._switch_now = threading.Event()
+        # Manual pick (`m`): the account a ``request_switch(target=...)``
+        # names. Handed over with ``_switch_now`` under ``_switch_lock`` so
+        # the tick always reads the flag and its target as one pair.
+        # ``_tick_target`` is what the current tick consumed (for
+        # ``_perform``); ``_pinned`` is the session-only "hold this manual
+        # pick until the threshold" marker (see ``pinned``). Never persisted.
+        self._switch_lock = threading.Lock()
+        self._switch_target: str | None = None
+        self._tick_target: str | None = None
+        self._pinned: str | None = None if pinned is None else str(pinned)
         # -- warmup (claude_swap/warmup.py) --------------------------------
         # The spawn seam, injected so tests never run a real `claude`.
         self.ping_runner = ping_runner or warmup.SubprocessPingRunner()
@@ -1079,8 +1102,14 @@ class AutoSwitchEngine:
         # tick decides (including the early returns below), the request is
         # spent, so a `n` press can never queue up and fire a surprise switch
         # several ticks later.
-        manual = self._switch_now.is_set()
-        self._switch_now.clear()
+        # The target (`m`, manual pick) travels with the flag: both read and
+        # cleared as one pair under the lock, so it is spent with the flag.
+        with self._switch_lock:
+            manual = self._switch_now.is_set()
+            self._switch_now.clear()
+            target = self._switch_target if manual else None
+            self._switch_target = None
+        self._tick_target = target
         # Same one-shot contract for `p` ("ping/warm now"): consumed by this
         # tick whatever it decides, so a keypress can never fire a surprise
         # round of hellos several ticks later.
@@ -1109,6 +1138,14 @@ class AutoSwitchEngine:
         )
 
         current = self.switcher.current_account_number()
+        # `current is not None`: an unreadable live login (transient) is not
+        # evidence of a move, so it must not drop the hold for good.
+        if (
+            self._pinned is not None
+            and current is not None
+            and self._pinned != current
+        ):
+            self._pinned = None  # moved off the manual pick: hold released
         if current is None:
             self._emit(
                 PollEvent(active=None, headroom={}, threshold=settings.threshold)
@@ -1209,12 +1246,27 @@ class AutoSwitchEngine:
                         )
                     )
                     return TickOutcome.NO_ACTION
+                if self._pinned == current and not manual:
+                    # Manual pick (`m`): hold it until the threshold instead
+                    # of the consume-first nudge below. Escapes never get here.
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="pinned",
+                            detail=(
+                                f"{pct_label(utilization)}% < "
+                                f"{pct_label(settings.threshold)}% · "
+                                "holding manual pick"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
                 # consume-first: below the threshold we still proactively move to
                 # whichever account's weekly window resets soonest, to burn the
                 # most-perishable quota first. Candidate selection decides whether
                 # a sooner-resetting account with room actually exists.
                 trigger = "consume-first"
             else:
+                self._pinned = None  # threshold reached: the hold is over
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
         elif manual:
             # The user asked to move NOW, so neither piece of unknown-usage
@@ -1281,6 +1333,14 @@ class AutoSwitchEngine:
             # cooldown below and in `_perform` stays scoped to the proactive
             # triggers, so a manual switch is never refused for being recent.
             trigger = "manual"
+            if target is not None:
+                # `m` (manual pick): the candidate list is exactly the target
+                # (see `_rank` below); these are the refusals that need no
+                # usage data. The threshold check waits for the fresh fetch.
+                refusal = self._target_refusal(target, current, quarantined)
+                if refusal is not None:
+                    self._emit(refusal)
+                    return TickOutcome.NO_ACTION
 
         if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
@@ -1378,6 +1438,9 @@ class AutoSwitchEngine:
             Cheap: the retry runs only when the barred list came back empty,
             which is the tick that was about to do nothing anyway.
             """
+            if target is not None:
+                # Manual pick: the human chose; no strategy, margin or bar.
+                return [target], True, None
             # Recomputed per snapshot, never once per tick: the consume-first
             # two-phase commit replaces `headroom` and `active_headroom` and
             # re-ranks, and the ratio release consumes exactly those two
@@ -1452,6 +1515,14 @@ class AutoSwitchEngine:
                 settings=settings,
                 now=decided_now,
             )
+
+        if target is not None:
+            # Manual pick, on the phase-2 data: landing at/over the threshold
+            # would bounce away on the very next tick.
+            refusal = self._target_usage_refusal(target, headroom, settings)
+            if refusal is not None:
+                self._emit(refusal)
+                return TickOutcome.NO_ACTION
 
         if (
             not ordered
@@ -1633,6 +1704,16 @@ class AutoSwitchEngine:
                     systemic = status
                 continue
             if status in ("skip-live-session", "warmup-in-flight"):
+                if target is not None:
+                    # Manual pick (`ordered` is exactly the target): name the
+                    # cause, which a bare `no-viable-target` would hide.
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="target-busy",
+                            detail=f"Account-{num}: " + _TARGET_BUSY_DETAIL[status],
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
                 continue
             return self._perform(num, email, trigger, left_snapshot)
 
@@ -1648,6 +1729,78 @@ class AutoSwitchEngine:
             return TickOutcome.ERROR
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
+
+    # -- manual pick (`m`) ------------------------------------------------------
+
+    def _target_refusal(
+        self, target: str, current: str, quarantined: set[str]
+    ) -> NoSwitchEvent | None:
+        """Why a manual-pick target can't be taken, before any usage data.
+
+        None = proceed. Cooldown, hysteresis, strictly-sooner and the
+        no-return bar are NOT here: the human overrode them by picking."""
+        if target == current:
+            return NoSwitchEvent(
+                reason="already-active",
+                detail=f"Account-{target} is the active account",
+            )
+        if target not in self.switcher.switchable_account_numbers():
+            return NoSwitchEvent(
+                reason="target-unavailable",
+                detail=(
+                    f"Account-{target} is not in rotation (unknown slot, no "
+                    "usable stored login, or disabled via 'cswap disable')"
+                ),
+            )
+        if target in quarantined:
+            return NoSwitchEvent(
+                reason="target-quarantined",
+                detail=(
+                    f"Account-{target} is quarantined; run 'cswap "
+                    f"--add-account --slot {target}' to recover it"
+                ),
+            )
+        if (
+            self.switcher.account_kind_for(target) == "api_key"
+            and not self.settings.include_api_key_accounts
+        ):
+            return NoSwitchEvent(
+                reason="target-unavailable",
+                detail=(
+                    f"Account-{target} is an API-key account and "
+                    "autoswitch.includeApiKeyAccounts is off"
+                ),
+            )
+        return None
+
+    def _target_usage_refusal(
+        self,
+        target: str,
+        headroom: dict[str, float | None],
+        settings: AutoSwitchSettings,
+    ) -> NoSwitchEvent | None:
+        """The manual-pick threshold check, on the post-refetch headroom
+        (same ``self._models`` windows as every other decision). API-key
+        targets have no measurable quota and pass."""
+        if self.switcher.account_kind_for(target) == "api_key":
+            return None
+        h = headroom.get(target)
+        if h is None:
+            return NoSwitchEvent(
+                reason="target-usage-unknown",
+                detail=f"Account-{target} usage could not be read this tick",
+            )
+        utilization = 100.0 - h
+        if utilization >= settings.threshold:
+            return NoSwitchEvent(
+                reason="target-over-threshold",
+                detail=(
+                    f"Account-{target} at {pct_label(utilization)}% >= "
+                    f"{pct_label(settings.threshold)}%; it would switch "
+                    "away again on the next tick"
+                ),
+            )
+        return None
 
     def _no_return_account(
         self,
@@ -3031,12 +3184,27 @@ class AutoSwitchEngine:
             state["leftTrigger"] = trigger
             atomic_write_json(self.state_path, state)
 
+        note = ""
+        if trigger == "manual":
+            # Live manual switch: `m` pins its target (held until the
+            # threshold); `n` (no target) replaces any earlier pin with none.
+            self._pinned = self._tick_target
+            if (
+                self._pinned is not None
+                and self.switcher.account_kind_for(self._pinned) == "api_key"
+            ):
+                # No measurable headroom: the engine fails over off it after
+                # the unhealthy ticks, so a "holding #N" would be a lie.
+                self._pinned = None
+                note = "API-key account: not held (no quota to measure)"
+
         self._emit(
             SwitchEvent(
                 trigger=trigger,
                 from_ref=result.get("from"),
                 to_ref=result.get("to"),
                 warnings=result.get("warnings", []),
+                note=note,
             )
         )
         return TickOutcome.SWITCHED
@@ -3145,7 +3313,7 @@ class AutoSwitchEngine:
         """Cut the current inter-tick sleep short and tick now."""
         self._wake.set()
 
-    def request_switch(self) -> None:
+    def request_switch(self, target: str | None = None) -> None:
         """One-shot "switch now" request from the TUI, for THIS session only.
 
         Sets a flag the NEXT tick consumes (and clears) before deciding, then
@@ -3153,9 +3321,26 @@ class AutoSwitchEngine:
         with trigger ``"manual"``: the strategy's own ranking, without the
         anti-flap margins or the cooldown. Nothing is persisted — a request
         that a tick has already spent cannot fire twice, and a request made
-        while the engine is stopping simply dies with it."""
-        self._switch_now.set()
+        while the engine is stopping simply dies with it.
+
+        ``target`` (the TUI's `m`, manual pick) names the account to take
+        instead of ranking: refused with a ``target-*``/``already-active``
+        reason if it is unavailable, quarantined, busy or at/over the
+        threshold, and after a live switch held (``pinned``) until the
+        threshold — unless it is an API-key account, which is never held. The
+        latest request wins: a ``target=None`` call clears a pending target."""
+        with self._switch_lock:
+            self._switch_target = None if target is None else str(target)
+            self._switch_now.set()
         self._wake.set()
+
+    @property
+    def pinned(self) -> str | None:
+        """The manual pick being held below the threshold, or None.
+
+        Session-only; pass it as ``pinned=`` to a rebuilt engine to carry it
+        over (the TUI's `s`/`l` restarts)."""
+        return self._pinned
 
     def request_warm(self) -> None:
         """One-shot "ping/warm now" request from the TUI's `p`.

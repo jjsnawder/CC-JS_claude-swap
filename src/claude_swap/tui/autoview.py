@@ -9,7 +9,9 @@ lock) make it safe to run alongside an external ``cswap auto``.
 The active account's full card sits on top (same widget as the dashboard's
 panel, with the threshold tick); this screen adds the engine badge, the
 ranked switch candidates, and the decision log. While it is up, the app's
-snapshot poller runs store-only: the engine is the only fetcher.
+snapshot poller runs store-only: the engine is the only fetcher. `n` asks the
+engine to switch by its strategy; `m` (manual pick) names the target and the
+engine holds it until the threshold.
 """
 
 from __future__ import annotations
@@ -37,7 +39,7 @@ from claude_swap.autoswitch import (
 from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
 from claude_swap.tui import data
-from claude_swap.tui.modals import ConfirmModal
+from claude_swap.tui.modals import AccountPickModal, ConfirmModal, PickRow
 from claude_swap.tui.theme import Palette
 from claude_swap.tui.widgets import AccountsPanel
 
@@ -72,6 +74,12 @@ def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Te
     text = Text()
     text.append(f"{data.clock_stamp()}  ", style=palette.foreground)
     body = event.human()
+    note = getattr(event, "note", "")
+    if note and body.endswith(f" · {note}"):
+        # A switch's aside (e.g. "not held") reads as detail, not as the switch.
+        text.append(body[: -len(note) - 3], style=style)
+        text.append(body[-len(note) - 3 :], style=palette.muted)
+        return text
     match = _USED_RE.search(body) if event.kind == "poll" else None
     if match is None:
         text.append(body, style=style)
@@ -207,6 +215,7 @@ class AutoScreen(Screen):
         Binding("t", "adjust_threshold", "Threshold"),
         Binding("s", "toggle_strategy", "Strategy"),
         Binding("n", "switch_now", "Switch now"),
+        Binding("m", "manual_pick", "Manual pick"),
         Binding("p", "ping_warm", "Ping/warm"),
         Binding("left", "threshold_step(-1)", "-1%"),
         Binding("right", "threshold_step(1)", "+1%"),
@@ -236,6 +245,9 @@ class AutoScreen(Screen):
         self._warm_timer = None
         # Last warmup panel text rendered, to skip no-op repaints.
         self._warm_rendered: str | None = None
+        # The engine pin last shown in the summary (` · holding #N`), so an
+        # engine event only repaints the summary when the pin changed.
+        self._shown_pin: str | None = None
 
     def compose(self) -> ComposeResult:
         yield AccountsPanel(show_minis=False, id="auto-active-panel")
@@ -306,7 +318,10 @@ class AutoScreen(Screen):
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         if action in ("threshold_step", "adjust_done") and not self._adjusting:
             return False  # hidden and inert until adjust mode is armed
-        if action in ("toggle_strategy", "switch_now", "ping_warm") and self._adjusting:
+        if (
+            action in ("toggle_strategy", "switch_now", "manual_pick", "ping_warm")
+            and self._adjusting
+        ):
             return False  # the keys belong to the threshold while it is armed
         return True
 
@@ -405,6 +420,9 @@ class AutoScreen(Screen):
         margin-based `skip` tags in "Next best" are waived, but a row
         at/over the threshold is not (landing there re-triggers at once).
 
+        `m` (``action_manual_pick``) is the targeted sibling: the human names
+        the account instead of the strategy ranking it.
+
         Inert in threshold-adjust mode, like `s`: the keys belong to the
         threshold while it is armed. No confirmation — in DRY-RUN this is a
         preview (`[dry-run] would switch ...`) and going LIVE was already
@@ -416,6 +434,78 @@ class AutoScreen(Screen):
         self.query_one("#event-log", RichLog).write(
             Text(
                 f"— switch now requested ({self._settings.strategy}) —",
+                style=Palette.from_theme(self.app.current_theme).muted,
+            )
+        )
+
+    # -- manual pick ----------------------------------------------------------
+
+    def action_manual_pick(self) -> None:
+        """Pick the account to switch to; the engine switches to exactly it.
+
+        Same contract as `n` (the ENGINE performs it, one-shot, no confirm,
+        a preview in DRY-RUN), but the target is the human's: the engine
+        refuses it only if it is the active account, out of rotation,
+        quarantined, busy (``target-busy``) or at/over the threshold, and
+        after a live switch it holds it (``engine.pinned``, ` · holding #N` in
+        the summary) until it reaches the threshold — never an API-key
+        account, which has no quota to hold against."""
+        if self._settings is None or self._adjusting or self._engine is None:
+            return
+        snap = self.app.snapshot
+        if snap is None or not snap.accounts:
+            self.query_one("#event-log", RichLog).write(
+                Text(
+                    "— manual pick: no account data yet —",
+                    style=Palette.from_theme(self.app.current_theme).muted,
+                )
+            )
+            return
+        rows = self._pick_rows(snap)
+        self.app.push_screen(
+            AccountPickModal(rows), lambda number: self._on_manual_pick(number, rows)
+        )
+
+    def _pick_rows(self, snap: AccountsSnapshot) -> list[PickRow]:
+        """Picker rows in snapshot order, pcts on the engine's own windows."""
+        models = parse_model_names(self._settings.model)
+        threshold = self._settings.threshold
+        rows: list[PickRow] = []
+        for acc in snap.accounts:
+            pct = binding_pct(acc.usage.last_good, models)
+            label = None
+            if acc.usage.sentinel is not None:
+                label = data.sentinel_label(acc.usage.sentinel)
+            elif pct is None:
+                label = "usage unknown"
+            tags: list[str] = []
+            if label is None and pct is not None and pct >= threshold:
+                tags.append("over threshold")
+            if acc.disabled:
+                tags.append("disabled")
+            elif not acc.switchable:
+                tags.append("not switchable")
+            rows.append(
+                PickRow(
+                    number=acc.number,
+                    email=acc.email,
+                    pct=pct,
+                    label=label,
+                    active=acc.number == snap.active_number,
+                    tags=tuple(tags),
+                )
+            )
+        return rows
+
+    def _on_manual_pick(self, number: str | None, rows: list[PickRow]) -> None:
+        if number is None or self._engine is None or not self.is_attached:
+            return
+        self._engine.request_switch(target=number)
+        email = next((r.email for r in rows if r.number == number), "")
+        who = f"Account-{number}" + (f" ({email})" if email else "")
+        self.query_one("#event-log", RichLog).write(
+            Text(
+                f"— switch to {who} requested (manual pick) —",
                 style=Palette.from_theme(self.app.current_theme).muted,
             )
         )
@@ -465,18 +555,22 @@ class AutoScreen(Screen):
         text.append(f" · {self._settings.strategy}")
         if self._settings.strategy != self._configured_strategy:
             text.append(" (session)", style=palette.muted)
+        self._shown_pin = getattr(self._engine, "pinned", None)
+        if self._shown_pin is not None:
+            text.append(f" · holding #{self._shown_pin}", style=palette.muted)
         if self._adjusting:
             text.append("   ← → adjust · enter done", style=palette.muted)
         self.query_one("#auto-summary", Static).update(text)
 
     # -- engine -------------------------------------------------------------
 
-    def _start_engine(self, *, dry_run: bool) -> None:
+    def _start_engine(self, *, dry_run: bool, pinned: str | None = None) -> None:
         engine = AutoSwitchEngine(
             self.app.switcher,
             self._settings,
             self._emit_from_thread,
             dry_run=dry_run,
+            pinned=pinned,
         )
         self._engine = engine
         self.run_worker(
@@ -514,6 +608,8 @@ class AutoScreen(Screen):
         self._refresh_warmup_panel()
         if event.kind == "switch":
             self.app.request_refresh()
+        if getattr(self._engine, "pinned", None) != self._shown_pin:
+            self._update_summary()
 
     def action_toggle_live(self) -> None:
         if self._engine is None:
@@ -537,9 +633,11 @@ class AutoScreen(Screen):
             self._restart_engine(dry_run=False)
 
     def _restart_engine(self, *, dry_run: bool) -> None:
+        # The manual-pick hold is session state: it survives the rebuild.
+        pinned = getattr(self._engine, "pinned", None)
         if self._engine is not None:
             self._engine.stop()
-        self._start_engine(dry_run=dry_run)
+        self._start_engine(dry_run=dry_run, pinned=pinned)
         # The new engine has planned nothing yet: show that rather than the
         # dead one's schedule.
         self._refresh_warmup_panel()

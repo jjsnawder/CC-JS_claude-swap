@@ -1302,6 +1302,12 @@ class _FakeEngine:
         self.applied_thresholds: list[float] = []
         self.wakes = 0
         self.switch_requests = 0
+        # Targets of `request_switch(target=...)` (`m`), in call order; a
+        # plain `n` request appends None.
+        self.switch_targets: list[str | None] = []
+        # Manual-pick hold, as the engine exposes it (read-only there).
+        self.pinned = kwargs.get("pinned")
+        self.kwargs = kwargs
         self.warm_requests = 0
         # What the warmup countdown panel renders (`warmup_schedule()`),
         # and the setting it reads for the "off" line.
@@ -1326,8 +1332,9 @@ class _FakeEngine:
     def wake(self) -> None:
         self.wakes += 1
 
-    def request_switch(self) -> None:
+    def request_switch(self, target: str | None = None) -> None:
         self.switch_requests += 1
+        self.switch_targets.append(target)
 
     def request_warm(self) -> None:
         self.warm_requests += 1
@@ -2063,6 +2070,162 @@ class TestAutoScreen:
             await pilot.pause()
             assert fake_engine.instances[0].warm_requests == 0
             assert "warmup requested" not in self._log_text(app)
+
+    # -- manual pick (`m`) ----------------------------------------------------
+
+    def _three(self, tmp_path):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2), make_account(3)],
+            tmp_path,
+        )
+        return fake, make_app(fake)
+
+    async def test_manual_pick_opens_the_picker_and_enter_takes_first_selectable(
+        self, tmp_path, fake_engine
+    ):
+        """`m` opens the picker; the active row (#1) is disabled, so the
+        highlight starts on #2 and enter asks the ENGINE for exactly that
+        account. Nothing is switched from the screen."""
+        fake, app = self._three(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            await pilot.press("m")
+            await pilot.pause()
+            from textual.widgets import OptionList
+
+            from claude_swap.tui.modals import AccountPickModal
+
+            assert isinstance(app.screen, AccountPickModal)
+            options = app.screen.query_one("#pick-list", OptionList)
+            assert options.get_option("1").disabled is True
+            assert options.get_option("2").disabled is False
+            assert options.highlighted == 1
+            await pilot.press("enter")
+            await pilot.pause()
+            from claude_swap.tui.autoview import AutoScreen
+
+            assert isinstance(app.screen, AutoScreen)
+            engine = fake_engine.instances[0]
+            assert engine.switch_targets == ["2"]
+            assert fake.calls == []
+            assert (
+                "switch to Account-2 (user2@example.com) requested (manual pick)"
+                in self._log_text(app)
+            )
+
+    async def test_manual_pick_digit_picks_that_account(
+        self, tmp_path, fake_engine
+    ):
+        """Digits are account NUMBERS, not row positions: with slots 1, 3, 5
+        a "2" (row 2 holds #3) does nothing and "5" (only three rows) picks #5."""
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(3), make_account(5)],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            await pilot.press("m", "2")
+            await pilot.pause()
+            from claude_swap.tui.modals import AccountPickModal
+
+            assert isinstance(app.screen, AccountPickModal)
+            assert fake_engine.instances[0].switch_targets == []
+            await pilot.press("5")
+            await pilot.pause()
+            assert fake_engine.instances[0].switch_targets == ["5"]
+            assert "Account-5" in self._log_text(app)
+
+    async def test_manual_pick_active_row_is_not_selectable(
+        self, tmp_path, fake_engine
+    ):
+        """The digit for the ACTIVE account does nothing: the picker stays
+        open and no request is made."""
+        _, app = self._three(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            await pilot.press("m", "1")
+            await pilot.pause()
+            from claude_swap.tui.modals import AccountPickModal
+
+            assert isinstance(app.screen, AccountPickModal)
+            assert fake_engine.instances[0].switch_targets == []
+
+    async def test_manual_pick_escape_is_a_no_op(self, tmp_path, fake_engine):
+        _, app = self._three(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            await pilot.press("m", "escape")
+            await pilot.pause()
+            from claude_swap.tui.autoview import AutoScreen
+
+            assert isinstance(app.screen, AutoScreen)
+            assert fake_engine.instances[0].switch_targets == []
+            assert "manual pick" not in self._log_text(app)
+
+    async def test_manual_pick_is_inert_in_threshold_adjust_mode(
+        self, tmp_path, fake_engine
+    ):
+        _, app = self._three(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            await pilot.press("t", "m")
+            await pilot.pause()
+            from claude_swap.tui.autoview import AutoScreen
+
+            assert isinstance(app.screen, AutoScreen)
+            assert fake_engine.instances[0].switch_targets == []
+
+    async def test_manual_pick_rows_carry_pct_and_markers(
+        self, tmp_path, fake_engine
+    ):
+        """Plain-data rows, snapshot order: pct on the engine's windows, an
+        `over threshold` tag (still selectable), `usage unknown`, and the
+        active flag."""
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(10.0)),
+                make_account(2, entry=make_entry(95.0)),
+                make_account(3, entry=UsageEntry()),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            rows = app.screen._pick_rows(app.snapshot)
+            assert [r.number for r in rows] == ["1", "2", "3"]
+            assert rows[0].active and not rows[1].active
+            assert rows[1].pct == pytest.approx(95.0)
+            assert "over threshold" in rows[1].tags
+            assert rows[2].label == "usage unknown"
+
+    async def test_summary_shows_the_engine_pin_and_restart_carries_it(
+        self, tmp_path, fake_engine
+    ):
+        _, app = self._three(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            screen = app.screen
+            summary = screen.query_one("#auto-summary", Static)
+            assert "holding" not in summary.render().plain
+            engine = fake_engine.instances[0]
+            engine.pinned = "2"
+            screen._on_engine_event(NoSwitchEvent(reason="pinned"))
+            await pilot.pause()
+            assert "holding #2" in summary.render().plain
+            await pilot.press("s")  # strategy toggle rebuilds the engine
+            await settle(pilot)
+            assert fake_engine.instances[-1].kwargs.get("pinned") == "2"
 
 
 class TestWarmupEventRendering:

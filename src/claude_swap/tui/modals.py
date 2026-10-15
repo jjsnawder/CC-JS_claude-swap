@@ -9,7 +9,10 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, Label, Static
+from textual.widgets import Button, Input, Label, OptionList, Static
+from textual.widgets.option_list import Option
+
+from claude_swap.tui.theme import Palette
 
 
 class ConfirmModal(ModalScreen[bool]):
@@ -156,4 +159,113 @@ class OutputModal(ModalScreen[None]):
         self.dismiss(None)
 
     def action_dismiss_modal(self) -> None:
+        self.dismiss(None)
+
+
+@dataclass(frozen=True)
+class PickRow:
+    """One account row for :class:`AccountPickModal` (plain data, no engine).
+
+    ``pct`` is the binding pct on the engine's own windows (None = unknown);
+    ``label`` replaces it (sentinel wording / "usage unknown"); ``tags`` are
+    extra muted markers ("over threshold", "disabled", ...). An ``active``
+    row is shown but cannot be picked."""
+
+    number: str
+    email: str
+    pct: float | None = None
+    label: str | None = None
+    active: bool = False
+    tags: tuple[str, ...] = ()
+
+
+class AccountPickModal(ModalScreen["str | None"]):
+    """Manual pick (`m` on the auto screen): choose the account to switch to.
+
+    Dismisses with the picked account number, or None on escape. ↑/↓ +
+    enter, or a digit 1-9 picks that account number directly. The active
+    row is disabled; every other row is selectable — a refusal (over the
+    threshold, out of rotation) is the engine's to explain in the log."""
+
+    DEFAULT_CSS = """
+    AccountPickModal {
+        align: center middle;
+        background: $background 60%;
+    }
+    AccountPickModal OptionList {
+        height: auto;
+        max-height: 16;
+        border: none;
+        background: $surface;
+        padding: 0;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=False),
+        *(
+            Binding(str(d), f"pick_number('{d}')", show=False)
+            for d in range(1, 10)
+        ),
+    ]
+
+    def __init__(self, rows: list[PickRow], *, title: str = "Manual pick") -> None:
+        super().__init__()
+        self._rows = list(rows)
+        self._title = title
+
+    def compose(self) -> ComposeResult:
+        palette = Palette.from_theme(self.app.current_theme)
+        with Vertical(classes="modal-box"):
+            yield Label(self._title, classes="modal-title")
+            yield OptionList(
+                *(
+                    Option(self._row_text(r, palette), id=r.number, disabled=r.active)
+                    for r in self._rows
+                ),
+                id="pick-list",
+            )
+            yield Static(
+                "↑ ↓ · enter pick  ·  1-9 account  ·  esc cancel",
+                classes="modal-hint",
+            )
+
+    @staticmethod
+    def _row_text(row: PickRow, palette: Palette) -> Text:
+        text = Text()
+        text.append(f"{row.number:>2}  ", style=palette.foreground)
+        text.append(row.email, style=palette.foreground)
+        if row.label is not None:
+            text.append(f"  {row.label}", style=palette.muted)
+        elif row.pct is not None:
+            text.append(f"  {row.pct:3.0f}% used", style=palette.severity(row.pct))
+        for tag in (("active",) if row.active else ()) + row.tags:
+            text.append(f"  {tag}", style=palette.muted)
+        return text
+
+    def on_mount(self) -> None:
+        options = self.query_one("#pick-list", OptionList)
+        first = next(
+            (i for i, r in enumerate(self._rows) if not r.active), None
+        )
+        if first is not None:
+            options.highlighted = first
+        options.focus()
+
+    def on_option_list_option_selected(
+        self, event: OptionList.OptionSelected
+    ) -> None:
+        event.stop()
+        self._pick(event.option.id)
+
+    def action_pick_number(self, number: str) -> None:
+        self._pick(number)
+
+    def _pick(self, number: str | None) -> None:
+        row = next((r for r in self._rows if r.number == number), None)
+        if row is None or row.active:
+            return
+        self.dismiss(row.number)
+
+    def action_cancel(self) -> None:
         self.dismiss(None)

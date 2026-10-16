@@ -444,10 +444,13 @@ class AutoScreen(Screen):
         """Pick the account to switch to; the engine switches to exactly it.
 
         Same contract as `n` (the ENGINE performs it, one-shot, no confirm,
-        a preview in DRY-RUN), but the target is the human's: the engine
-        refuses it only if it is the active account, out of rotation,
-        quarantined, busy (``target-busy``) or at/over the threshold, and
-        after a live switch it holds it (``engine.pinned``, ` · holding #N` in
+        a preview in DRY-RUN), but the target is the human's — a disabled
+        slot included, as with ``cswap switch``: the engine refuses it only
+        if it is the active account, has no usable stored login, is
+        quarantined, busy (``target-busy``) or a landing `n` would refuse
+        (unreadable, at its limit, or at/over the threshold while the active
+        is readable and the fleet is not all over it); after a live switch
+        it holds it (``engine.pinned``, ` · holding #N` in
         the summary) until it reaches the threshold — never an API-key
         account, which has no quota to hold against."""
         if self._settings is None or self._adjusting or self._engine is None:
@@ -482,8 +485,8 @@ class AutoScreen(Screen):
             if label is None and pct is not None and pct >= threshold:
                 tags.append("over threshold")
             if acc.disabled:
-                tags.append("disabled")
-            elif not acc.switchable:
+                tags.append("disabled")  # informational: still a valid pick
+            if not acc.switchable:
                 tags.append("not switchable")
             rows.append(
                 PickRow(

@@ -7510,17 +7510,111 @@ class TestManualPick:
         assert self._reasons(harness) == ["target-unavailable"]
         assert harness.active_number() == 1
 
-    def test_refuses_a_disabled_slot(self, harness):
-        data = harness.switcher._get_sequence_data()
-        data["accounts"]["3"]["disabled"] = True
-        harness.switcher._write_json(harness.switcher.sequence_file, data)
+    def _disable(self, h: EngineHarness, num: str) -> None:
+        data = h.switcher._get_sequence_data()
+        data["accounts"][num]["disabled"] = True
+        h.switcher._write_json(h.switcher.sequence_file, data)
+
+    def test_takes_a_disabled_slot(self, harness):
+        """Like `cswap switch`, a pick may name a disabled slot; it joins
+        the phase-2 refetch, so the landing check reads it fresh."""
+        self._disable(harness, "3")
+        assert "3" not in harness.switcher.switchable_account_numbers()
+        usage = {"1": _usage7(30, 30), "2": _usage7(25, 25), "3": _usage7(10, 10)}
+        now = harness.clock.now
+        fetches: list[set] = []
+
+        def entries(fetch=None, **_kw):
+            fetches.append(set(fetch or ()))
+            return {n: _entry_for(v, now) for n, v in usage.items()}
+
+        harness.engine.request_switch(target="3")
+        with patch.object(
+            harness.switcher, "usage_entries_by_account", side_effect=entries
+        ):
+            outcome = harness.engine.tick()
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 3
+        assert harness.engine.pinned == "3"
+        assert any("3" in f for f in fetches)
+        # Still disabled: the pick does not put it back in rotation.
+        assert "3" not in harness.switcher.switchable_account_numbers()
+
+    def test_a_disabled_target_still_gets_the_landing_check(self, harness):
+        self._disable(harness, "3")
         harness.engine.request_switch(target="3")
         outcome = harness.tick_with_usage({
+            "1": _usage7(30, 30), "2": _usage7(25, 25), "3": _usage7(95, 95),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert self._reasons(harness) == ["target-over-threshold"]
+        assert harness.active_number() == 1
+
+    def test_a_disabled_quarantined_target_is_still_quarantined(self, harness):
+        self._disable(harness, "3")
+        harness.engine._quarantine("3", "c@example.com", "invalid_grant")
+        harness.events.clear()
+        harness.engine.request_switch(target="3")
+        harness.tick_with_usage({
             "1": _usage7(30, 30), "2": _usage7(25, 25), "3": _usage7(10, 10),
+        })
+        assert self._reasons(harness) == ["target-quarantined"]
+        assert harness.active_number() == 1
+
+    def test_refuses_a_disabled_slot_without_a_stored_login(self, harness):
+        """Disabled is allowed; unusable is not. A managed, disabled record
+        with no stored credentials stays `target-unavailable`."""
+        data = harness.switcher._get_sequence_data()
+        data["accounts"]["4"] = {"email": "d@example.com", "disabled": True}
+        data["sequence"].append(4)
+        harness.switcher._write_json(harness.switcher.sequence_file, data)
+        harness.engine.request_switch(target="4")
+        outcome = harness.tick_with_usage({
+            "1": _usage7(30, 30), "2": _usage7(25, 25), "4": _usage7(10, 10),
         })
         assert outcome is TickOutcome.NO_ACTION
         assert self._reasons(harness) == ["target-unavailable"]
         assert harness.active_number() == 1
+
+    def test_a_disabled_active_holds_then_leaves_for_rotation(self, temp_home):
+        """After `m` onto a disabled slot the engine holds it like any pick,
+        then escapes at the threshold to a SWITCHABLE account and never
+        ranks the disabled one again."""
+        h = self._cf(temp_home)
+        self._disable(h, "3")
+        self._pin_on_3(h)
+        assert h.tick_with_usage(self._CF_USAGE) is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["pinned"]
+        h.events.clear()
+        hot = {**self._CF_USAGE, "3": _usage7(95, 95, _R_LATEST)}
+        assert h.tick_with_usage(hot) is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
+        assert h.active_number() in (1, 2)
+        assert h.engine.pinned is None
+        # Back in rotation: #3 (now cool again) is never a candidate.
+        h.clock.advance(h.settings.cooldown_seconds + 1)
+        h.events.clear()
+        h.engine.request_switch()
+        cool3 = {
+            "1": _usage7(80, 80, _R_LATER), "2": _usage7(85, 85, _R_SOON),
+            "3": _usage7(1, 1, _R_SOON),
+        }
+        h.tick_with_usage(cool3)
+        assert h.active_number() in (1, 2)
+
+    def test_a_disabled_active_with_unreadable_usage_fails_over(self, temp_home):
+        h = self._cf(temp_home)
+        self._disable(h, "3")
+        self._pin_on_3(h)
+        dead = {**self._CF_USAGE, "3": None}
+        outcomes = [
+            h.tick_with_usage(dead) for _ in range(h.settings.unhealthy_ticks)
+        ]
+        assert outcomes[-1] is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "failover"
+        assert h.active_number() in (1, 2)
 
     def test_refuses_a_quarantined_target(self, harness):
         harness.engine._quarantine("3", "c@example.com", "invalid_grant")
@@ -7641,6 +7735,81 @@ class TestManualPick:
         refusal = next(e for e in harness.events if isinstance(e, NoSwitchEvent))
         assert refusal.reason == "target-over-threshold"
         assert "90%" in refusal.detail
+        assert harness.active_number() == 1
+
+    # `m` lands exactly where `n` would: each case below previews `n` on the
+    # same fleet first (a dry-run engine: no writes, no pin), so the parity
+    # is asserted, not assumed.
+
+    def _n_lands_on(self, h: EngineHarness, usage: dict) -> int | None:
+        live = h.engine
+        h.engine = h._make_engine(dry_run=True)
+        try:
+            h.engine.request_switch()
+            h.tick_with_usage(usage)
+        finally:
+            h.engine = live
+        sw = [e for e in h.events if isinstance(e, SwitchEvent)]
+        h.events.clear()
+        return sw[0].to_ref["number"] if sw else None
+
+    def test_takes_an_over_threshold_target_when_the_active_is_unreadable(
+        self, harness
+    ):
+        """Active unreadable: `n` is an escape and lands over the threshold,
+        so `m` may too."""
+        usage = {"1": None, "2": _usage7(97, 97), "3": _usage7(95, 95)}
+        assert self._n_lands_on(harness, usage) == 3
+        harness.engine.request_switch(target="2")
+        assert harness.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+
+    def test_takes_an_over_threshold_target_when_the_whole_fleet_is_over(
+        self, harness
+    ):
+        usage = {
+            "1": _usage7(95, 95), "2": _usage7(92, 92), "3": _usage7(96, 96),
+        }
+        assert self._n_lands_on(harness, usage) in (2, 3)
+        harness.engine.request_switch(target="3")
+        assert harness.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert harness.active_number() == 3
+
+    def test_refuses_a_target_at_its_limit_even_when_the_fleet_is_over(
+        self, harness
+    ):
+        """`n` never lands on an account with no headroom; neither does `m`."""
+        harness.engine.request_switch(target="3")
+        outcome = harness.tick_with_usage({
+            "1": _usage7(95, 95), "2": _usage7(92, 92), "3": _usage7(100, 100),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        refusal = next(e for e in harness.events if isinstance(e, NoSwitchEvent))
+        assert refusal.reason == "target-over-threshold"
+        assert "limit" in refusal.detail
+
+    def test_refuses_an_unknown_target_even_when_the_active_is_unreadable(
+        self, harness
+    ):
+        harness.engine.request_switch(target="3")
+        outcome = harness.tick_with_usage({
+            "1": None, "2": _usage7(25, 25), "3": None,
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert self._reasons(harness) == ["target-usage-unknown"]
+
+    def test_refuses_an_over_threshold_target_when_a_healthy_peer_exists(
+        self, harness
+    ):
+        """The normal case, with the active also over: one healthy peer means
+        `all_above` is off, so `n` refuses #3 and so does `m`."""
+        usage = {
+            "1": _usage7(95, 95), "2": _usage7(30, 30), "3": _usage7(93, 93),
+        }
+        assert self._n_lands_on(harness, usage) == 2
+        harness.engine.request_switch(target="3")
+        assert harness.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert self._reasons(harness) == ["target-over-threshold"]
         assert harness.active_number() == 1
 
     @pytest.mark.parametrize(

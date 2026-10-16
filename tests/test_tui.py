@@ -2154,6 +2154,40 @@ class TestAutoScreen:
             assert isinstance(app.screen, AccountPickModal)
             assert fake_engine.instances[0].switch_targets == []
 
+    @pytest.mark.parametrize("keys", [("3",), ("down", "enter")])
+    async def test_manual_pick_disabled_row_is_selectable(
+        self, tmp_path, fake_engine, keys
+    ):
+        """A `cswap disable`d slot is a valid pick (as with `cswap switch`):
+        enabled in the list, tagged `disabled`, reachable by digit and enter."""
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True),
+                make_account(2),
+                make_account(3, disabled=True),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            rows = app.screen._pick_rows(app.snapshot)
+            assert rows[2].tags == ("disabled",)
+            await pilot.press("m")
+            await pilot.pause()
+            from textual.widgets import OptionList
+
+            from claude_swap.tui.modals import AccountPickModal
+
+            assert isinstance(app.screen, AccountPickModal)
+            options = app.screen.query_one("#pick-list", OptionList)
+            assert options.get_option("3").disabled is False
+            assert "disabled" in str(options.get_option("3").prompt)
+            await pilot.press(*keys)
+            await pilot.pause()
+            assert fake_engine.instances[0].switch_targets == ["3"]
+
     async def test_manual_pick_escape_is_a_no_op(self, tmp_path, fake_engine):
         _, app = self._three(tmp_path)
         async with app.run_test(size=(100, 40)) as pilot:

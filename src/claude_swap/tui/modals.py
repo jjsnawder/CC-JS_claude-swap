@@ -184,8 +184,9 @@ class AccountPickModal(ModalScreen["str | None"]):
 
     Dismisses with the picked account number, or None on escape. ↑/↓ +
     enter, or a digit 1-9 picks that account number directly. The active
-    row is disabled; every other row is selectable — a refusal (over the
-    threshold, out of rotation) is the engine's to explain in the log."""
+    row is disabled; every other row is selectable, a ``disabled`` (cswap
+    disable) slot included — a refusal (over the threshold, no usable
+    login) is the engine's to explain in the log."""
 
     DEFAULT_CSS = """
     AccountPickModal {

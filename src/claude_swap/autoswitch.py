@@ -1336,7 +1336,7 @@ class AutoSwitchEngine:
             if target is not None:
                 # `m` (manual pick): the candidate list is exactly the target
                 # (see `_rank` below); these are the refusals that need no
-                # usage data. The threshold check waits for the fresh fetch.
+                # usage data. The landing check waits for the fresh fetch.
                 refusal = self._target_refusal(target, current, quarantined)
                 if refusal is not None:
                     self._emit(refusal)
@@ -1352,6 +1352,12 @@ class AutoSwitchEngine:
             for num in self.switcher.switchable_account_numbers()
             if num != current and num not in quarantined
         ]
+        if target is not None and target not in candidates:
+            # `m` on a DISABLED slot (admitted by `_target_refusal`; every
+            # other way to be missing here was refused there). It joins this
+            # tick's census so the phase-2 refetch reads it and the landing
+            # check ranks it with the fleet; rotation itself is untouched.
+            candidates.append(target)
         oauth_candidates = [
             n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
         ]
@@ -1517,9 +1523,19 @@ class AutoSwitchEngine:
             )
 
         if target is not None:
-            # Manual pick, on the phase-2 data: landing at/over the threshold
-            # would bounce away on the very next tick.
-            refusal = self._target_usage_refusal(target, headroom, settings)
+            # Manual pick, on the phase-2 data: refused exactly where `n`'s
+            # landing gate would refuse the same account this tick.
+            refusal = self._target_usage_refusal(
+                target,
+                consume_first=consume_first,
+                oauth_candidates=oauth_candidates,
+                usage=usage,
+                headroom=headroom,
+                current=current,
+                active_headroom=active_headroom,
+                settings=settings,
+                now=decided_now,
+            )
             if refusal is not None:
                 self._emit(refusal)
                 return TickOutcome.NO_ACTION
@@ -1738,18 +1754,26 @@ class AutoSwitchEngine:
         """Why a manual-pick target can't be taken, before any usage data.
 
         None = proceed. Cooldown, hysteresis, strictly-sooner and the
-        no-return bar are NOT here: the human overrode them by picking."""
+        no-return bar are NOT here: the human overrode them by picking. Nor
+        is ``cswap disable``: like ``cswap switch``, a pick may name a
+        disabled slot (it only leaves AUTOMATIC rotation), as long as it is
+        managed and has a usable stored login."""
         if target == current:
             return NoSwitchEvent(
                 reason="already-active",
                 detail=f"Account-{target} is the active account",
             )
-        if target not in self.switcher.switchable_account_numbers():
+        if target not in self.switcher.switchable_account_numbers() and not (
+            target in self.switcher.disabled_account_numbers()
+            # The same stored-login test `switchable_account_numbers` applies,
+            # minus its disabled filter.
+            and self.switcher._account_is_switchable(target)
+        ):
             return NoSwitchEvent(
                 reason="target-unavailable",
                 detail=(
-                    f"Account-{target} is not in rotation (unknown slot, no "
-                    "usable stored login, or disabled via 'cswap disable')"
+                    f"Account-{target} cannot be switched to (unknown slot "
+                    "or no usable stored login)"
                 ),
             )
         if target in quarantined:
@@ -1776,13 +1800,41 @@ class AutoSwitchEngine:
     def _target_usage_refusal(
         self,
         target: str,
+        *,
+        consume_first: bool,
+        oauth_candidates: list[str],
+        usage: dict[str, dict | str | None],
         headroom: dict[str, float | None],
+        current: str,
+        active_headroom: float | None,
         settings: AutoSwitchSettings,
+        now: float,
     ) -> NoSwitchEvent | None:
-        """The manual-pick threshold check, on the post-refetch headroom
-        (same ``self._models`` windows as every other decision). API-key
-        targets have no measurable quota and pass."""
+        """The manual-pick landing check, on the post-refetch data.
+
+        Decided BY `n`'s own ranking rather than a copy of its rule: the
+        target is accepted iff the ``manual`` ranking of this same fleet
+        would keep it. That ranking waives every anti-flap margin for
+        ``manual`` and ``_no_return_account`` returns None for it, so what
+        is left is exactly the landing gate — readable, headroom > 0, and
+        below the threshold unless the active is unreadable (escape) or the
+        whole fleet is at/over it (``all_above``). API-key targets have no
+        measurable quota and pass."""
         if self.switcher.account_kind_for(target) == "api_key":
+            return None
+        kept, _, _ = self._rank_candidates(
+            trigger="manual",
+            consume_first=consume_first,
+            oauth_candidates=oauth_candidates,
+            no_return=None,
+            usage=usage,
+            headroom=headroom,
+            current=current,
+            active_headroom=active_headroom,
+            settings=settings,
+            now=now,
+        )
+        if target in kept:
             return None
         h = headroom.get(target)
         if h is None:
@@ -1791,16 +1843,16 @@ class AutoSwitchEngine:
                 detail=f"Account-{target} usage could not be read this tick",
             )
         utilization = 100.0 - h
-        if utilization >= settings.threshold:
-            return NoSwitchEvent(
-                reason="target-over-threshold",
-                detail=(
-                    f"Account-{target} at {pct_label(utilization)}% >= "
-                    f"{pct_label(settings.threshold)}%; it would switch "
-                    "away again on the next tick"
-                ),
-            )
-        return None
+        return NoSwitchEvent(
+            reason="target-over-threshold",
+            detail=(
+                f"Account-{target} is at its limit ({pct_label(utilization)}%)"
+                if h <= 0
+                else f"Account-{target} at {pct_label(utilization)}% >= "
+                f"{pct_label(settings.threshold)}%; it would switch "
+                "away again on the next tick"
+            ),
+        )
 
     def _no_return_account(
         self,
@@ -2231,7 +2283,13 @@ class AutoSwitchEngine:
         candidate unhealthy, manual returns nothing and `_tick_inner` reports
         no-qualifying-candidate. ONE exception, at the gate itself: with the
         ACTIVE account unreadable there is no next trigger to protect against
-        and manual behaves as an escape.
+        and manual behaves as an escape. `m` (a named target) is checked
+        against this same ranking — ``_target_usage_refusal`` asks whether
+        the ``manual`` pass keeps it — so the two keys apply the same
+        threshold check. Two deliberate differences remain: `m` takes an
+        included API-key target even under consume-first, and `m` always
+        decides on the fresh second fetch (`n` re-fetches only when its first
+        ranking is non-empty).
         """
         # consume-first ranks a qualifying candidate cool-before-5h-hot,
         # then by soonest weekly reset, then soonest 5-hour reset, then
@@ -3325,8 +3383,10 @@ class AutoSwitchEngine:
 
         ``target`` (the TUI's `m`, manual pick) names the account to take
         instead of ranking: refused with a ``target-*``/``already-active``
-        reason if it is unavailable, quarantined, busy or at/over the
-        threshold, and after a live switch held (``pinned``) until the
+        reason if it is unavailable, quarantined, busy, or a landing `n`
+        itself would refuse (at/over the threshold outside the escape and
+        all-over states). A disabled slot is a valid target, as with ``cswap
+        switch``. After a live switch it is held (``pinned``) until the
         threshold — unless it is an API-key account, which is never held. The
         latest request wins: a ``target=None`` call clears a pending target."""
         with self._switch_lock:

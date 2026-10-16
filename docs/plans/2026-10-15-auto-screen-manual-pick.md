@@ -14,9 +14,13 @@ threshold, then normal auto-switching resumes. `n` (Switch now) is unchanged.
   engine still owns health checks, two-phase fresh fetch, freshening,
   quarantine and `_perform`. The screen never calls `switch_to` itself.
 - Refusals (NoSwitchEvent, NO_ACTION): `already-active`,
-  `target-unavailable`, `target-quarantined`, `target-over-threshold`
-  (landing there re-triggers next tick), `target-usage-unknown`,
-  `target-busy` (live `cswap run` session or warmup hello in flight).
+  `target-unavailable` (unknown slot / no usable login), `target-quarantined`,
+  `target-over-threshold` (only where `n` would also refuse it — revised
+  2026-10-16: `m` reuses `n`'s manual ranking, so it lands over the
+  threshold when the active account is unreadable or the whole fleet is
+  over), `target-usage-unknown`, `target-busy` (live `cswap run` session or
+  warmup hello in flight). A DISABLED managed account is an accepted target
+  (Jeremy, 2026-10-16), added to that tick's candidates only.
   Cooldown / hysteresis / sooner-reset / no-return gates are waived. A failed
   freshen of the target never slides to another account. An API-key target
   is switched to but never pinned (no quota to hold against).

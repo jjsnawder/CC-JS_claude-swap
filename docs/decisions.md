@@ -315,3 +315,17 @@ refusal names the reason instead; (c) persisting the pin — it would outlive
 the session that made the choice.
 **Why it matters:** the pick has to survive consume-first's own logic without
 ever weakening the escapes that protect a session from hitting the limit.
+
+## 2026-10-16 - `m` follows `n`'s landing rule, and may pick a disabled account (Jeremy)
+Corrects the 2026-10-15 entry's rejected alternative (b).
+**Chose:** (1) `_target_usage_refusal` runs `n`'s own `manual` ranking over
+the fleet and accepts the target only if that ranking keeps it, so `m` lands
+over the threshold exactly where `n` does (active usage unreadable, whole
+fleet at/over) and refuses exactly where `n` refuses; (2) a disabled account
+that is managed and has a usable stored login is an accepted target, added to
+that tick's candidate list only — it stays out of rotation afterwards.
+**Rejected:** a separate threshold test for `m` (the shipped behaviour) — two
+rules for one landing decision drift; refusing disabled slots — `cswap switch`
+already allows them, and the pick is an explicit human choice.
+**Why it matters:** `m` and `n` now differ only in WHO is chosen, never in
+whether a landing is allowed.

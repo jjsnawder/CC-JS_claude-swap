@@ -345,3 +345,9 @@ spends the quota the strategy exists to save; (d) an upstream-PR shape —
 not worth the extra work for an operator-specific need.
 **Why it matters:** "last" has to hold in escapes too, or a limit hit lands
 on the reserve whenever it has the most headroom — which is usually.
+
+## 2026-11-01 - Strategy name is `consume-first-reserve-jj` (Jeremy)
+Corrects the name in the entry above.
+**Chose:** `consume-first-reserve-jj`. **Rejected:** `consume-first-reserve`.
+**Why it matters:** the name is the settings/CLI value; set once, renaming
+later breaks an existing settings.json.

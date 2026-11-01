@@ -13,7 +13,9 @@ own account #1. The repo is public, so the account is a setting, never code.)
   (settings spec, `cswap auto --strategy`, `s` cycle picks it up for free).
 - New `autoswitch.reserveAccounts` (camelCase JSON key; field
   `reserve_accounts`): comma-separated account numbers, e.g. `"1"` or `"1,4"`.
-  Default unset. Validated as slot numbers. Optional CLI `--reserve NUMS`.
+  Default `"1"` (Jeremy, 2026-11-01); `none` = no reserve. Session-only
+  override `--reserve NUMS|none` on `cswap auto` and the TUI launch
+  (`cswap`, `cswap tui`, `cswap watch`, which also take `--strategy`).
 - Strategy set but reserve list empty → behaves exactly like `consume-first`.
 - Everywhere the code asks "is this consume-first?" (`consume_first` bool in
   the engine, warmup ordering, Next best panel, API-key gates), the new

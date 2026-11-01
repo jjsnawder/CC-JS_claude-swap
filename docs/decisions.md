@@ -418,3 +418,17 @@ upstream's "no command given" (upstream checks that first; the reviewer's
 "specific message" premise was wrong — a parity test pins it).
 **Rejected:** a silent fallback — a typo would quietly hold account 1 back.
 **Why it matters:** one fewer upstream function carries a fork hunk.
+
+## 2026-11-01 - Engine control for Claude Remote: CLI contract cswap-engine/0.1 (draft)
+**Chose:** a `cswap engine status|pick|strategy --json` verb with exit codes
+0 done / 1 error / 2 usage / 3 no engine / 4 pending / 5 refused (5, not 2,
+because argparse owns 2); picks are synchronous with a `--timeout` and go
+through `request_switch(target=N)`, so `m`'s refusals and hold apply
+unchanged; transport is a box-local `multiprocessing.connection` pipe/socket
+whose endpoint file only cswap reads.
+**Rejected:** a request file polled by the tick (60 s latency, no answer
+channel); a loopback TCP port (reachable by any local process without the
+authkey handshake being idiomatic); the hub reading engine state files
+(charter forbids it).
+**Why it matters:** the hub's fallback depends on "no engine" (3) being
+distinct from every failure.

@@ -1,5 +1,5 @@
 # Collaboration: cswap remote control (manual pick + strategy from Claude Remote)
-Status: active
+Status: closed 2026-11-01
 Projects: CC-JS_Claude_Remote ↔ CC-JS_claude-swap     This file: CC-JS_claude-swap's side (receiver)
 Charter: D:\Dev Projects\CC-JS_Claude_Remote\docs\collaborations\2026-11-01-cswap-remote-control.md @ 0a298f9
 
@@ -21,3 +21,6 @@ offers: `docs/plans/2026-11-01-engine-control.md` §Contract.
 - 2026-11-01 · dry-run engine up (TUI pid 60884); my check: status running/dry-run, pick 2 -> would-switch, active unchanged. Remote's test: hub direct + HTTP routes (GET /api/cswap, POST /api/cswap/switch) would-switch 4->2 in ~1 s, bad slot 400, active unchanged; contract 0.1 + amendments consumed as written
 - 2026-11-01 · Jeremy approved live test (#4 -> #2 -> #4) after pressing `l`. Remote's hub POST /api/cswap/switch: 4->2 switched in 2.6 s (verified here: engine active 2 pinned 2, live login Account-2), 2->4 switched in 1.7 s (verified: active 4 pinned 4, live login Account-4). No retries, #1 and strategy untouched.
 - 2026-11-01 · contract `cswap-engine/0.1` + amendments is the version the hub consumes (string stays "cswap-engine/0.1"). NOT yet verified live: `engine strategy` (persists to settings) and the hub's no-engine fallback (`cswap switch` / `config set`). Collaboration stays open until Jeremy rules on those.
+- 2026-11-01 · Test A (Jeremy-approved): hub set strategy consume-first-reserve-jj via engine -> applied, live; verified here strategy_source flipped session->settings, config get = consume-first-reserve-jj, reserve 1 (kept as Jeremy's saved default). Suggested hub pass `persisted` through.
+- 2026-11-01 · Test B (Jeremy stopped cswap): status no-engine/exit 3, endpoint file removed. Hub fallback `cswap switch` 4->2 (2.1 s, verified Account-2) and 2->4 (2.2 s, verified Account-4).
+- 2026-11-01 · Done when met (engine pick, engine strategy, no-engine switch fallback all verified live; `config set` fallback not run live, same exit-3 branch). Closed. Jeremy's cswap auto is stopped; restart is his.

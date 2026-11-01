@@ -432,3 +432,16 @@ authkey handshake being idiomatic); the hub reading engine state files
 (charter forbids it).
 **Why it matters:** the hub's fallback depends on "no engine" (3) being
 distinct from every failure.
+
+## 2026-11-01 - Engine control: own HMAC handshake, bounded server, unreachable != no-engine
+**Chose:** a mutual HMAC-SHA256 handshake in `engine_control.py` with every
+server read bounded by `poll`, replacing stdlib `deliver_challenge` (unbounded
+recv; the default pipe DACL lets other users open it read-only); handler cap 8
+and backlog 16; only FileNotFound/ConnectionRefused mean "no engine", any
+other connect failure is exit 1 `transport`; the TUI's remote strategy path
+refuses once the screen is unmounted (no orphan engine).
+**Rejected:** stdlib challenge + Timer(close) (Windows-only); treating every
+OSError as stale (reintroduces the hub's competing-switch fallback against a
+live engine).
+**Why it matters:** "no engine" is the hub's licence to switch around the
+engine, so it must mean exactly that.

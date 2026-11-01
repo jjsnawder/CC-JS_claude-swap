@@ -1,4 +1,4 @@
-# Plan — `consume-first-reserve` strategy
+# Plan — `consume-first-reserve-jj` strategy
 
 Date: 2026-11-01 · Branch: `jeremy` · Status: **planned**
 Shape: **fork-only** (Jeremy, 2026-11-01), separable so it rebases cleanly.
@@ -9,7 +9,7 @@ configured "reserve" accounts are always consumed LAST. (Jeremy's case: his
 own account #1. The repo is public, so the account is a setting, never code.)
 
 ## Configuration
-- `autoswitch.strategy` gains the choice `consume-first-reserve`
+- `autoswitch.strategy` gains the choice `consume-first-reserve-jj`
   (settings spec, `cswap auto --strategy`, `s` cycle picks it up for free).
 - New `autoswitch.reserveAccounts` (camelCase JSON key; field
   `reserve_accounts`): comma-separated account numbers, e.g. `"1"` or `"1,4"`.

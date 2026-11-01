@@ -1,6 +1,6 @@
 # Plan — `consume-first-reserve-jj` strategy
 
-Date: 2026-11-01 · Branch: `jeremy` · Status: **planned**
+Date: 2026-11-01 · Branch: `jeremy` · Status: **built** (bf26cc2, d4234af)
 Shape: **fork-only** (Jeremy, 2026-11-01), separable so it rebases cleanly.
 
 ## Ask

@@ -351,3 +351,59 @@ Corrects the name in the entry above.
 **Chose:** `consume-first-reserve-jj`. **Rejected:** `consume-first-reserve`.
 **Why it matters:** the name is the settings/CLI value; set once, renaming
 later breaks an existing settings.json.
+
+## 2026-11-01 - consume-first-reserve-jj: implementation calls
+**Chose:** (1) `s` cycles `consume-first-reserve-jj` only when
+`autoswitch.reserveAccounts` is not `none` — without a reserve it equals
+consume-first, so a third stop would be a no-op toggle; (2) one wrapper,
+`_rank_reserve_aware`, in front of the existing ranking: drop reserves when
+any non-reserve is a healthy landing, else re-tier (healthy reserves,
+non-reserves in today's order, other reserves); (3) a `waive_sooner` keyword
+on `_rank_candidates` used only when the active account is a reserve; (4) a
+new NoSwitch reason `reserve-hold` when an active reserve has nowhere healthy
+to go; `--reserve` is silently ignored under other strategies.
+**Rejected:** a leading tier in every sort key — touches every upstream key
+branch (rebase friction); always showing three strategies in `s`.
+**Why it matters:** with an empty reserve the wrapper is a pass-through, so
+the fork's delta cannot change consume-first or best.
+
+## 2026-11-01 - Reserve defaults to account 1; launch flags override (Jeremy)
+Corrects "default unset" in the plan.
+**Chose:** `autoswitch.reserveAccounts` defaults to `"1"` (only read under
+`consume-first-reserve-jj`); `none` means no reserve; `config unset` returns
+to 1. Session-only overrides `--reserve NUMS|none` on `cswap auto` and on the
+TUI launch (`cswap`, `cswap tui`, `cswap watch`), which also takes
+`--strategy` so the auto screen can open straight into the reserve strategy.
+**Rejected:** settings-only configuration — Jeremy wants it working with no
+setup and switchable per launch.
+**Why it matters:** a slot number is not operator data, so the default can
+live in the public repo; the email never does.
+
+## 2026-11-01 - Reserve vs the no-return bar; panel follows the engine
+**Chose:** (1) a non-reserve account barred by the no-return bar still
+counts as a "usable landing", so the reserve stays out: on N1 over the
+threshold with the only healthy non-reserve being the just-left N2, the
+engine holds on N1 until the at-limit escape takes N2, rather than spending
+the reserve. (2) The Next best panel orders healthy rows first, then reserve
+after non-reserve, matching the engine's tiers, instead of the plan's
+literal "reserves always last" display.
+**Rejected:** (1) letting the bar open the reserve — reserve-last is the
+point of the strategy; (2) the literal display — upstream treats an
+unhealthy row shown first as a bug, since it reads as the next pick.
+**Why it matters:** the panel must never predict a different move than the
+engine makes.
+
+## 2026-11-01 - Reserve default plumbing: TUI launch flags, save_settings
+**Chose:** (1) TUI launch flags are split off argv by `_pop_tui_overrides`
+before the main parser, because the main parser's `--strategy` belongs to
+`switch` with different choices; they reach the auto screen as
+`auto_overrides` and are merged in `on_mount`, never saved. Bare
+`cswap --strategy …` now opens the TUI in an interactive terminal. (2)
+`save_settings` never writes the default `"1"` (and drops the key when it
+returns to it), so a future default change is not frozen into files; `none`
+is stored explicitly. (3) Upstream's `_consume_first_app` test helper pins
+`reserveAccounts: "none"` — its tests assert a two-stop `s` cycle.
+**Rejected:** adding `--reserve`/`--strategy` to the main parser — collides
+with `switch --strategy` and widens the upstream diff.
+**Why it matters:** the one upstream test-helper hunk is a known rebase
+conflict point.

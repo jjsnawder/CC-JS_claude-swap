@@ -766,6 +766,7 @@ class AutoScreen(Screen):
         threshold = self._settings.threshold if self._settings else 100.0
         active_reset_ts = float("inf")
         active_below = False
+        active_over = False
         idle = False
         if consume_first:
             key_kwargs = dict(
@@ -786,6 +787,7 @@ class AutoScreen(Screen):
             # at/over the threshold the engine must move and takes any healthy
             # account, so muting on reset there would contradict it.
             active_below = active_pct is not None and active_pct < threshold
+            active_over = active_pct is not None and active_pct >= threshold
             # ...and below the threshold with the active reset unmeasured, the
             # engine's gate can never pass ("reset-unknown"): nothing here is
             # takeable until that number is reported.
@@ -797,6 +799,10 @@ class AutoScreen(Screen):
         # their 998/999 buckets and sort after every keyed row.
         ranked: list[tuple[tuple, str]] = []
         lines: dict[str, Text] = {}
+        # Over the threshold the engine takes a healthy non-reserve before
+        # any reserve, so healthy reserves are tagged `skip` once one exists.
+        held_reserves: list[Text] = []
+        usable_non_reserve = False
         for acc in snap.accounts:
             if acc.number == active_number or not acc.switchable:
                 continue
@@ -809,6 +815,7 @@ class AutoScreen(Screen):
             # under `best`, so the panel's colours mean the same thing
             # whichever key ordered it.
             skip = False
+            healthy = False
             if acc.usage.sentinel is not None:
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
@@ -841,6 +848,7 @@ class AutoScreen(Screen):
                 # row — untiered, an unhealthy account still rendered first
                 # and read as the engine's next pick.
                 unhealthy = pct >= threshold
+                healthy = not unhealthy
                 # Tagged, still RANKED: this is the order the engine would
                 # use the moment the account becomes eligible.
                 skip = unhealthy or (
@@ -854,9 +862,16 @@ class AutoScreen(Screen):
                 # Never the target of a below-threshold nudge.
                 entry.append("  reserve", style=palette.muted)
                 skip = skip or active_below
+                if healthy and active_over:
+                    held_reserves.append(entry)
+            elif healthy:
+                usable_non_reserve = True
             if skip or idle:  # idle: nothing here is takeable
                 entry.append("  skip", style=palette.muted)
             lines[acc.number] = entry
+        if usable_non_reserve:
+            for entry in held_reserves:
+                entry.append("  skip", style=palette.muted)
 
         text = Text()
         text.append("Next best", style=palette.muted)

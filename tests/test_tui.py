@@ -2936,6 +2936,32 @@ class TestAutoScreenReserve:
             assert plain.index("user2@example.com") < plain.index("user3@example.com")
             assert not self._line(plain, "user2@example.com").rstrip().endswith("skip")
 
+    async def test_over_threshold_skips_reserve_when_a_non_reserve_is_usable(
+        self, tmp_path, fake_engine
+    ):
+        """Active at 92% (threshold 90) with the healthy non-reserve #3
+        available: the engine takes #3, never the healthy reserve #2, so #2
+        is tagged `skip`. Order is unchanged (#3 before #2)."""
+        app = self._app(
+            tmp_path,
+            [
+                make_account(
+                    1, active=True, entry=make_entry(92.0, 92.0, reset7_in=86400 * 9)
+                ),
+                make_account(2, entry=make_entry(10.0, 10.0, reset7_in=86400)),
+                make_account(3, entry=make_entry(20.0, 20.0, reset7_in=86400 * 4)),
+            ],
+            threshold=90,
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            plain = self._static(app, "#candidates")
+            assert plain.index("user3@example.com") < plain.index("user2@example.com")
+            line2 = self._line(plain, "user2@example.com").rstrip()
+            assert line2.endswith("skip") and line2.count("skip") == 1
+            assert not self._line(plain, "user3@example.com").rstrip().endswith("skip")
+
     async def test_on_reserve_later_resets_are_not_skipped(self, tmp_path, fake_engine):
         """Active #2 is the reserve: the strictly-sooner gate is waived, so a
         non-reserve resetting LATER is takeable (no `skip`)."""

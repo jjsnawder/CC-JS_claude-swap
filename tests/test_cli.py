@@ -1992,11 +1992,41 @@ class TestTuiLaunchOverrides:
         assert not launched
         assert needle in capsys.readouterr().err
 
+    @pytest.mark.parametrize(
+        "argv, prog",
+        [
+            (["watch", "--reserve", "x"], "cswap watch: "),
+            (["tui", "--reserve", "x"], "cswap tui: "),
+            (["--reserve", "x"], "cswap: "),
+        ],
+    )
+    def test_error_names_the_actual_verb(
+        self, monkeypatch, temp_home, capsys, argv, prog
+    ):
+        code, _ = self._launch(monkeypatch, argv)
+        assert code == 2
+        err = capsys.readouterr().err
+        assert f"{prog}error:" in err
+        if prog == "cswap: ":
+            assert "cswap tui" not in err
+
     def test_bare_non_tty_keeps_usage_error(self, monkeypatch, temp_home):
         code, launched = self._launch(
             monkeypatch, ["--reserve", "1"], tty=False
         )
         assert code == 2 and not launched
+
+    def test_bare_non_tty_strategy_matches_upstream(
+        self, monkeypatch, temp_home, capsys
+    ):
+        """Upstream checks "no command given" BEFORE "--strategy can only be
+        used with bare 'switch'", so bare `cswap --strategy best` never got
+        the specific message; the fork keeps that exactly."""
+        code, launched = self._launch(
+            monkeypatch, ["--strategy", "best"], tty=False
+        )
+        assert code == 2 and not launched
+        assert "no command given" in capsys.readouterr().err
 
     def test_switch_strategy_is_not_taken(self):
         assert cli._pop_tui_overrides(["switch", "--strategy", "best"]) == (

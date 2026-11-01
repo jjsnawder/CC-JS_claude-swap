@@ -72,8 +72,8 @@ class AutoSwitchSettings:
     warmup_stagger: bool = True
     # Fork-only (consume-first-reserve-jj): comma-separated account numbers
     # (e.g. "1" or "1,4") consumed LAST under that strategy. Ignored by every
-    # other strategy. Default "1" (Jeremy, 2026-11-01; a missing account 1
-    # is a no-op). "none" (``RESERVE_NONE``; None or "" too) = no reserve,
+    # other strategy. Default "1" (a missing account 1 is a no-op).
+    # "none" (``RESERVE_NONE``; None, "" or false too) = no reserve,
     # and the strategy then equals consume-first. Canonicalised by
     # ``_clamped`` via ``parse_account_numbers``.
     reserve_accounts: str | None = "1"
@@ -259,12 +259,26 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
             kwargs[spec.field] = value if isinstance(value, str) and value else spec.default
         elif spec.kind == "accounts":
             nums = parse_account_numbers(value)
-            if nums:
-                kwargs[spec.field] = ",".join(nums)
-            elif _is_reserve_none(value):
+            if value is False or _is_reserve_none(value):
                 kwargs[spec.field] = RESERVE_NONE
-            else:  # junk ("0", true, "x"): back to the default
+            elif not nums:  # junk ("0", true, "x", ["", " "]): the default
+                _logger.warning(
+                    "settings.json: unsupported %s %r; using %r",
+                    spec.dotted, value, spec.default,
+                )
                 kwargs[spec.field] = spec.default
+            else:
+                parts = (
+                    value if isinstance(value, (list, tuple))
+                    else str(value).split(",")
+                )
+                if any(not parse_account_numbers([p]) for p in parts):
+                    _logger.warning(
+                        "settings.json: %s %r has entries that are not "
+                        "account numbers; using %r",
+                        spec.dotted, value, ",".join(nums),
+                    )
+                kwargs[spec.field] = ",".join(nums)
         else:  # choice
             if value not in spec.choices:
                 _logger.warning(
@@ -333,13 +347,6 @@ def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
     if not isinstance(section, dict):
         section = {}
     for field, json_key in _AUTOSWITCH_KEYS.items():
-        if field == "reserve_accounts" and settings.reserve_accounts == (
-            AutoSwitchSettings.reserve_accounts
-        ):
-            # Fork: never freeze the reserve default ("1") into the file;
-            # absent IS the default, so a later default change still lands.
-            section.pop(json_key, None)
-            continue
         section[json_key] = getattr(settings, field)
     raw["autoswitch"] = section
     atomic_write_json(path, raw)

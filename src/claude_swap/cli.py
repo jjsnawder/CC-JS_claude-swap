@@ -592,12 +592,13 @@ _TUI_LAUNCH_VERBS = ("tui", "watch", "--tui", "--watch")
 _TUI_OVERRIDE_FLAGS = ("--strategy", "--reserve")
 
 
-def _tui_override_parser() -> argparse.ArgumentParser:
+def _tui_override_parser(verb: str | None = None) -> argparse.ArgumentParser:
+    """``verb``: the launch token (``tui``, ``--watch``...) so an error
+    reads ``cswap watch: ...``; None (bare ``cswap``) reads ``cswap: ...``."""
     from claude_swap.settings import SETTING_SPECS
 
-    parser = argparse.ArgumentParser(
-        prog=f"{_prog_name()} tui", add_help=False, allow_abbrev=False
-    )
+    prog = _prog_name() + (f" {verb}" if verb else "")
+    parser = argparse.ArgumentParser(prog=prog, add_help=False, allow_abbrev=False)
     parser.add_argument(
         "--strategy", choices=SETTING_SPECS["autoswitch.strategy"].choices
     )
@@ -631,7 +632,7 @@ def _pop_tui_overrides(argv: list[str]) -> tuple[list[str], argparse.Namespace |
         if not argv:
             return argv, None
         head, tail = [], argv
-    ns, rest = _tui_override_parser().parse_known_args(tail)
+    ns, rest = _tui_override_parser(head[0] if head else None).parse_known_args(tail)
     if ns.strategy is None and ns.reserve is None:
         return argv, None
     return head + rest, ns

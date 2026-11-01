@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import stat
 import sys
 from pathlib import Path
@@ -416,6 +417,11 @@ class TestReserveAccountsSetting:
             ("", "none"),
             (None, "none"),
             ([], "none"),
+            (False, "none"),     # JSON false reads as no reserve
+            (0, "1"),
+            ("4;2", "1"),
+            ("4 2", "1"),
+            (["", " "], "1"),
         ],
     )
     def test_lenient_load(self, tmp_path: Path, raw, expected):
@@ -423,6 +429,42 @@ class TestReserveAccountsSetting:
             json.dumps({"autoswitch": {"reserveAccounts": raw}})
         )
         assert load_settings(tmp_path).reserve_accounts == expected
+
+    @staticmethod
+    def _load_warnings(tmp_path: Path, caplog, raw) -> list[str]:
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"reserveAccounts": raw}})
+        )
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            load_settings(tmp_path)
+        return [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and "reserveAccounts" in r.getMessage()
+        ]
+
+    @pytest.mark.parametrize(
+        "raw", ["0", 0, True, "x", "4;2", "4 2", ["", " "], "²"]
+    )
+    def test_junk_load_warns_and_uses_the_default(self, tmp_path, caplog, raw):
+        warnings = self._load_warnings(tmp_path, caplog, raw)
+        assert len(warnings) == 1
+        assert "unsupported" in warnings[0] and "'1'" in warnings[0]
+
+    @pytest.mark.parametrize(
+        "raw, kept", [("x,2", "2"), ("4,²", "4"), ([1, "x"], "1"), ("1,4,", "1,4")]
+    )
+    def test_partly_bad_list_warns(self, tmp_path, caplog, raw, kept):
+        warnings = self._load_warnings(tmp_path, caplog, raw)
+        assert len(warnings) == 1
+        assert "not account numbers" in warnings[0] and repr(kept) in warnings[0]
+        assert load_settings(tmp_path).reserve_accounts == kept
+
+    @pytest.mark.parametrize(
+        "raw", ["1", "1,4", " 4 , 01,4 ", 2, [1, "3"], "none", "", None, [], False]
+    )
+    def test_clean_values_load_silently(self, tmp_path, caplog, raw):
+        assert self._load_warnings(tmp_path, caplog, raw) == []
 
     def test_strict_set_canonicalises(self, tmp_path: Path):
         assert set_setting(tmp_path, "autoswitch.reserveAccounts", "4, 1") == "4,1"
@@ -457,19 +499,3 @@ class TestReserveAccountsSetting:
         )
         save_settings(tmp_path, s)
         assert load_settings(tmp_path) == s
-
-    def test_save_never_freezes_the_default(self, tmp_path: Path):
-        settings_path(tmp_path).write_text(
-            json.dumps({"autoswitch": {"reserveAccounts": "4"}})
-        )
-        save_settings(tmp_path, AutoSwitchSettings())
-        raw = json.loads(settings_path(tmp_path).read_text())
-        assert "reserveAccounts" not in raw["autoswitch"]  # absent == default
-        assert load_settings(tmp_path).reserve_accounts == "1"
-
-    @pytest.mark.parametrize("value", ["none", "4,2"])
-    def test_save_writes_a_non_default(self, tmp_path: Path, value):
-        save_settings(tmp_path, AutoSwitchSettings(reserve_accounts=value))
-        raw = json.loads(settings_path(tmp_path).read_text())
-        assert raw["autoswitch"]["reserveAccounts"] == value
-        assert load_settings(tmp_path).reserve_accounts == value

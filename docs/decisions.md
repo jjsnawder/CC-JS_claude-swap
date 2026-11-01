@@ -407,3 +407,14 @@ is stored explicitly. (3) Upstream's `_consume_first_app` test helper pins
 with `switch --strategy` and widens the upstream diff.
 **Why it matters:** the one upstream test-helper hunk is a known rebase
 conflict point.
+
+## 2026-11-01 - Reserve follow-ups: save_settings reverted, loud fallbacks
+Corrects (2) of "Reserve default plumbing" above.
+**Chose:** `save_settings` back to upstream's shape (nothing in `src/` calls
+it, and the skip would erase a deliberately set "1"); hand-edited junk in
+`reserveAccounts` now logs a warning before falling back to "1", JSON
+`false` means no reserve. Non-TTY bare `cswap --strategy best` keeps
+upstream's "no command given" (upstream checks that first; the reviewer's
+"specific message" premise was wrong — a parity test pins it).
+**Rejected:** a silent fallback — a typo would quietly hold account 1 back.
+**Why it matters:** one fewer upstream function carries a fork hunk.

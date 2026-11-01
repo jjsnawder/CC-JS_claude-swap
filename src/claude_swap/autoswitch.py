@@ -768,6 +768,85 @@ def _headroom_by_account(
     }
 
 
+# -- consume-first-reserve-jj (fork-only) -------------------------------------
+# Consume-first, except the configured reserve accounts
+# (``autoswitch.reserveAccounts``) are always consumed LAST. Every helper is
+# pure and module-level so the TUI panel imports the same answers, and so the
+# engine carries only call-site edits (this fork rebases onto upstream).
+
+RESERVE_STRATEGY = "consume-first-reserve-jj"
+CONSUME_FIRST_STRATEGIES = ("consume-first", RESERVE_STRATEGY)
+
+
+def is_consume_first(strategy: str | None) -> bool:
+    """Whether ``strategy`` is consume-first: the one place a strategy string
+    is asked. The reserve variant answers yes everywhere (ranking key, warmup
+    order, Next best panel, API-key gates); only the reserve helpers below
+    differ."""
+    return strategy in CONSUME_FIRST_STRATEGIES
+
+
+def reserve_accounts(settings: AutoSwitchSettings | None) -> frozenset[str]:
+    """The reserve set S, or empty unless the strategy is the reserve one.
+    Empty S makes every reserve code path a no-op, so the strategy then
+    behaves exactly like consume-first."""
+    if getattr(settings, "strategy", None) != RESERVE_STRATEGY:
+        return frozenset()
+    from claude_swap.settings import parse_account_numbers
+
+    return frozenset(
+        parse_account_numbers(getattr(settings, "reserve_accounts", None))
+    )
+
+
+def strategy_cycle(
+    choices: Sequence[str], settings: AutoSwitchSettings | None
+) -> tuple[str, ...]:
+    """The strategies the TUI's `s` cycles: the reserve variant only when a
+    reserve list is configured (always, by the default "1", unless it is set
+    to "none": then it is consume-first, and a press landing on it would
+    change nothing)."""
+    from claude_swap.settings import parse_account_numbers
+
+    if parse_account_numbers(getattr(settings, "reserve_accounts", None)):
+        return tuple(choices)
+    return tuple(c for c in choices if c != RESERVE_STRATEGY)
+
+
+def _usable_landing(headroom: float | None, threshold: float) -> bool:
+    """Readable, not at its limit, and below the threshold: the landing a
+    non-reserve account must offer before any reserve is considered."""
+    return headroom is not None and headroom > 0 and (100.0 - headroom) < threshold
+
+
+def _without_reserves(
+    candidates: Sequence[str], reserves: frozenset[str]
+) -> list[str]:
+    return [n for n in candidates if n not in reserves]
+
+
+def _reserve_tier(
+    num: str,
+    reserves: frozenset[str],
+    headroom: dict[str, float | None],
+    threshold: float,
+) -> int:
+    """Stable-sort tier for a ranking that INCLUDES reserves, which happens
+    only when no non-reserve candidate is a usable landing: a reserve that is
+    one (0) beats every non-reserve (1), and every other reserve sorts after
+    them (2). Non-reserves keep the ranking's own order among themselves."""
+    if num not in reserves:
+        return 1
+    return 0 if _usable_landing(headroom.get(num), threshold) else 2
+
+
+def _reserve_departure_note(from_number, reserves: frozenset[str]) -> str:
+    """The SwitchEvent ``note`` for a move off a reserve account."""
+    if from_number is None or str(from_number) not in reserves:
+        return ""
+    return f"left reserve account #{from_number}"
+
+
 class AutoSwitchEngine:
     """Threshold-policy auto-switcher over a :class:`ClaudeAccountSwitcher`.
 
@@ -1233,7 +1312,7 @@ class AutoSwitchEngine:
                 # `trigger = "consume-first"` it then falls through to is
                 # overwritten by the `if manual:` block below, whatever the
                 # strategy; only the early return is being skipped here.
-                if settings.strategy != "consume-first" and not manual:
+                if not is_consume_first(settings.strategy) and not manual:
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
@@ -1372,7 +1451,7 @@ class AutoSwitchEngine:
         )
         if (
             trigger == "consume-first"
-            and not oauth_candidates
+            and not _without_reserves(oauth_candidates, reserve_accounts(settings))
             and active_headroom is not None
         ):
             # Healthy below-threshold account with no OAuth peer to compare
@@ -1400,7 +1479,7 @@ class AutoSwitchEngine:
             self._emit(NoSwitchEvent(reason="no-candidates"))
             return TickOutcome.BLOCKED
 
-        consume_first = settings.strategy == "consume-first"
+        consume_first = is_consume_first(settings.strategy)
 
         def _rank(**kw):
             """Rank with the no-return bar, and WITHOUT it if that empties AND
@@ -1471,9 +1550,9 @@ class AutoSwitchEngine:
                 kw["settings"],
                 kw["current"],
             )
-            ranked = self._rank_candidates(no_return=no_return, **kw)
+            ranked = self._rank_reserve_aware(no_return=no_return, **kw)
             if no_return is not None and not ranked[0] and recovered:
-                unbarred = self._rank_candidates(no_return=None, **kw)
+                unbarred = self._rank_reserve_aware(no_return=None, **kw)
                 if unbarred[0]:
                     return unbarred
             return ranked
@@ -1586,6 +1665,19 @@ class AutoSwitchEngine:
                 # Below the threshold and healthy: staying put is a correct
                 # outcome, never a block. Distinguish *why* nothing qualified
                 # so an opted-in user can see the strategy working (or inert).
+                if current in reserve_accounts(settings):
+                    # Fork (reserve): the sooner-reset gate is waived on a
+                    # reserve, so empty means no non-reserve landing exists.
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="reserve-hold",
+                            detail=(
+                                "on reserve account; no non-reserve account "
+                                "is below the threshold with room"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
                 if active_reset_ts is None:
                     # The strictly-sooner filter skips every candidate when the
                     # active account's weekly reset is unknown — without this
@@ -2256,6 +2348,7 @@ class AutoSwitchEngine:
         active_headroom: float | None,
         settings: AutoSwitchSettings,
         now: float,
+        waive_sooner: bool = False,
     ) -> tuple[list[str], bool, float | None]:
         """Filter and rank OAuth candidates for this tick's trigger.
 
@@ -2452,7 +2545,7 @@ class AutoSwitchEngine:
                     # only move to accounts whose weekly window resets sooner
                     # than the active one (above the threshold we must move, so
                     # any healthy account qualifies and the sort picks soonest).
-                    if trigger == "consume-first" and (
+                    if trigger == "consume-first" and not waive_sooner and (
                         reset_ts is None
                         or active_reset_ts is None
                         or reset_ts >= active_reset_ts
@@ -2523,6 +2616,47 @@ class AutoSwitchEngine:
         qualifying = qualifying or fallback
         qualifying.sort(key=lambda t: t[0])
         return [num for _, num in qualifying], any_known, active_reset_ts
+
+    def _rank_reserve_aware(self, **kw) -> tuple[list[str], bool, float | None]:
+        """``_rank_candidates`` under consume-first-reserve-jj (fork-only).
+
+        With no reserve configured this IS ``_rank_candidates``. Otherwise:
+
+        - The ``consume-first`` nudge never ranks a reserve (from a
+          non-reserve nothing forces the move; from a reserve it is leaving
+          it). On a reserve the strictly-sooner gate is waived so the move
+          happens right away; landing health, the no-return bar, cooldown,
+          the pin and the two-phase fetch all still apply.
+        - Every other trigger ranks WITHOUT reserves while any non-reserve
+          candidate is a usable landing (``_usable_landing``). Only when none
+          is does it rank everyone exactly as today and then stable-sort by
+          ``_reserve_tier``: a healthy reserve beats a non-reserve at/over the
+          threshold, and every other reserve sorts after the non-reserves.
+
+        `m` does not come through here: an explicit pick of a reserve is
+        allowed under the same rules as any other account.
+        """
+        reserves = reserve_accounts(kw["settings"])
+        if not reserves:
+            return self._rank_candidates(**kw)
+        candidates = kw["oauth_candidates"]
+        others = _without_reserves(candidates, reserves)
+        if kw["trigger"] == "consume-first":
+            return self._rank_candidates(
+                **{**kw, "oauth_candidates": others},
+                waive_sooner=kw["current"] in reserves,
+            )
+        if len(others) == len(candidates):
+            return self._rank_candidates(**kw)
+        headroom = kw["headroom"]
+        threshold = kw["settings"].threshold
+        if any(_usable_landing(headroom.get(n), threshold) for n in others):
+            return self._rank_candidates(**{**kw, "oauth_candidates": others})
+        ordered, any_known, active_reset_ts = self._rank_candidates(**kw)
+        ordered = sorted(
+            ordered, key=lambda n: _reserve_tier(n, reserves, headroom, threshold)
+        )
+        return ordered, any_known, active_reset_ts
 
     # -- warmup ----------------------------------------------------------------
 
@@ -2966,11 +3100,11 @@ class AutoSwitchEngine:
             return eligible
         order: dict[str, int] = {}
         try:
-            ranked, _known, _reset = self._rank_candidates(
+            ranked, _known, _reset = self._rank_reserve_aware(
                 # Ordering, not deciding: the strategy's proactive ranking
                 # WITHOUT the anti-flap margins (see the docstring).
                 trigger="manual",
-                consume_first=self.settings.strategy == "consume-first",
+                consume_first=is_consume_first(self.settings.strategy),
                 oauth_candidates=[
                     acct.number for acct in cold if acct.number != current
                 ],
@@ -2991,6 +3125,7 @@ class AutoSwitchEngine:
                 acct.number in exclude,
                 acct.number == current,
                 order.get(acct.number, len(order)),
+                acct.number in reserve_accounts(self.settings),  # fork: reserves last
                 warmup.slot_sort_key(acct.number),
             )
         )
@@ -3193,6 +3328,9 @@ class AutoSwitchEngine:
                     from_ref=_ref(current, current_email) if current else None,
                     to_ref=_ref(number, email),
                     dry_run=True,
+                    note=_reserve_departure_note(
+                        current, reserve_accounts(self.settings)
+                    ),
                 )
             )
             return TickOutcome.SWITCHED
@@ -3255,6 +3393,11 @@ class AutoSwitchEngine:
                 # the unhealthy ticks, so a "holding #N" would be a lie.
                 self._pinned = None
                 note = "API-key account: not held (no quota to measure)"
+        departure = _reserve_departure_note(
+            (result.get("from") or {}).get("number"), reserve_accounts(self.settings)
+        )
+        if departure:
+            note = f"{note} · {departure}" if note else departure
 
         self._emit(
             SwitchEvent(

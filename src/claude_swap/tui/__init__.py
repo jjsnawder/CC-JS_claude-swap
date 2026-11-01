@@ -14,7 +14,11 @@ if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
 
 
-def run(switcher: "ClaudeAccountSwitcher", start: str = "dashboard") -> int:
+def run(
+    switcher: "ClaudeAccountSwitcher",
+    start: str = "dashboard",
+    auto_overrides=None,  # fork: `cswap tui --strategy/--reserve` (session only)
+) -> int:
     """Run the TUI over an existing switcher. Returns the process exit code.
 
     ``start="watch"`` (the ``cswap watch`` command) opens directly on the
@@ -33,6 +37,8 @@ def run(switcher: "ClaudeAccountSwitcher", start: str = "dashboard") -> int:
     except Exception:
         detected = None
     app = CswapApp(switcher, start=start, detected=detected)
+    # Fork: read by AutoScreen.on_mount via ``merged_with_cli``; never saved.
+    app.auto_overrides = auto_overrides
     # Drain any late OSC reply immediately before Textual's driver starts,
     # so it isn't reissued as keystrokes once the app takes over the terminal.
     try:

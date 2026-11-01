@@ -573,6 +573,70 @@ Examples:
         sys.exit(130)
 
 
+def _reserve_accounts_arg(value: str) -> str:
+    """argparse ``type`` for ``cswap auto --reserve``: the strict
+    ``autoswitch.reserveAccounts`` parser, so a typo errors at the prompt."""
+    from claude_swap.exceptions import ConfigError
+    from claude_swap.settings import SETTING_SPECS, parse_setting_value
+
+    try:
+        return parse_setting_value(SETTING_SPECS["autoswitch.reserveAccounts"], value)
+    except ConfigError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+
+
+# Fork (consume-first-reserve-jj): session-only auto-screen overrides on a TUI
+# launch. Peeled off BEFORE the main parser, whose own --strategy belongs to
+# bare `switch` with different choices.
+_TUI_LAUNCH_VERBS = ("tui", "watch", "--tui", "--watch")
+_TUI_OVERRIDE_FLAGS = ("--strategy", "--reserve")
+
+
+def _tui_override_parser() -> argparse.ArgumentParser:
+    from claude_swap.settings import SETTING_SPECS
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} tui", add_help=False, allow_abbrev=False
+    )
+    parser.add_argument(
+        "--strategy", choices=SETTING_SPECS["autoswitch.strategy"].choices
+    )
+    parser.add_argument("--reserve", type=_reserve_accounts_arg)
+    return parser
+
+
+def _pop_tui_overrides(argv: list[str]) -> tuple[list[str], argparse.Namespace | None]:
+    """Split ``--strategy S`` / ``--reserve NUMS|none`` off a TUI launch
+    (``cswap tui|watch ...``, or bare ``cswap`` given ONLY those flags).
+
+    Returns (argv without them, Namespace or None when none were given).
+    Any other argv is returned untouched, so ``cswap switch --strategy
+    best`` keeps reaching the main parser. Nothing is ever persisted: the
+    auto screen overlays these onto settings.json via ``merged_with_cli``.
+    """
+    if argv and argv[0] in _TUI_LAUNCH_VERBS:
+        head, tail = argv[:1], argv[1:]
+    else:
+        # Bare form: every token must be one of the override flags or its
+        # value; anything else is not a TUI launch.
+        i = 0
+        while i < len(argv):
+            token = argv[i]
+            if token in _TUI_OVERRIDE_FLAGS:
+                i += 2
+            elif token.startswith(tuple(f + "=" for f in _TUI_OVERRIDE_FLAGS)):
+                i += 1
+            else:
+                return argv, None
+        if not argv:
+            return argv, None
+        head, tail = [], argv
+    ns, rest = _tui_override_parser().parse_known_args(tail)
+    if ns.strategy is None and ns.reserve is None:
+        return argv, None
+    return head + rest, ns
+
+
 def _auto_command(argv: list[str]) -> None:
     """Handle `cswap auto [--once] [--json] [...]`.
 
@@ -608,6 +672,10 @@ Examples:
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
   cswap auto --dry-run             # log decisions, never actually switch
+  cswap auto --strategy consume-first-reserve-jj --reserve 1,4
+                                   # consume-first, accounts 1 and 4 used last
+  cswap auto --strategy consume-first-reserve-jj --reserve none
+                                   # same strategy, no reserve (= consume-first)
 
 Defaults live in settings.json in the backup root; flags override them.
         """,
@@ -664,12 +732,26 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     parser.add_argument(
         "--strategy",
-        choices=("best", "consume-first"),
+        choices=("best", "consume-first", "consume-first-reserve-jj"),
         default=None,
         help=(
             "Target selection: 'best' (most quota left; default) or "
             "'consume-first' (proactively use the account whose weekly window "
             "resets soonest)"
+            # Fork-only addition, kept as its own literal for rebases.
+            "; 'consume-first-reserve-jj' is consume-first with the --reserve "
+            "accounts used last"
+        ),
+    )
+    parser.add_argument(
+        "--reserve",
+        type=_reserve_accounts_arg,
+        default=None,
+        metavar="NUMS|none",
+        help=(
+            "consume-first-reserve-jj: account number(s) consumed last, "
+            "comma-separated (e.g. 1 or 1,4), or 'none'; overrides "
+            "autoswitch.reserveAccounts (default 1)"
         ),
     )
     parser.add_argument(
@@ -1125,6 +1207,10 @@ def main() -> None:
         _move_command(argv[1:])
         return
 
+    # Fork: `cswap [tui|watch] --strategy S --reserve NUMS|none`.
+    argv, tui_overrides = _pop_tui_overrides(argv)
+    tui_kwargs = {"auto_overrides": tui_overrides} if tui_overrides else {}
+
     # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
     # lazygit/k9s). TTY-gated on both ends so scripts and pipes keep getting
     # the usage error, and `cswap tui` stays the explicit spelling.
@@ -1188,6 +1274,9 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s run 2 -- --resume                 # forward args after '--' to claude
   %(prog)s auto --once                       # single auto-switch tick (cron-friendly)
   %(prog)s config set autoswitch.threshold 80
+  %(prog)s tui --strategy consume-first-reserve-jj --reserve 1,4
+                                          # auto screen overrides, this session only
+  %(prog)s watch --reserve none              # (also bare %(prog)s; never saved)
 
 The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep working.
         """,
@@ -1550,11 +1639,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         elif args.tui:
             from claude_swap.tui import run as tui_run
 
-            sys.exit(tui_run(switcher))
+            sys.exit(tui_run(switcher, **tui_kwargs))
         elif args.watch:
             from claude_swap.tui import run as tui_run
 
-            sys.exit(tui_run(switcher, start="watch"))
+            sys.exit(tui_run(switcher, start="watch", **tui_kwargs))
         elif args.menubar:
             if sys.platform != "darwin":
                 error("The menu bar is only available on macOS.")

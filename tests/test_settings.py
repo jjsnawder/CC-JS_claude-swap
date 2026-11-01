@@ -377,3 +377,99 @@ class TestAtomicWriteThroughSymlink:
         assert (repo.stat().st_mode & 0o777) == 0o755, "foreign dir untouched"
         assert (live.stat().st_mode & 0o777) == 0o700, "our dir hardened"
         assert (tracked.stat().st_mode & 0o777) == 0o600, "file still 0600"
+
+
+class TestReserveAccountsSetting:
+    """Fork-only: autoswitch.reserveAccounts (consume-first-reserve-jj)."""
+
+    def test_reserve_strategy_is_a_valid_choice(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"strategy": "consume-first-reserve-jj"}})
+        )
+        assert load_settings(tmp_path).strategy == "consume-first-reserve-jj"
+
+    def test_default_is_account_1(self):
+        assert AutoSwitchSettings().reserve_accounts == "1"
+        assert SETTING_SPECS["autoswitch.reserveAccounts"].default == "1"
+
+    def test_missing_key_loads_the_default(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"autoswitch": {}}))
+        assert load_settings(tmp_path).reserve_accounts == "1"
+
+    @pytest.mark.parametrize(
+        "raw, expected",
+        [
+            ("1", "1"),
+            ("1,4", "1,4"),
+            (" 4 , 01,4 ", "4,1"),
+            (2, "2"),
+            ([1, "3"], "1,3"),
+            ("x,2", "2"),        # lenient load drops the junk part
+            ("4,²", "4"),     # "²".isdigit() is True; int("²") raises
+            ("1,²", "1"),
+            ("²", "1"),       # junk only -> the default
+            ("0", "1"),
+            (True, "1"),
+            ("none", "none"),    # explicit no-reserve survives the clamp
+            ("NONE", "none"),
+            (" None ", "none"),
+            ("", "none"),
+            (None, "none"),
+            ([], "none"),
+        ],
+    )
+    def test_lenient_load(self, tmp_path: Path, raw, expected):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"reserveAccounts": raw}})
+        )
+        assert load_settings(tmp_path).reserve_accounts == expected
+
+    def test_strict_set_canonicalises(self, tmp_path: Path):
+        assert set_setting(tmp_path, "autoswitch.reserveAccounts", "4, 1") == "4,1"
+        assert load_settings(tmp_path).reserve_accounts == "4,1"
+
+    @pytest.mark.parametrize("raw", ["none", "NONE", " None "])
+    def test_strict_set_accepts_none(self, tmp_path: Path, raw):
+        assert set_setting(tmp_path, "autoswitch.reserveAccounts", raw) == "none"
+        assert load_settings(tmp_path).reserve_accounts == "none"
+
+    def test_unset_returns_to_the_default(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.reserveAccounts", "none")
+        assert unset_setting(tmp_path, "autoswitch.reserveAccounts") is True
+        assert load_settings(tmp_path).reserve_accounts == "1"
+
+    @pytest.mark.parametrize(
+        "bad", ["", "  ", "a", "1,b", "0", "1,,2", "1.5", "²", "1,²", "1,none"]
+    )
+    def test_strict_set_rejects(self, tmp_path: Path, bad):
+        with pytest.raises(ConfigError):
+            set_setting(tmp_path, "autoswitch.reserveAccounts", bad)
+
+    def test_cli_override(self):
+        merged = merged_with_cli(AutoSwitchSettings(), _args(reserve="1,4"))
+        assert merged.reserve_accounts == "1,4"
+        merged = merged_with_cli(AutoSwitchSettings(), _args(reserve="none"))
+        assert merged.reserve_accounts == "none"
+
+    def test_save_round_trip(self, tmp_path: Path):
+        s = AutoSwitchSettings(
+            strategy="consume-first-reserve-jj", reserve_accounts="1"
+        )
+        save_settings(tmp_path, s)
+        assert load_settings(tmp_path) == s
+
+    def test_save_never_freezes_the_default(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"reserveAccounts": "4"}})
+        )
+        save_settings(tmp_path, AutoSwitchSettings())
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert "reserveAccounts" not in raw["autoswitch"]  # absent == default
+        assert load_settings(tmp_path).reserve_accounts == "1"
+
+    @pytest.mark.parametrize("value", ["none", "4,2"])
+    def test_save_writes_a_non_default(self, tmp_path: Path, value):
+        save_settings(tmp_path, AutoSwitchSettings(reserve_accounts=value))
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw["autoswitch"]["reserveAccounts"] == value
+        assert load_settings(tmp_path).reserve_accounts == value

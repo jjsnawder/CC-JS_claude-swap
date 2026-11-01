@@ -36,8 +36,15 @@ from claude_swap.autoswitch import (
     consume_first_key,
     pct_label,
 )
+from claude_swap.autoswitch import (  # fork: consume-first-reserve-jj
+    RESERVE_STRATEGY,
+    is_consume_first,
+    reserve_accounts,
+    strategy_cycle,
+)
 from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
+from claude_swap.settings import merged_with_cli  # fork: TUI launch overrides
 from claude_swap.tui import data
 from claude_swap.tui.modals import AccountPickModal, ConfirmModal, PickRow
 from claude_swap.tui.theme import Palette
@@ -265,12 +272,17 @@ class AutoScreen(Screen):
     def on_mount(self) -> None:
         self.app.set_store_only(True)
         self._settings = load_settings(self.app.switcher.backup_dir)
+        file_settings = self._settings  # fork: launch overrides tag "(session)"
+        self._settings = merged_with_cli(  # fork: `cswap tui --strategy/--reserve`
+            self._settings, getattr(self.app, "auto_overrides", None)
+        )
         # The bar tick everywhere reads app.threshold_pct, loaded once at app
         # startup — sync it to the fresh file value so bars and engine agree,
         # and remember that value: unmount restores it (only the session
         # adjustment reverts, not this correction).
         self._configured_threshold = self._settings.threshold
-        self._configured_strategy = self._settings.strategy
+        self._configured_strategy = file_settings.strategy
+        self._configured_reserve = file_settings.reserve_accounts  # fork
         self.app.threshold_pct = self._settings.threshold
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
@@ -386,6 +398,7 @@ class AutoScreen(Screen):
         # Cycle the configured choices, so a third upstream strategy needs
         # no change here (an unknown value lands on the first choice).
         choices = SETTING_SPECS["autoswitch.strategy"].choices
+        choices = strategy_cycle(choices, self._settings)  # fork: reserve variant
         current = (
             choices.index(self._settings.strategy)
             if self._settings.strategy in choices
@@ -557,6 +570,18 @@ class AutoScreen(Screen):
         )
         text.append(f" · {self._settings.strategy}")
         if self._settings.strategy != self._configured_strategy:
+            text.append(" (session)", style=palette.muted)
+        reserves = reserve_accounts(self._settings)  # fork: consume-first-reserve-jj
+        if reserves:
+            text.append(
+                " · reserve " + ", ".join(f"#{n}" for n in sorted(reserves, key=int))
+            )
+        elif self._settings.strategy == RESERVE_STRATEGY:
+            text.append(" · reserve none")
+        if self._settings.strategy == RESERVE_STRATEGY and (
+            self._settings.reserve_accounts
+            != getattr(self, "_configured_reserve", self._settings.reserve_accounts)
+        ):  # a `--reserve` launch override, this session only
             text.append(" (session)", style=palette.muted)
         self._shown_pin = getattr(self._engine, "pinned", None)
         if self._shown_pin is not None:
@@ -730,8 +755,12 @@ class AutoScreen(Screen):
         models = parse_model_names(self._settings.model) if self._settings else ()
         consume_first = (
             self._settings is not None
-            and self._settings.strategy == "consume-first"
+            and is_consume_first(self._settings.strategy)
         )
+        # Fork (consume-first-reserve-jj): reserves rank after every
+        # non-reserve and are tagged; on a reserve the sooner gate is waived.
+        reserves = reserve_accounts(self._settings)
+        on_reserve = active_number in reserves
         now = time.time()
         key_kwargs: dict = {}
         threshold = self._settings.threshold if self._settings else 100.0
@@ -760,7 +789,9 @@ class AutoScreen(Screen):
             # ...and below the threshold with the active reset unmeasured, the
             # engine's gate can never pass ("reset-unknown"): nothing here is
             # takeable until that number is reported.
-            idle = active_below and active_reset_ts == float("inf")
+            idle = (
+                active_below and active_reset_ts == float("inf") and not on_reserve
+            )
         # (sort key, number) with a TUPLE key, so `best`'s single pct and
         # consume-first's tiered key share one list. Unreadable rows keep
         # their 998/999 buckets and sort after every keyed row.
@@ -812,11 +843,17 @@ class AutoScreen(Screen):
                 unhealthy = pct >= threshold
                 # Tagged, still RANKED: this is the order the engine would
                 # use the moment the account becomes eligible.
-                skip = unhealthy or (active_below and key[1] >= active_reset_ts)
+                skip = unhealthy or (
+                    active_below and not on_reserve and key[1] >= active_reset_ts
+                )
                 ranked.append(((0.0, 1 if unhealthy else 0) + key, acc.number))
             else:
                 entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
                 ranked.append(((pct,), acc.number))
+            if acc.number in reserves:
+                # Never the target of a below-threshold nudge.
+                entry.append("  reserve", style=palette.muted)
+                skip = skip or active_below
             if skip or idle:  # idle: nothing here is takeable
                 entry.append("  skip", style=palette.muted)
             lines[acc.number] = entry
@@ -836,6 +873,14 @@ class AutoScreen(Screen):
         # stable, so a full tie falls through to sequence order exactly as the
         # engine's does. Sorting the pairs compared the account NUMBER as a
         # string on ties, where "10" precedes "2".
+        if reserves:
+            # Engine order (``_reserve_tier``): healthy before unhealthy, and
+            # within each, non-reserves before reserves. So a healthy reserve
+            # outranks an over-threshold non-reserve, as the escape takes it.
+            ranked = [
+                (key[:2] + (number in reserves,) + key[2:], number)
+                for key, number in ranked
+            ]
         for _key, number in sorted(ranked, key=lambda t: t[0]):
             text.append(lines[number])
         return text

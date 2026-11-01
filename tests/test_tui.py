@@ -1567,7 +1567,11 @@ class TestAutoScreen:
 
         (tmp_path / "settings.json").write_text(_json.dumps({
             "schemaVersion": 1,
-            "autoswitch": {"strategy": "consume-first", **autoswitch},
+            # Fork: "none" keeps `s` upstream's two-way best <-> consume-first
+            # toggle (the default reserve "1" adds consume-first-reserve-jj).
+            "autoswitch": {
+                "strategy": "consume-first", "reserveAccounts": "none", **autoswitch
+            },
         }))
         return make_app(FakeSwitcher(accounts, tmp_path))
 
@@ -2853,3 +2857,231 @@ class TestThemeWiring:
             assert app._theme_name == "light"
             assert app.theme == "cswap-light"
 
+
+
+@pytest.mark.asyncio
+class TestAutoScreenReserve:
+    """Fork-only: consume-first-reserve-jj on the auto screen."""
+
+    async def _open(self, pilot):
+        await settle(pilot)
+        await pilot.press("g")
+        await pilot.pause()
+
+    def _app(self, tmp_path, accounts, **autoswitch):
+        (tmp_path / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {
+                "strategy": "consume-first-reserve-jj",
+                "reserveAccounts": "2",
+                **autoswitch,
+            },
+        }))
+        return make_app(FakeSwitcher(accounts, tmp_path))
+
+    def _static(self, app, selector: str) -> str:
+        from textual.widgets import Static
+
+        return app.screen.query_one(selector, Static).render().plain
+
+    def _line(self, plain: str, email: str) -> str:
+        return next(ln for ln in plain.splitlines() if email in ln)
+
+    async def test_panel_ranks_reserve_last_and_tags_it(self, tmp_path, fake_engine):
+        """#2 is the reserve and resets soonest (consume-first's first pick);
+        it renders after every HEALTHY non-reserve but before the
+        over-threshold #4 (the engine's ``_reserve_tier`` order), tagged
+        `reserve`."""
+        app = self._app(
+            tmp_path,
+            [
+                make_account(
+                    1, active=True, entry=make_entry(20.0, 20.0, reset7_in=86400 * 9)
+                ),
+                make_account(2, entry=make_entry(10.0, 10.0, reset7_in=86400)),
+                make_account(3, entry=make_entry(10.0, 10.0, reset7_in=86400 * 4)),
+                make_account(4, entry=make_entry(95.0, 95.0, reset7_in=86400 * 2)),
+            ],
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            plain = self._static(app, "#candidates")
+            assert plain.index("user3@example.com") < plain.index("user2@example.com")
+            assert plain.index("user2@example.com") < plain.index("user4@example.com")
+            assert "reserve" in self._line(plain, "user2@example.com")
+            assert "reserve" not in self._line(plain, "user3@example.com")
+            # below the threshold the nudge never targets a reserve
+            assert self._line(plain, "user2@example.com").rstrip().endswith("skip")
+
+    async def test_escape_order_matches_the_engine(self, tmp_path, fake_engine):
+        """Active at 92% (threshold 90): the engine escapes to the healthy
+        reserve #2 over the over-threshold non-reserve #3, so the panel must
+        list #2 first."""
+        app = self._app(
+            tmp_path,
+            [
+                make_account(
+                    1, active=True, entry=make_entry(92.0, 92.0, reset7_in=86400 * 9)
+                ),
+                make_account(2, entry=make_entry(10.0, 10.0, reset7_in=86400 * 4)),
+                make_account(3, entry=make_entry(95.0, 95.0, reset7_in=86400)),
+            ],
+            threshold=90,
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            plain = self._static(app, "#candidates")
+            assert plain.index("user2@example.com") < plain.index("user3@example.com")
+            assert not self._line(plain, "user2@example.com").rstrip().endswith("skip")
+
+    async def test_on_reserve_later_resets_are_not_skipped(self, tmp_path, fake_engine):
+        """Active #2 is the reserve: the strictly-sooner gate is waived, so a
+        non-reserve resetting LATER is takeable (no `skip`)."""
+        app = self._app(
+            tmp_path,
+            [
+                make_account(1, entry=make_entry(10.0, 10.0, reset7_in=86400 * 9)),
+                make_account(
+                    2, active=True, entry=make_entry(20.0, 20.0, reset7_in=86400)
+                ),
+                make_account(3, entry=make_entry(10.0, 10.0, reset7_in=86400 * 4)),
+            ],
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            plain = self._static(app, "#candidates")
+            assert not self._line(plain, "user1@example.com").rstrip().endswith("skip")
+            assert not self._line(plain, "user3@example.com").rstrip().endswith("skip")
+
+    async def test_summary_shows_strategy_and_reserve(self, tmp_path, fake_engine):
+        app = self._app(
+            tmp_path, [make_account(1, active=True), make_account(2)],
+            reserveAccounts="4,2",
+        )
+        async with app.run_test(size=(140, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            summary = self._static(app, "#auto-summary")
+            assert "consume-first-reserve-jj" in summary
+            assert "reserve #2, #4" in summary
+
+    async def test_s_cycles_three_strategies_with_a_reserve(self, tmp_path, fake_engine):
+        app = self._app(tmp_path, [make_account(1, active=True), make_account(2)])
+        async with app.run_test(size=(140, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            seen = [app.screen._settings.strategy]
+            for _ in range(3):
+                await pilot.press("s")
+                await settle(pilot)
+                seen.append(app.screen._settings.strategy)
+            assert seen == [
+                "consume-first-reserve-jj", "best", "consume-first",
+                "consume-first-reserve-jj",
+            ]
+
+    async def test_s_cycles_three_with_the_default_reserve(self, tmp_path, fake_engine):
+        """No reserveAccounts key: the default "1" keeps the variant in."""
+        (tmp_path / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1, "autoswitch": {"strategy": "consume-first"},
+        }))
+        app = make_app(FakeSwitcher([make_account(1, active=True), make_account(2)], tmp_path))
+        async with app.run_test(size=(140, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            await pilot.press("s")
+            await settle(pilot)
+            assert app.screen._settings.strategy == "consume-first-reserve-jj"
+            summary = self._static(app, "#auto-summary")
+            assert "reserve #1" in summary
+
+    async def test_s_skips_reserve_variant_without_a_list(self, tmp_path, fake_engine):
+        app = self._app(
+            tmp_path, [make_account(1, active=True), make_account(2)],
+            strategy="consume-first", reserveAccounts="none",
+        )
+        async with app.run_test(size=(140, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            await pilot.press("s")
+            await settle(pilot)
+            assert app.screen._settings.strategy == "best"
+            await pilot.press("s")
+            await settle(pilot)
+            assert app.screen._settings.strategy == "consume-first"
+
+
+@pytest.mark.asyncio
+class TestAutoScreenLaunchOverrides:
+    """Fork-only: `cswap tui --strategy S --reserve NUMS|none` reaches the auto
+    screen as ``app.auto_overrides``; settings.json is never written."""
+
+    async def _open(self, pilot):
+        await settle(pilot)
+        await pilot.press("g")
+        await pilot.pause()
+
+    def _app(self, tmp_path, overrides, **autoswitch):
+        import argparse
+
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"schemaVersion": 1, "autoswitch": autoswitch}))
+        app = make_app(
+            FakeSwitcher([make_account(1, active=True), make_account(2)], tmp_path)
+        )
+        app.auto_overrides = argparse.Namespace(**overrides)
+        return app, path
+
+    def _summary(self, app) -> str:
+        from textual.widgets import Static
+
+        return app.screen.query_one("#auto-summary", Static).render().plain
+
+    async def test_strategy_and_reserve_override_the_file(self, tmp_path, fake_engine):
+        app, path = self._app(
+            tmp_path,
+            {"strategy": "consume-first-reserve-jj", "reserve": "4,2"},
+            strategy="best",
+        )
+        before = path.read_bytes()
+        async with app.run_test(size=(160, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            assert app.screen._settings.strategy == "consume-first-reserve-jj"
+            assert app.screen._settings.reserve_accounts == "4,2"
+            summary = self._summary(app)
+            assert "consume-first-reserve-jj (session)" in summary
+            assert "reserve #2, #4 (session)" in summary
+        assert path.read_bytes() == before
+
+    async def test_reserve_none_override(self, tmp_path, fake_engine):
+        app, _ = self._app(
+            tmp_path,
+            {"strategy": None, "reserve": "none"},
+            strategy="consume-first-reserve-jj",
+        )
+        async with app.run_test(size=(160, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            assert app.screen._settings.reserve_accounts == "none"
+            summary = self._summary(app)
+            assert "consume-first-reserve-jj ·" in summary  # not a session strategy
+            assert "reserve none (session)" in summary
+            # the variant drops out of the `s` cycle with no reserve
+            await pilot.press("s")
+            await settle(pilot)
+            await pilot.press("s")
+            await settle(pilot)
+            assert app.screen._settings.strategy == "consume-first"
+
+    async def test_no_overrides_is_the_file(self, tmp_path, fake_engine):
+        app, _ = self._app(tmp_path, {}, strategy="consume-first-reserve-jj")
+        app.auto_overrides = None
+        async with app.run_test(size=(160, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            assert app.screen._settings.reserve_accounts == "1"
+            assert "(session)" not in self._summary(app)

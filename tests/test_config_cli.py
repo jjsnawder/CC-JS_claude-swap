@@ -271,3 +271,36 @@ class TestConfigMisc:
             with pytest.raises(SystemExit):
                 cli.main()
         assert captured["settings"].threshold == 77.0
+
+
+class TestConfigReserveAccounts:
+    """Fork-only: autoswitch.reserveAccounts + the consume-first-reserve-jj choice."""
+
+    def test_set_reserve_strategy_and_accounts(self, temp_home, capsys):
+        assert _run(
+            ["set", "autoswitch.strategy", "consume-first-reserve-jj"], capsys
+        )[0] == 0
+        assert _run(["set", "autoswitch.reserveAccounts", "1, 4,1"], capsys)[0] == 0
+        raw = json.loads(_settings_file(capsys).read_text())
+        assert raw["autoswitch"]["strategy"] == "consume-first-reserve-jj"
+        assert raw["autoswitch"]["reserveAccounts"] == "1,4"
+
+    @pytest.mark.parametrize("bad", ["x", "0", "1,,2", "-1", " ", "²"])
+    def test_bad_reserve_value_exits_1(self, temp_home, capsys, bad):
+        code, _, err = _run(["set", "autoswitch.reserveAccounts", bad], capsys)
+        assert code == 1
+        assert "account numbers" in err
+        assert "Traceback" not in err
+
+    def test_default_is_1_and_none_round_trips(self, temp_home, capsys):
+        code, out, _ = _run(["get", "autoswitch.reserveAccounts"], capsys)
+        assert (code, out.strip()) == (0, "1")
+        assert _run(["set", "autoswitch.reserveAccounts", "None"], capsys)[0] == 0
+        raw = json.loads(_settings_file(capsys).read_text())
+        assert raw["autoswitch"]["reserveAccounts"] == "none"
+        code, out, _ = _run(["get", "autoswitch.reserveAccounts"], capsys)
+        assert (code, out.strip()) == (0, "none")
+        # unset goes back to the default, not to "no reserve"
+        assert _run(["unset", "autoswitch.reserveAccounts"], capsys)[0] == 0
+        code, out, _ = _run(["get", "autoswitch.reserveAccounts"], capsys)
+        assert (code, out.strip()) == (0, "1")

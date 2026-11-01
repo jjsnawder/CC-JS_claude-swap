@@ -1867,3 +1867,149 @@ def test_importing_the_module_allocates_no_temp_dir(tmp_path, tmp_path_factory):
     home = Path(_subprocess_env()["HOME"])
     assert home.is_dir(), f"the isolated HOME is not a real directory: {home}"
     assert home.is_relative_to(tmp_path_factory.getbasetemp()), f"{home} escapes basetemp"
+
+
+class TestAutoReserveFlags:
+    """Fork-only: `cswap auto --strategy consume-first-reserve-jj --reserve`."""
+
+    def _run(self, argv: list[str], temp_home):
+        TestAutoCommand.FakeEngine.instances = []
+        TestAutoCommand.FakeEngine.tick_outcome = None
+        return TestAutoCommand()._run(argv, temp_home)
+
+    def test_strategy_choice_and_reserve_reach_the_engine(self, temp_home):
+        self._run(
+            ["--once", "--strategy", "consume-first-reserve-jj", "--reserve", "4, 01"],
+            temp_home,
+        )
+        settings = TestAutoCommand.FakeEngine.instances[-1].settings
+        assert settings.strategy == "consume-first-reserve-jj"
+        assert settings.reserve_accounts == "4,1"
+
+    def test_bad_reserve_is_a_usage_error(self, temp_home, capsys):
+        assert self._run(["--once", "--reserve", "one"], temp_home) == 2
+        assert "account numbers" in capsys.readouterr().err
+
+    def test_help_lists_the_choice_and_flag(self, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "auto", "--help"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+        out = capsys.readouterr().out
+        assert "consume-first-reserve-jj" in out
+        assert "--reserve" in out
+        assert "--reserve none" in out  # epilog example
+        assert "NUMS|none" in out
+
+    def test_reserve_none_reaches_the_engine(self, temp_home):
+        self._run(
+            ["--once", "--strategy", "consume-first-reserve-jj", "--reserve", "NONE"],
+            temp_home,
+        )
+        settings = TestAutoCommand.FakeEngine.instances[-1].settings
+        assert settings.reserve_accounts == "none"
+
+    def test_default_reserve_is_1(self, temp_home):
+        self._run(["--once", "--strategy", "consume-first-reserve-jj"], temp_home)
+        settings = TestAutoCommand.FakeEngine.instances[-1].settings
+        assert settings.reserve_accounts == "1"
+
+
+class TestTuiLaunchOverrides:
+    """Fork-only: `cswap [tui|watch] --strategy S --reserve NUMS|none`, also
+    bare `cswap` with only those flags; session-only, never written."""
+
+    def _launch(self, monkeypatch, argv, tty=True):
+        import claude_swap.tui as tui
+
+        launched: dict = {}
+
+        def fake_run(switcher, start="dashboard", **kw):
+            launched["start"] = start
+            launched.update(kw)
+            return 0
+
+        monkeypatch.setattr(sys, "argv", ["cswap", *argv])
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: tty)
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: tty)
+        monkeypatch.setattr(tui, "run", fake_run)
+        with pytest.raises(SystemExit) as excinfo:
+            cli.main()
+        return excinfo.value.code, launched
+
+    @pytest.mark.parametrize(
+        "argv, start",
+        [
+            (["tui"], "dashboard"),
+            (["--tui"], "dashboard"),
+            (["watch"], "watch"),
+            ([], "dashboard"),  # bare cswap
+        ],
+    )
+    def test_overrides_reach_the_tui(self, monkeypatch, temp_home, argv, start):
+        code, launched = self._launch(
+            monkeypatch,
+            [*argv, "--strategy", "consume-first-reserve-jj", "--reserve", "4,01"],
+        )
+        assert code == 0
+        assert launched["start"] == start
+        ns = launched["auto_overrides"]
+        assert (ns.strategy, ns.reserve) == ("consume-first-reserve-jj", "4,1")
+
+    def test_reserve_none_and_equals_form(self, monkeypatch, temp_home):
+        code, launched = self._launch(monkeypatch, ["watch", "--reserve=None"])
+        assert code == 0
+        assert launched["auto_overrides"].reserve == "none"
+        assert launched["auto_overrides"].strategy is None
+
+    def test_no_overrides_keeps_the_upstream_call(self, monkeypatch, temp_home):
+        code, launched = self._launch(monkeypatch, ["tui"])
+        assert code == 0
+        assert "auto_overrides" not in launched
+
+    def test_nothing_is_written(self, monkeypatch, temp_home):
+        from claude_swap.paths import get_backup_root
+        from claude_swap.settings import settings_path
+
+        path = settings_path(get_backup_root())
+        before = path.read_bytes() if path.exists() else None
+        self._launch(monkeypatch, ["tui", "--reserve", "none", "--strategy", "best"])
+        after = path.read_bytes() if path.exists() else None
+        assert after == before
+
+    @pytest.mark.parametrize(
+        "argv, needle",
+        [
+            (["tui", "--reserve", "x"], "account numbers"),
+            (["tui", "--strategy", "next-available"], "invalid choice"),
+            (["--reserve", "0"], "account numbers"),
+        ],
+    )
+    def test_bad_values_are_usage_errors(
+        self, monkeypatch, temp_home, capsys, argv, needle
+    ):
+        code, launched = self._launch(monkeypatch, argv)
+        assert code == 2
+        assert not launched
+        assert needle in capsys.readouterr().err
+
+    def test_bare_non_tty_keeps_usage_error(self, monkeypatch, temp_home):
+        code, launched = self._launch(
+            monkeypatch, ["--reserve", "1"], tty=False
+        )
+        assert code == 2 and not launched
+
+    def test_switch_strategy_is_not_taken(self):
+        assert cli._pop_tui_overrides(["switch", "--strategy", "best"]) == (
+            ["switch", "--strategy", "best"], None,
+        )
+        assert cli._pop_tui_overrides(["--strategy", "best", "--list"]) == (
+            ["--strategy", "best", "--list"], None,
+        )
+
+    def test_help_shows_the_tui_examples(self, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "help"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+        out = capsys.readouterr().out
+        assert "tui --strategy consume-first-reserve-jj --reserve" in out
+        assert "--reserve none" in out

@@ -288,6 +288,27 @@ class AutoScreen(Screen):
         self.watch(self.app, "snapshot", self._on_snapshot)
         self.watch(self.app, "theme", self._on_theme_change)
         self._start_engine(dry_run=True)
+        # Fork (engine_control): `cswap engine` channel for this screen's
+        # engine(s); outlives the `s`/`l` rebuilds, so it asks for the
+        # current one each request.
+        from claude_swap import engine_control
+
+        self._control = engine_control.start_server(
+            lambda: self._engine,
+            host="tui",
+            backup_root=self.app.switcher.backup_dir,
+            apply_strategy=lambda name: self.app.call_from_thread(
+                self._apply_engine_strategy, name
+            ),
+        )
+        if self._control is None:  # hub would fall back to a competing switch
+            self.query_one("#event-log", RichLog).write(
+                Text(
+                    "— cswap engine control unavailable: outside picks/strategy "
+                    "cannot reach this engine —",
+                    style=Palette.from_theme(self.app.current_theme).muted,
+                )
+            )
         # A countdown has to move on its own: the engine only speaks on a
         # tick (up to a minute apart) and the panel's whole job is telling
         # you how long until the next hello. Screen-owned, so it stops with
@@ -299,6 +320,10 @@ class AutoScreen(Screen):
         if self._warm_timer is not None:
             self._warm_timer.stop()
             self._warm_timer = None
+        from claude_swap import engine_control  # fork: engine_control
+
+        engine_control.stop_server(getattr(self, "_control", None))
+        self._control = None
         if self._engine is not None:
             self._engine.stop()
         # A session threshold must not outlive the engine it steered: unpin
@@ -415,6 +440,34 @@ class AutoScreen(Screen):
         self.query_one("#event-log", RichLog).write(
             Text(
                 f"— strategy set to {flipped} for this session —",
+                style=Palette.from_theme(self.app.current_theme).muted,
+            )
+        )
+
+    def _apply_engine_strategy(self, name: str) -> None:
+        """Fork (engine_control): `cswap engine strategy NAME`, already
+        persisted by the caller. The same rebuild as `s` (dry-run/live and
+        the held pick carried over), but the new value IS the configured
+        one now, so the summary drops its "(session)" tag."""
+        # Escape may have unmounted the screen while this call was queued:
+        # never rebuild an orphan engine. The raise makes the reply `live: false`.
+        if (
+            self._settings is None
+            or not self.is_attached
+            or getattr(self, "_control", None) is None
+        ):
+            raise RuntimeError("auto screen closed")
+        self._settings = replace(self._settings, strategy=name)
+        self._configured_strategy = name
+        if self._engine is not None:
+            self._restart_engine(dry_run=self._engine.dry_run)
+        self._update_summary()
+        snap = self.app.snapshot
+        if snap is not None:
+            self._on_snapshot(snap)
+        self.query_one("#event-log", RichLog).write(
+            Text(
+                f"— strategy set to {name} (cswap engine; saved to settings) —",
                 style=Palette.from_theme(self.app.current_theme).muted,
             )
         )

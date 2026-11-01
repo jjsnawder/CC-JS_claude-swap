@@ -14,3 +14,5 @@ offers: `docs/plans/2026-11-01-engine-control.md` §Contract.
 - 2026-11-01 12:21 CT · received charter request from the CC-JS_Claude_Remote session ("fix camera monitor")
 - 2026-11-01 12:22 CT · Jeremy approved as written in this session
 - 2026-11-01 12:25 CT · draft contract cswap-engine/0.1 written (plan file), sent to Remote
+- 2026-11-01 12:40 CT · built cswap engine (uncommitted); deep verify: ship after fixes; fixes in progress
+- 2026-11-01 · Remote asked kill-safety of `cswap switch` (hub 15 s timeout + taskkill /T) and `engine pick`; answered: per-file writes atomic (temp + os.replace), multi-step switch not (kill between steps = mixed but recoverable state), suggest 30 s, after a kill check status and re-run once; engine pick kill only abandons the wait

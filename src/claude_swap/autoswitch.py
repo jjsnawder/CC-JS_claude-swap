@@ -900,6 +900,14 @@ class AutoSwitchEngine:
         self._switch_target: str | None = None
         self._tick_target: str | None = None
         self._pinned: str | None = None if pinned is None else str(pinned)
+        # Fork (engine_control): an optional outcome callback that travels
+        # with a ``request_switch`` under ``_switch_lock`` exactly like the
+        # target, plus the events of the tick that consumed it. None for the
+        # TUI's own `m`/`n`, which then behave exactly as without this hook.
+        self._switch_on_result: Callable | None = None
+        self._tick_on_result: Callable | None = None
+        self._tick_events: list[AutoSwitchEvent] | None = None
+        self.last_tick_at: float | None = None  # fork: `cswap engine status`
         # -- warmup (claude_swap/warmup.py) --------------------------------
         # The spawn seam, injected so tests never run a real `claude`.
         self.ping_runner = ping_runner or warmup.SubprocessPingRunner()
@@ -1166,6 +1174,7 @@ class AutoSwitchEngine:
                 ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
             )
             outcome = TickOutcome.ERROR
+        self._finish_switch_request(outcome)  # fork: engine_control
         # Warmup hellos spawn HERE, never inside the decision. A hello runs
         # the full ``setup_session`` preparation, whose consume gate rotates
         # the slot's refresh token; starting one before the decision means a
@@ -1188,7 +1197,11 @@ class AutoSwitchEngine:
             self._switch_now.clear()
             target = self._switch_target if manual else None
             self._switch_target = None
+            on_result = self._switch_on_result if manual else None  # fork
+            self._switch_on_result = None  # fork: engine_control
         self._tick_target = target
+        self._tick_on_result = on_result  # fork: engine_control
+        self._tick_events = [] if on_result is not None else None  # fork
         # Same one-shot contract for `p` ("ping/warm now"): consumed by this
         # tick whatever it decides, so a keypress can never fire a surprise
         # round of hellos several ticks later.
@@ -3500,6 +3513,22 @@ class AutoSwitchEngine:
 
     def _emit(self, event: AutoSwitchEvent) -> None:
         self.on_event(event)
+        tick_events = self._tick_events  # fork: engine_control
+        if tick_events is not None:
+            tick_events.append(event)
+
+    def _finish_switch_request(self, outcome: TickOutcome) -> None:
+        """Fork (engine_control): stamp the tick and hand a consumed
+        request's outcome to its callback. Never raises into the loop."""
+        self.last_tick_at = self.clock()
+        on_result, events = self._tick_on_result, self._tick_events
+        self._tick_on_result = None
+        self._tick_events = None
+        if on_result is not None:
+            try:
+                on_result(outcome, list(events or ()))
+            except Exception as e:  # pragma: no cover - safety net
+                _logger.debug("switch-request callback failed: %r", e)
 
     # -- loop -------------------------------------------------------------------
 
@@ -3514,7 +3543,9 @@ class AutoSwitchEngine:
         """Cut the current inter-tick sleep short and tick now."""
         self._wake.set()
 
-    def request_switch(self, target: str | None = None) -> None:
+    def request_switch(
+        self, target: str | None = None, *, on_result: Callable | None = None
+    ) -> None:
         """One-shot "switch now" request from the TUI, for THIS session only.
 
         Sets a flag the NEXT tick consumes (and clears) before deciding, then
@@ -3531,10 +3562,43 @@ class AutoSwitchEngine:
         all-over states). A disabled slot is a valid target, as with ``cswap
         switch``. After a live switch it is held (``pinned``) until the
         threshold — unless it is an API-key account, which is never held. The
-        latest request wins: a ``target=None`` call clears a pending target."""
+        latest request wins: a ``target=None`` call clears a pending target.
+
+        Fork (engine_control): ``on_result(outcome, events)`` is called on the
+        engine thread at the end of THE tick that consumes this request, with
+        that tick's events; a request replaced before any tick consumed it
+        gets ``on_result(None, [])``."""
         with self._switch_lock:
+            superseded = self._switch_on_result  # fork: engine_control
+            self._switch_on_result = on_result  # fork: engine_control
             self._switch_target = None if target is None else str(target)
             self._switch_now.set()
+        if superseded is not None:  # fork: engine_control
+            try:
+                superseded(None, [])
+            except Exception as e:  # pragma: no cover - safety net
+                _logger.debug("switch-request callback failed: %r", e)
+        self._wake.set()
+
+    def withdraw_switch(self, on_result: Callable) -> bool:
+        """Fork (engine_control): cancel a request no tick has consumed yet,
+        if it is still the one carrying ``on_result``. True = withdrawn (it
+        will never run); False = already consumed or replaced."""
+        with self._switch_lock:
+            if self._switch_on_result is not on_result or not self._switch_now.is_set():
+                return False
+            self._switch_now.clear()
+            self._switch_target = None
+            self._switch_on_result = None
+        return True
+
+    def apply_strategy(self, strategy: str) -> None:
+        """Fork (engine_control): retarget the strategy mid-run, for the
+        `cswap auto` host (the TUI rebuilds instead, like its `s`). Same
+        atomic frozen-settings swap as ``apply_threshold``; nothing else in
+        the engine derives state from the strategy at construction. Wakes
+        the loop so the next decision uses it now."""
+        self.settings = replace(self.settings, strategy=strategy)
         self._wake.set()
 
     @property

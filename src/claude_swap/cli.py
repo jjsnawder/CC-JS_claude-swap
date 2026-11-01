@@ -820,7 +820,22 @@ Defaults live in settings.json in the backup root; flags override them.
                     f"{' (dry-run)' if args.dry_run else ''} — Ctrl-C to stop"
                 )
             )
-        sys.exit(engine.run_loop())
+        # Fork (engine_control): `cswap engine` channel, loop mode only.
+        from claude_swap import engine_control
+
+        control = engine_control.start_server(
+            lambda: engine, host="auto", backup_root=switcher.backup_dir
+        )
+        if control is None:  # else the hub falls back to a competing switch
+            print(
+                dimmed("cswap engine control unavailable: outside picks/strategy "
+                       "cannot reach this engine"),
+                file=sys.stderr if args.json else sys.stdout,
+            )
+        try:
+            sys.exit(engine.run_loop())
+        finally:
+            engine_control.stop_server(control)
     except ClaudeSwitchError as e:
         if args.json:
             print(json.dumps(error_envelope(e)))
@@ -1188,6 +1203,11 @@ def main() -> None:
         return
     if argv and argv[0] == "warm":
         _warm_command(argv[1:])
+        return
+    if argv and argv[0] == "engine":  # fork: engine_control (`cswap engine`)
+        from claude_swap import engine_control
+
+        engine_control.main(argv[1:])
         return
     if argv and argv[0] == "map":
         _map_command(argv[1:])

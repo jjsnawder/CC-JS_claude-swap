@@ -67,6 +67,24 @@ No engine → exit 3 and nothing persisted (the hub's fallback is
 pending is answered `refused` / `reason: "busy"`. Two engines running at once
 (`cswap auto` and a TUI auto screen) → exit 1, `error: "multiple-engines"`.
 
+**Additions found while building (0.1 amendments, shapes and codes unchanged)**
+- Refusal reasons pass through every engine NoSwitch reason (e.g.
+  `no-candidates`, `no-active-account`, `no-viable-target`, `all-exhausted`),
+  plus `superseded` (exit 5): the TUI's own `m`/`n` replaced the pick first.
+- Error codes (exit 1): `engine-stopped` (TUI rebuilt its engine on `s`/`l`,
+  or the host quit, before the pick ran), `busy` (strategy only, since
+  strategy has no exit 5), `bad-request`, `settings-error`, plus
+  `multiple-engines`, `transport`, `engine-error`.
+- Error shape: `{"contract", "op", "result": "error", "error", "message"}`;
+  strategy errors add `persisted` and `live`. Pending: `{"contract", "op",
+  "result": "pending", "message"}`. No-engine on pick/strategy: same shape as
+  on status.
+- `pick_pending` covers picks sent via `cswap engine` only, not a TUI `m`.
+- **Exit 1 after `pick` does not prove nothing changed**: the engine can
+  switch and then fail writing its own state (pre-existing upstream window),
+  answering `engine-error` with no switch event. On any exit 1 or 4 after a
+  pick, read `status` before acting.
+
 ## Transport (this side's choice; invisible to the hub)
 Box-local only. Working choice: `multiprocessing.connection` Listener — a named
 pipe on Windows, a Unix socket elsewhere — with a random authkey. The engine

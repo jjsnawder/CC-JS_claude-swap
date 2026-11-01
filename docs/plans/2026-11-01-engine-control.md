@@ -1,6 +1,6 @@
 # Plan — `cswap engine`: outside control of a running auto-switch engine
 
-Date: 2026-11-01 · Branch: `jeremy` · Status: **draft contract sent; build not started**
+Date: 2026-11-01 · Branch: `jeremy` · Status: **built + verified live** (424e7a2; contract cswap-engine/0.1 + amendments)
 Collaboration: `docs/collaborations/2026-11-01-cswap-remote-control.md` (Claude Remote's hub consumes it).
 Shape: fork-only, separable module (`src/claude_swap/engine_control.py`) + one CLI verb.
 

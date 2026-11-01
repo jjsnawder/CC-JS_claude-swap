@@ -329,3 +329,19 @@ rules for one landing decision drift; refusing disabled slots — `cswap switch`
 already allows them, and the pick is an explicit human choice.
 **Why it matters:** `m` and `n` now differ only in WHO is chosen, never in
 whether a landing is allowed.
+
+## 2026-11-01 - `consume-first-reserve`: reserve accounts consumed last, left right away (Jeremy)
+**Chose:** a third strategy, consume-first plus `autoswitch.reserveAccounts`
+(account numbers in the private settings.json). A reserve is a target only
+when no non-reserve account is a healthy landing, for every trigger; the
+below-threshold nudge never lands on one; while ON a reserve below the
+threshold the nudge waives the sooner-reset gate so the engine moves off it
+as soon as a non-reserve is healthy (cooldown, `m` pin and no-return bar
+still apply). Fork-only, in separable helpers.
+**Rejected:** (a) hardcoding account #1 / an email — public repo; (b) a
+modifier applied to every strategy — Jeremy asked for a strategy, and `s`
+cycles strategies; (c) "stay on the reserve until threshold once landed" —
+spends the quota the strategy exists to save; (d) an upstream-PR shape —
+not worth the extra work for an operator-specific need.
+**Why it matters:** "last" has to hold in escapes too, or a limit hit lands
+on the reserve whenever it has the most headroom — which is usually.

@@ -1,6 +1,6 @@
 # Reconcile: rebase `jeremy` onto upstream v0.29.0
 
-**Status:** in progress (2026-11-02)
+**Status:** DONE — cut over 2026-11-02; live `cswap` is 0.29.0 + fork.
 **Kickoff:** Jeremy saw the 0.29.0 update notice; approved a rebase (never `cswap upgrade`,
 which would replace the editable install with the PyPI wheel). Constraint: minimal
 auto-switch downtime.
@@ -53,3 +53,4 @@ pre-rebase tip is tagged `pre-v029-reconcile` → `git checkout -B jeremy pre-v0
 ## Log
 - 2026-11-02: plan written; rebase started, stopped on the first code commit (autoswitch ranking rewritten upstream). Switched to a final-state port (decisions.md 2026-11-02): 40 frame commits replayed (2 of them the frame half of mixed commits) onto v0.29.0; code 3-way merged per file (baseline ref `refs/reconcile/automerge`; conflicts: autoswitch 18, autoview 4, cli 3, test_config_cli 3, test_autoswitch 3, settings 2, others 1, switcher 0); three tool-runners resolving by file ownership.
 - 2026-11-02: agents A/B/C resolved all conflicts; full suite 3286 passed / 121 skipped / 0 failed. Scratch trial (fake accounts, keyring/network/real-store blocked by a guard): list/status/switch round-trip byte-exact, no stray temps, config/auto/warm/engine/threshold/priority all behave; slots now get a `rules/` copy. `review`: no lost fork or upstream behaviour; W1 panel/engine consume-first key mismatch, W2 `n` under priority undone after cooldown (ruling in decisions.md), W3 warmup share_history (POSIX only), W4 flipped test lost its discriminating power, nit on test_config_cli key list — all sent for fixing. `deep` (adversarial): credential writes, slot layout (restic + cross-sessions), data migration/rollback and launch path all HOLD. Post-cutover watch: a switch refused for a "live session-mode Claude (PID N)" in a slot with nothing running = stale session record (Windows PID reuse). Optional env-repo follow-up: restic `--exclude '.credentials.json*'` (pre-existing gap for hard-kill temps).
+- 2026-11-02: review fixes landed (suite 3291/0 failed); Jeremy asked to suppress priority-consume-first → fork-only `SUPPRESSED_STRATEGIES` (suite 3298/0). Cutover: Jeremy quit the TUI, no cswap process left; `jeremy` reset to the port tip, `pip install -e .`, `cswap --version` = 0.29.0, `cswap status` read all 4 accounts, strategy still consume-first-reserve-jj. `jeremy` force-with-lease pushed, `main` ff'd to upstream/main, worktree/branch/automerge ref removed. Open: step 7 (reconcile workflow) awaits Jeremy's OK.

@@ -11,6 +11,7 @@ from claude_swap.autoswitch import (
     TickOutcome,
     _headroom_by_account,
 )
+from claude_swap.exceptions import ConfigError
 from claude_swap.models import AccountPolicy, normalize_account_priority
 from claude_swap.settings import load_settings, set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -390,12 +391,14 @@ def test_priority_validation_and_corrupt_read_fallback(invalid):
     assert policy == AccountPolicy(threshold=85, priority=0)
 
 
-def test_priority_strategy_uses_existing_configurable_cutoffs(tmp_path):
-    set_setting(tmp_path, "autoswitch.strategy", "priority-consume-first")
+def test_priority_strategy_is_refused_by_config_set_in_this_fork(tmp_path):
+    # Fork: priority-consume-first is suppressed (settings.SUPPRESSED_STRATEGIES).
+    with pytest.raises(ConfigError):
+        set_setting(tmp_path, "autoswitch.strategy", "priority-consume-first")
     set_setting(tmp_path, "autoswitch.threshold", "85")
     set_setting(tmp_path, "autoswitch.weeklyThreshold", "99.9")
     settings = load_settings(tmp_path)
-    assert settings.strategy == "priority-consume-first"
+    assert settings.strategy == "best"
     assert settings.threshold == 85
     assert settings.weekly_threshold == 99.9
 

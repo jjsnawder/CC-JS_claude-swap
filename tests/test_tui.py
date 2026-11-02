@@ -1661,8 +1661,8 @@ class TestAutoScreen:
 
     async def _toggle_to(self, pilot, app, target: str) -> int:
         """Press `s` until the session strategy is ``target``; the presses.
-        v0.29 added `priority-consume-first`, so the cycle is no longer a
-        two-way flip; the tests pin the destination, not the hop count."""
+        v0.29 added `priority-consume-first` (suppressed in this fork), so the
+        tests pin the destination, not the hop count."""
         for presses in range(1, 6):
             await pilot.press("s")
             await settle(pilot)
@@ -3203,13 +3203,14 @@ class TestAutoScreenReserve:
             await self._open(pilot)
             await settle(pilot)
             seen = [app.screen._settings.strategy]
-            for _ in range(4):
+            for _ in range(3):
                 await pilot.press("s")
                 await settle(pilot)
                 seen.append(app.screen._settings.strategy)
+            # Fork: priority-consume-first is suppressed, never in the cycle.
             assert seen == [
                 "consume-first-reserve-jj", "best", "consume-first",
-                "priority-consume-first", "consume-first-reserve-jj",
+                "consume-first-reserve-jj",
             ]
 
     async def test_s_cycles_three_with_the_default_reserve(self, tmp_path, fake_engine):
@@ -3221,9 +3222,7 @@ class TestAutoScreenReserve:
         async with app.run_test(size=(140, 40)) as pilot:
             await self._open(pilot)
             await settle(pilot)
-            await pilot.press("s")  # -> priority-consume-first (v0.29)
-            await settle(pilot)
-            await pilot.press("s")
+            await pilot.press("s")  # fork: priority-consume-first is suppressed
             await settle(pilot)
             assert app.screen._settings.strategy == "consume-first-reserve-jj"
             summary = self._static(app, "#auto-summary")
@@ -3242,7 +3241,7 @@ class TestAutoScreenReserve:
                 await pilot.press("s")
                 await settle(pilot)
                 seen.append(app.screen._settings.strategy)
-            assert seen == ["priority-consume-first", "best", "consume-first"]
+            assert seen == ["best", "consume-first", "best"]
 
 
 @pytest.mark.asyncio

@@ -27,7 +27,7 @@ from claude_swap.printer import (
     warning,
 )
 from claude_swap.settings import (
-    AUTOSWITCH_STRATEGIES,
+    SELECTABLE_STRATEGIES,
     load_run_settings,
     load_ui_settings,
     load_update_settings,
@@ -723,7 +723,8 @@ def _priority_command(argv: list[str]) -> None:
         description=(
             "Set or list account priority tiers for the optional "
             "priority-consume-first strategy. Higher numbers are used first; "
-            "accounts in the same tier are ordered by soonest weekly reset."
+            "accounts in the same tier are ordered by soonest weekly reset. "
+            "(Tiers are unused: priority-consume-first is disabled in this fork.)"
         ),
     )
     parser.add_argument("account", nargs="?", metavar="NUM|EMAIL|ALIAS")
@@ -747,7 +748,7 @@ def _priority_command(argv: list[str]) -> None:
             print(bolded("Account priorities (higher first; default 0):"))
             for num, policy in switcher.account_policies().items():
                 print(f"  Account-{num}  {switcher.account_email(num)}  {policy.priority}")
-            print(dimmed("Used only by: cswap auto --strategy priority-consume-first"))
+            print(dimmed("Unused: priority-consume-first is disabled in this fork"))
             return
         switcher.set_account_priority(args.account, None if args.unset else args.priority)
     except (ValueError, ClaudeSwitchError) as e:
@@ -929,13 +930,12 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     parser.add_argument(
         "--strategy",
-        choices=AUTOSWITCH_STRATEGIES,
+        choices=SELECTABLE_STRATEGIES,
         default=None,
         help=(
             "Target selection: 'best' (most quota left; default) or "
             "'consume-first' (proactively use the account whose weekly window "
-            "resets soonest), or 'priority-consume-first' (highest account "
-            "priority, then soonest weekly reset; only targets below all switch lines)"
+            "resets soonest)"
             # Fork-only addition, kept as its own literal for rebases.
             "; 'consume-first-reserve-jj' is consume-first with the --reserve "
             "accounts used last"

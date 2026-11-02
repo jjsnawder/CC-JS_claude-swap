@@ -2065,7 +2065,7 @@ class ClaudeAccountSwitcher:
             data["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, data)
         print(f"Account-{account_num} ({email}) priority: {normalized} "
-              "(used by priority-consume-first).")
+              "(unused: priority-consume-first is disabled in this fork).")
 
     def set_account_disabled(self, identifier: str, disabled: bool) -> None:
         """Hold an account out of rotation (``disabled=True``) or return it.

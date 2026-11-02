@@ -29,6 +29,9 @@ SETTINGS_FILENAME = "settings.json"
 AUTOSWITCH_STRATEGIES = (
     "best", "consume-first", "priority-consume-first", "consume-first-reserve-jj",
 )
+# Fork-only: engine code stays, but no user surface offers these; empty the set to re-enable.
+SUPPRESSED_STRATEGIES = frozenset({"priority-consume-first"})
+SELECTABLE_STRATEGIES = tuple(s for s in AUTOSWITCH_STRATEGIES if s not in SUPPRESSED_STRATEGIES)
 
 _logger = logging.getLogger("claude-swap")
 
@@ -178,7 +181,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "strategy", "strategy", "choice",
-            choices=AUTOSWITCH_STRATEGIES,
+            choices=SELECTABLE_STRATEGIES,
             help="How auto-switch picks the target account",
         ),
         SettingSpec(

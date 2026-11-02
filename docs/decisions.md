@@ -474,3 +474,16 @@ keypress buys a five-minute detour; pinning `n`'s landing under priority
 (new fork behaviour for a strategy Jeremy doesn't run, more rebase surface).
 **Why it matters:** smallest delta from upstream, and `n` can never start a
 switch the engine itself will undo.
+
+## 2026-11-02 - priority-consume-first suppressed in the fork
+**Chose:** a fork-only `SUPPRESSED_STRATEGIES` set in `settings.py`; every
+user-facing selector (config set, `auto --strategy`, `engine strategy`, the TUI
+`s` cycle) offers `SELECTABLE_STRATEGIES` instead. Upstream's engine code and
+engine-level tests for the strategy stay untouched; emptying the set re-enables
+it. Jeremy's ask at v0.29.0 cutover.
+**Rejected:** deleting the strategy from `AUTOSWITCH_STRATEGIES` or the engine
+(large diff against upstream, rebase conflicts every release); hiding it only
+from the `s` cycle (still reachable by config/CLI/hub).
+**Why it matters:** the strategy's hold-instead-of-land rule and its lack of the
+fork's consume-first refinements make it a trap if picked by accident; the
+2026-11-02 `n`-under-priority ruling now only matters if it is re-enabled.

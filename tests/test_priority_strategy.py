@@ -399,3 +399,17 @@ def test_priority_strategy_uses_existing_configurable_cutoffs(tmp_path):
     assert settings.threshold == 85
     assert settings.weekly_threshold == 99.9
 
+
+def test_manual_switch_keeps_the_outrank_filter_from_the_top(temp_home):
+    """Fork ruling: `n` under priority still has to OUTRANK the active
+    account. From the top tier, below its line, nothing does, so `n`
+    reports that and points at `m` (the held manual pick) instead."""
+    h = fleet(temp_home)
+    values = usage(h)
+    h.engine.request_switch()
+    assert h.tick_with_usage(values) is TickOutcome.NO_ACTION
+    assert h.active_number() == 1
+    assert not any(isinstance(e, SwitchEvent) for e in h.events)
+    refusal = [e for e in h.events if isinstance(e, NoSwitchEvent)][-1]
+    assert refusal.reason == "already-consuming-priority"
+    assert "use m to pick" in refusal.detail

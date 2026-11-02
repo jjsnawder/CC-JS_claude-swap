@@ -49,7 +49,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import oauth, poll_policy
+from claude_swap import oauth, poll_policy, warmup
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.lines import BindingWindow, binding_window, window_line
@@ -92,6 +92,13 @@ _SYSTEMIC_MESSAGES = {
 # Insertion order IS the precedence order, so the remedy and its rank cannot
 # drift apart.
 _SYSTEMIC_STATUSES = tuple(_SYSTEMIC_MESSAGES)
+
+# A manual pick (`m`) the freshen step had to pass over: `target-busy` names
+# the cause instead of the bare `no-viable-target` a ranked list ends on.
+_TARGET_BUSY_DETAIL = {
+    "skip-live-session": "live cswap run session on this account",
+    "warmup-in-flight": "warmup hello in flight — press m again in a few seconds",
+}
 
 # Freshen targets whose access token expires within this window: twice Claude
 # Code's own 5-minute refresh buffer, so its post-lock "abort refresh if not
@@ -335,19 +342,24 @@ class PollEvent(AutoSwitchEvent):
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
     trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first" | "priority"
+    #             | "manual" (one-shot request from the TUI's "switch now")
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
     dry_run: bool = False
+    note: str = ""  # muted aside, e.g. why a manual pick is not held
 
     def _fields(self) -> dict:
-        return {
+        fields = {
             "trigger": self.trigger,
             "from": self.from_ref,
             "to": self.to_ref,
             "warnings": self.warnings,
             "dryRun": self.dry_run,
         }
+        if self.note:
+            fields["note"] = self.note
+        return fields
 
     def human(self) -> str:
         src = (
@@ -359,7 +371,8 @@ class SwitchEvent(AutoSwitchEvent):
             else "?"
         )
         prefix = "[dry-run] would switch" if self.dry_run else "Switched"
-        return f"{prefix} {src} -> {dst} ({self.trigger})"
+        tail = f" · {self.note}" if self.note else ""
+        return f"{prefix} {src} -> {dst} ({self.trigger}){tail}"
 
 
 @dataclass(frozen=True)
@@ -463,6 +476,44 @@ class ConfigWarningEvent(AutoSwitchEvent):
         return f"warning: {self.message}"
 
 
+@dataclass(frozen=True)
+class WarmupEvent(AutoSwitchEvent):
+    """One warmup hello: performed, refused, or previewed.
+
+    ``detail`` is deliberately narrow — a token/cost summary on success, an
+    exit code plus a truncated stderr tail on failure. Nothing from the
+    child's environment or its config dir ever reaches an event, because
+    these lines are logged, scrolled, and pasted into issues.
+    """
+
+    kind: ClassVar[str] = "warmup"
+    action: str  # "pinged" | "failed" | "would-ping" | "skipped"
+    number: str
+    email: str = ""
+    model: str = warmup.DEFAULT_MODEL
+    detail: str = ""
+
+    def _fields(self) -> dict:
+        return {
+            "action": self.action,
+            "number": self.number,
+            "email": self.email,
+            "model": self.model,
+            "detail": self.detail,
+        }
+
+    def human(self) -> str:
+        who = f"Account-{self.number}" + (f" ({self.email})" if self.email else "")
+        tail = f" ({self.detail})" if self.detail else ""
+        if self.action == "would-ping":
+            return f"[dry-run] would warm {who} with {self.model}"
+        if self.action == "skipped":
+            return f"{who} warmup skipped{tail}"
+        if self.action == "failed":
+            return f"{who} warmup failed{tail or f' ({self.model})'}"
+        return f"{who} warmed{tail or f' ({self.model})'}"
+
+
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
@@ -511,14 +562,18 @@ def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
     """Epoch of an account's 7-day (weekly) window reset, or None if unknown
     or already past.
 
-    The consume-first strategy ranks by this — the weekly window is the
-    perishable quota (the 5-hour one recycles too fast to be worth planning
-    around). A stale snapshot can carry a ``resets_at`` that has since
-    elapsed; treated as a real instant it would sort the *just-rolled-over*
-    account (the least perishable quota of all) as "soonest", so past ==
-    unknown. Plain ``ts <= now``: RESET_SLACK_S is poll-scheduling lag
-    tolerance, not ranking input — padding here would turn a genuinely
-    imminent reset into a false reset-unknown hold.
+    The consume-first strategy ranks by this first within the 5-hour-heat
+    tier (see :func:`consume_first_key`) — the weekly window is the
+    perishable quota that is actually lost forever at reset, so among
+    qualifying candidates the one whose week dies soonest is drained first
+    (``_five_hour_reset_ts`` below breaks a tie on this axis, since two
+    accounts can share a weekly rollover while their 5-hour windows do not).
+    A stale snapshot can carry a ``resets_at`` that has since elapsed; treated
+    as a real instant it would sort the *just-rolled-over* account (the least
+    perishable quota of all) as "soonest", so past == unknown. Plain
+    ``ts <= now``: RESET_SLACK_S is poll-scheduling lag tolerance, not ranking
+    input — padding here would turn a genuinely imminent reset into a false
+    reset-unknown hold.
     """
     if isinstance(usage, dict):
         window = usage.get("seven_day")
@@ -527,6 +582,89 @@ def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
             if ts is not None and ts > now:
                 return ts
     return None
+
+
+def _five_hour_reset_ts(usage: dict | str | None, now: float) -> float | None:
+    """Epoch of an account's 5-hour window reset, or None if unknown or
+    already past. Same past-is-unknown reasoning as ``_seven_day_reset_ts``.
+
+    Consume-first's reset tiebreak axis: it recycles too fast to plan a move
+    around on its own, but when two candidates tie on the weekly reset (the
+    common case for accounts added around the same time) it still separates
+    them meaningfully, rather than falling straight through to headroom.
+    """
+    if isinstance(usage, dict):
+        window = usage.get("five_hour")
+        if isinstance(window, dict):
+            ts = _parse_reset_ts(window.get("resets_at"))
+            if ts is not None and ts > now:
+                return ts
+    return None
+
+
+def _five_hour_pct(usage: dict | str | None) -> float | None:
+    """The 5-hour window's utilization pct, or None when unknown.
+
+    Reads through the one canonical window source (``_window_pcts`` ->
+    ``oauth.relevant_windows``), so the "hot" test in
+    :func:`consume_first_key` can never disagree with the pcts the poll log
+    and ``oauth.account_headroom`` report. Unfiltered by ``models`` on
+    purpose: the 5-hour window always gates the account.
+    """
+    if not isinstance(usage, dict):
+        return None
+    return _window_pcts(usage).get("5h")
+
+
+def consume_first_key(
+    usage: dict | str | None,
+    headroom: float | None,
+    *,
+    threshold: float,
+    hysteresis_pct: float,
+    now: float,
+) -> tuple[int, float, float, float]:
+    """Consume-first's PROACTIVE ranking key (ascending; smaller wins).
+
+    ``(hot, seven_day_reset_ts, five_hour_reset_ts, headroom)``:
+
+    1. **Tier** — 0 cool, 1 "hot". A candidate whose 5-hour utilization is
+       already within the hysteresis margin of the threshold
+       (``pct >= threshold - hysteresis_pct``, boundary inclusive) ranks
+       behind EVERY cool candidate: consume-first is about spending
+       perishable *weekly* quota, and landing on an account whose 5-hour
+       window is about to bind buys minutes of work before the next
+       trigger. It is still a candidate, just a last-resort one — the
+       margin, not a hard exclusion, is what keeps a fleet of hot accounts
+       usable. Unknown 5-hour pct == cool (never punish an unreadable row).
+    2. Soonest weekly reset, unknown/past last (``_seven_day_reset_ts``).
+    3. Soonest 5-hour reset breaks a weekly tie (``_five_hour_reset_ts``).
+    4. Least headroom — the MORE-used account wins a full tie, the opposite
+       of ``best``'s rule: two quotas perishing at the same moment are
+       equally worth spending, so finish one off instead of half-draining
+       both. Unknown headroom sorts last within its tier.
+
+    Module-level and pure so the TUI's "Next best" panel
+    (``tui/autoview.py``) can import it and rank identically — a display
+    that computes its own order eventually disagrees with the decision. Escapes
+    ("at-limit"/"failover") do NOT use this key: they rank by headroom, so
+    they land on an account that can work (#305). Callers must scope it to
+    the "proactive"/"consume-first" triggers.
+    """
+    five_hour_pct = _five_hour_pct(usage)
+    # ``hysteresis_pct=0`` makes the tier INERT, not strict: the bar collapses
+    # onto the threshold itself, and a candidate whose 5-hour pct is already
+    # >= threshold has been dropped by the landing gate before it reaches this
+    # key — so with no margin configured nothing here can be hot.
+    hot = five_hour_pct is not None and five_hour_pct >= threshold - hysteresis_pct
+    seven_day_reset_ts = _seven_day_reset_ts(usage, now)
+    five_hour_reset_ts = _five_hour_reset_ts(usage, now)
+    return (
+        1 if hot else 0,
+        seven_day_reset_ts if seven_day_reset_ts is not None else float("inf"),
+        five_hour_reset_ts if five_hour_reset_ts is not None else float("inf"),
+        headroom if headroom is not None else float("inf"),
+    )
 
 
 def _binding_recovery_ts(
@@ -653,6 +791,96 @@ def _headroom_by_account(
     }
 
 
+# -- consume-first-reserve-jj (fork-only) -------------------------------------
+# Consume-first, except the configured reserve accounts
+# (``autoswitch.reserveAccounts``) are always consumed LAST. Every helper is
+# pure and module-level so the TUI panel imports the same answers, and so the
+# engine carries only call-site edits (this fork rebases onto upstream).
+
+RESERVE_STRATEGY = "consume-first-reserve-jj"
+CONSUME_FIRST_STRATEGIES = ("consume-first", RESERVE_STRATEGY)
+
+
+def is_consume_first(strategy: str | None) -> bool:
+    """Whether ``strategy`` is consume-first: the one place a strategy string
+    is asked. The reserve variant answers yes everywhere (ranking key, warmup
+    order, Next best panel, API-key gates); only the reserve helpers below
+    differ."""
+    return strategy in CONSUME_FIRST_STRATEGIES
+
+
+def reserve_accounts(settings: AutoSwitchSettings | None) -> frozenset[str]:
+    """The reserve set S, or empty unless the strategy is the reserve one.
+    Empty S makes every reserve code path a no-op, so the strategy then
+    behaves exactly like consume-first."""
+    if getattr(settings, "strategy", None) != RESERVE_STRATEGY:
+        return frozenset()
+    from claude_swap.settings import parse_account_numbers
+
+    return frozenset(
+        parse_account_numbers(getattr(settings, "reserve_accounts", None))
+    )
+
+
+def strategy_cycle(
+    choices: Sequence[str], settings: AutoSwitchSettings | None
+) -> tuple[str, ...]:
+    """The strategies the TUI's `s` cycles: the reserve variant only when a
+    reserve list is configured (always, by the default "1", unless it is set
+    to "none": then it is consume-first, and a press landing on it would
+    change nothing)."""
+    from claude_swap.settings import parse_account_numbers
+
+    if parse_account_numbers(getattr(settings, "reserve_accounts", None)):
+        return tuple(choices)
+    return tuple(c for c in choices if c != RESERVE_STRATEGY)
+
+
+def _usable_landing(
+    headroom: float | None, threshold: float, over: bool | None = None
+) -> bool:
+    """Readable, not at its limit, and below the threshold: the landing a
+    non-reserve account must offer before any reserve is considered.
+    ``over`` is the engine's per-window verdict against the account's own
+    lines (``BindingWindow.over``); when given it replaces the single-line
+    test, so the reserve gate reads the same lines as the landing gate."""
+    if headroom is None or headroom <= 0:
+        return False
+    if over is not None:
+        return not over
+    return (100.0 - headroom) < threshold
+
+
+def _without_reserves(
+    candidates: Sequence[str], reserves: frozenset[str]
+) -> list[str]:
+    return [n for n in candidates if n not in reserves]
+
+
+def _reserve_tier(
+    num: str,
+    reserves: frozenset[str],
+    headroom: dict[str, float | None],
+    threshold: float,
+    over: Mapping[str, bool | None] | None = None,
+) -> int:
+    """Stable-sort tier for a ranking that INCLUDES reserves, which happens
+    only when no non-reserve candidate is a usable landing: a reserve that is
+    one (0) beats every non-reserve (1), and every other reserve sorts after
+    them (2). Non-reserves keep the ranking's own order among themselves."""
+    if num not in reserves:
+        return 1
+    verdict = over.get(num) if over is not None else None
+    return 0 if _usable_landing(headroom.get(num), threshold, verdict) else 2
+
+
+def _reserve_departure_note(from_number, reserves: frozenset[str]) -> str:
+    """The SwitchEvent ``note`` for a move off a reserve account."""
+    if from_number is None or str(from_number) not in reserves:
+        return ""
+    return f"left reserve account #{from_number}"
+
+
 class AutoSwitchEngine:
     """Threshold-policy auto-switcher over a :class:`ClaudeAccountSwitcher`.
 
@@ -670,6 +898,8 @@ class AutoSwitchEngine:
         dry_run: bool = False,
         state_path: Path | None = None,
         clock: Callable[[], float] = time.time,
+        ping_runner: "warmup.PingRunner | None" = None,
+        pinned: str | None = None,
     ):
         self.switcher = switcher
         self.settings = settings
@@ -698,6 +928,57 @@ class AutoSwitchEngine:
         # Cuts the current inter-tick sleep short (a session threshold change
         # from the TUI should show a fresh decision now, not next interval).
         self._wake = threading.Event()
+        # One-shot "switch now" request from the TUI (see ``request_switch``).
+        # Consumed by the next tick, which then decides with trigger "manual".
+        self._switch_now = threading.Event()
+        # Manual pick (`m`): the account a ``request_switch(target=...)``
+        # names. Handed over with ``_switch_now`` under ``_switch_lock`` so
+        # the tick always reads the flag and its target as one pair.
+        # ``_tick_target`` is what the current tick consumed (for
+        # ``_perform``); ``_pinned`` is the session-only "hold this manual
+        # pick until the threshold" marker (see ``pinned``). Never persisted.
+        self._switch_lock = threading.Lock()
+        self._switch_target: str | None = None
+        self._tick_target: str | None = None
+        self._pinned: str | None = None if pinned is None else str(pinned)
+        # Fork (engine_control): an optional outcome callback that travels
+        # with a ``request_switch`` under ``_switch_lock`` exactly like the
+        # target, plus the events of the tick that consumed it. None for the
+        # TUI's own `m`/`n`, which then behave exactly as without this hook.
+        self._switch_on_result: Callable | None = None
+        self._tick_on_result: Callable | None = None
+        self._tick_events: list[AutoSwitchEvent] | None = None
+        self.last_tick_at: float | None = None  # fork: `cswap engine status`
+        # -- warmup (claude_swap/warmup.py) --------------------------------
+        # The spawn seam, injected so tests never run a real `claude`.
+        self.ping_runner = ping_runner or warmup.SubprocessPingRunner()
+        # One-shot "ping/warm now" request from the TUI (``request_warm``).
+        self._warm_now = threading.Event()
+        # Numbers with a hello in flight, and the results those threads hand
+        # back. Both under ``_warm_lock``: the threads are daemons that can
+        # outlive the tick that started them.
+        self._warm_lock = threading.Lock()
+        self._warm_inflight: set[str] = set()
+        self._warm_results: list[tuple[str, str, str, warmup.PingResult]] = []
+        # Earliest instant this tick wants to be awake for (a staggered
+        # warmup deadline, or a 5h stamp about to lapse). Per-tick, like
+        # ``_sleep_until_ts``; ``_next_delay`` clamps the sleep to it.
+        self._warm_deadline_ts: float | None = None
+        # Planner inputs handed from ``_tick_inner`` to the post-decision
+        # spawn phase (see ``_spawn_planned_warmups``): (now, candidates,
+        # stagger). None = nothing to spawn this tick.
+        self._warm_plan: tuple | None = None
+        # Display-only mirror of the last planning pass, keyed by account
+        # number (see ``warmup.build_schedule``). Read from the TUI thread
+        # via ``warmup_schedule()``, so it lives under ``_warm_lock`` and is
+        # only ever REPLACED, never mutated in place.
+        self._warm_schedule: dict[str, warmup.WarmupSlot] = {}
+        # Set per tick by ``_run_warmup``; see ``_spawn_planned_warmups``.
+        self._warm_ran = False
+        self._warm_off = False
+        # ``_refuse_session_shell`` is a standing condition, not an event —
+        # warn once per engine, not once per tick.
+        self._warm_shell_warned = False
         self._unhealthy_ticks = 0
         self._health_account: str | None = None
         # Both set per tick: a known-reset sleep target, and whether a BLOCKED
@@ -804,12 +1085,28 @@ class AutoSwitchEngine:
         Returns ``"ok"``, ``"invalid_grant"`` (dead lineage — quarantine),
         ``"identity-conflict"`` (alive but authenticates as a different
         account — quarantine, do not activate), ``"transient"`` (network
-        trouble — try again next tick) or ``"skip-live-session"``. Only ever
-        touches the slot's *backup* store; the active credential belongs to
-        Claude Code.
+        trouble — try again next tick), ``"skip-live-session"`` or
+        ``"warmup-in-flight"``. Only ever touches the slot's *backup* store;
+        the active credential belongs to Claude Code.
         """
         if self.switcher.account_kind_for(number) == "api_key":
             return "ok"  # API keys don't expire/refresh
+        with self._warm_lock:
+            warming = number in self._warm_inflight
+        if warming:
+            # A warmup hello for this slot is mid-``setup_session``, whose
+            # consume gate POSTs a refresh OUTSIDE the backup lock and then
+            # persists the successor by fingerprint CAS. Activating the slot
+            # now reads generation N under ``lock_file`` and installs it as
+            # the live login, and the gate's CAS lands generation N+1 a
+            # moment later — leaving the DEFAULT LOGIN holding a spent
+            # refresh token, which fails ``invalid_grant`` at its next
+            # expiry with no warning anywhere.
+            #
+            # The window is one tick wide and the remedy is free: a warmup
+            # takes seconds, so the next tick can activate this same slot
+            # safely. Never trade a live login for it.
+            return "warmup-in-flight"
         if self.switcher.live_session_pids_for(number, email):
             # A live `cswap run` session owns this account's token in its own
             # profile. Auto-activating it as the default login too would put
@@ -912,15 +1209,24 @@ class AutoSwitchEngine:
         try:
             outcome = self._tick_inner()
             self._persist_health_counters(self._health_account)
-            return outcome
         except ClaudeSwitchError as e:
             self._emit(ErrorEvent(message=str(e), transient=True))
-            return TickOutcome.ERROR
+            outcome = TickOutcome.ERROR
         except Exception as e:  # pragma: no cover - safety net
             self._emit(
                 ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
             )
-            return TickOutcome.ERROR
+            outcome = TickOutcome.ERROR
+        self._finish_switch_request(outcome)  # fork: engine_control
+        # Warmup hellos spawn HERE, never inside the decision. A hello runs
+        # the full ``setup_session`` preparation, whose consume gate rotates
+        # the slot's refresh token; starting one before the decision means a
+        # switch onto that same slot can install a generation the gate is
+        # about to supersede (see ``_freshen_target``). Draining and
+        # refetching still happen up front, inside ``_tick_inner``, because
+        # the decision wants that data.
+        self._spawn_planned_warmups(outcome)
+        return outcome
 
     def _resolve_thresholds(
         self, settings: AutoSwitchSettings | None = None,
@@ -1061,7 +1367,35 @@ class AutoSwitchEngine:
         self._mutate_state(store)
 
     def _tick_inner(self) -> TickOutcome:
+        # Consume the one-shot request FIRST and unconditionally: whatever this
+        # tick decides (including the early returns below), the request is
+        # spent, so a `n` press can never queue up and fire a surprise switch
+        # several ticks later.
+        # The target (`m`, manual pick) travels with the flag: both read and
+        # cleared as one pair under the lock, so it is spent with the flag.
+        with self._switch_lock:
+            manual = self._switch_now.is_set()
+            self._switch_now.clear()
+            target = self._switch_target if manual else None
+            self._switch_target = None
+            on_result = self._switch_on_result if manual else None  # fork
+            self._switch_on_result = None  # fork: engine_control
+        self._tick_target = target
+        self._tick_on_result = on_result  # fork: engine_control
+        self._tick_events = [] if on_result is not None else None  # fork
+        # Same one-shot contract for `p` ("ping/warm now"): consumed by this
+        # tick whatever it decides, so a keypress can never fire a surprise
+        # round of hellos several ticks later.
+        warm_request = self._warm_now.is_set()
+        self._warm_now.clear()
         self._sleep_until_ts = None
+        self._warm_deadline_ts = None
+        # Per-tick markers for the display schedule (see
+        # ``_spawn_planned_warmups``): whether the warmup step ran at all,
+        # and whether it found warmup switched OFF rather than merely
+        # refused for the moment.
+        self._warm_ran = False
+        self._warm_off = False
         self._blocked_wait_long = False
         self._idle_hold_slow = False
         settings = self.settings
@@ -1084,6 +1418,14 @@ class AutoSwitchEngine:
         if current is not None and current != self._health_account:
             self._load_health_counters(state, current)
             self._health_account = current
+        # `current is not None`: an unreadable live login (transient) is not
+        # evidence of a move, so it must not drop the hold for good.
+        if (
+            self._pinned is not None
+            and current is not None
+            and self._pinned != current
+        ):
+            self._pinned = None  # moved off the manual pick: hold released
         if current is None:
             self._emit(
                 PollEvent(
@@ -1132,6 +1474,16 @@ class AutoSwitchEngine:
             threshold=thresholds[current],
             weekly_threshold=settings.weekly_threshold,
         )
+        # Warmup runs BEFORE the poll event so any refetch it forces (a
+        # hello that just landed, a stale-looking cold row) is what this
+        # tick both reports and decides on. Fully shielded: a warmup problem
+        # must never cost a switch decision.
+        try:
+            entries, usage, headroom = self._run_warmup(
+                current, quarantined, entries, usage, headroom, warm_request
+            )
+        except Exception as e:  # pragma: no cover - safety net
+            _logger.debug("warmup step failed: %r", e)
         self._emit(
             PollEvent(
                 active=active_ref,
@@ -1188,7 +1540,16 @@ class AutoSwitchEngine:
                 else (100.0 - active_headroom) < thresholds[current]
             )
             if below:
-                if settings.strategy != "consume-first" and not priority_mode:
+                # `and not manual`: a "switch now" request must not be
+                # answered with "you are below the threshold". The provisional
+                # `trigger = "consume-first"` it then falls through to is
+                # overwritten by the `if manual:` block below, whatever the
+                # strategy; only the early return is being skipped here.
+                if (
+                    not is_consume_first(settings.strategy)
+                    and not priority_mode
+                    and not manual
+                ):
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
@@ -1202,14 +1563,39 @@ class AutoSwitchEngine:
                         )
                     )
                     return TickOutcome.NO_ACTION
+                if self._pinned == current and not manual:
+                    # Manual pick (`m`): hold it until the threshold instead
+                    # of the consume-first nudge below. Escapes never get here.
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="pinned",
+                            detail=(
+                                _below_line_detail(
+                                    active_binding,
+                                    active_headroom,
+                                    thresholds[current],
+                                )
+                                + " · holding manual pick"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
                 # consume-first: below the threshold we still proactively move to
                 # whichever account's weekly window resets soonest, to burn the
                 # most-perishable quota first. Candidate selection decides whether
                 # a sooner-resetting account with room actually exists.
                 trigger = "priority" if priority_mode else "consume-first"
             else:
+                self._pinned = None  # threshold reached: the hold is over
                 # Exhaustion is physical: at-limit reads the raw headroom.
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
+        elif manual:
+            # The user asked to move NOW, so neither piece of unknown-usage
+            # bookkeeping applies: no idle-hold nap (its whole point is that
+            # nobody is waiting) and no unhealthy counting toward failover
+            # (`_unhealthy_ticks` is deliberately left where it was — a manual
+            # switch is not evidence about the active account's health).
+            trigger = "manual"
         else:
             if usage.get(current) == USAGE_TOKEN_EXPIRED:
                 # Expired and the refresh could not complete this pass (lock
@@ -1258,6 +1644,25 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
+        if manual:
+            # `n` in the TUI (``request_switch``). Everything above still runs:
+            # the unmanaged/absent-active and active-API-key exits are about
+            # whether this engine may act at all, not about when. From here the
+            # utilization classification is discarded — the human has already
+            # made that call — and the ranking follows the configured strategy
+            # minus the anti-flap margins (see ``_rank_candidates``). The
+            # cooldown below and in `_perform` stays scoped to the proactive
+            # triggers, so a manual switch is never refused for being recent.
+            trigger = "manual"
+            if target is not None:
+                # `m` (manual pick): the candidate list is exactly the target
+                # (see `_rank` below); these are the refusals that need no
+                # usage data. The landing check waits for the fresh fetch.
+                refusal = self._target_refusal(target, current, quarantined)
+                if refusal is not None:
+                    self._emit(refusal)
+                    return TickOutcome.NO_ACTION
+
         if trigger in ("proactive", "consume-first", "priority") and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
@@ -1269,6 +1674,12 @@ class AutoSwitchEngine:
             for num in switchable
             if num != current and num not in quarantined
         ]
+        if target is not None and target not in candidates:
+            # `m` on a DISABLED slot (admitted by `_target_refusal`; every
+            # other way to be missing here was refused there). It joins this
+            # tick's census so the phase-2 refetch reads it and the landing
+            # check ranks it with the fleet; rotation itself is untouched.
+            candidates.append(target)
         oauth_candidates = [
             n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
         ]
@@ -1283,7 +1694,7 @@ class AutoSwitchEngine:
         )
         if (
             trigger in ("consume-first", "priority")
-            and not oauth_candidates
+            and not _without_reserves(oauth_candidates, reserve_accounts(settings))
             and active_headroom is not None
         ):
             # Healthy below-threshold account with no OAuth peer to compare
@@ -1310,7 +1721,7 @@ class AutoSwitchEngine:
             self._emit(NoSwitchEvent(reason="no-candidates"))
             return TickOutcome.BLOCKED
 
-        consume_first = settings.strategy == "consume-first"
+        consume_first = is_consume_first(settings.strategy)
 
         def _rank(**kw):
             """Rank with the no-return bar, and WITHOUT it if that empties AND
@@ -1354,6 +1765,9 @@ class AutoSwitchEngine:
             Cheap: the retry runs only when the barred list came back empty,
             which is the tick that was about to do nothing anyway.
             """
+            if target is not None:
+                # Manual pick: the human chose; no strategy, margin or bar.
+                return [target], True, None
             if priority_mode:
                 # Strict landing and a stable priority/reset ordering make the
                 # legacy escape/no-return heuristics unnecessary. A recovered
@@ -1393,9 +1807,9 @@ class AutoSwitchEngine:
                 thresholds=kw["thresholds"],
                 usage=kw["usage"],
             )
-            ranked = self._rank_candidates(no_return=no_return, **kw)
+            ranked = self._rank_reserve_aware(no_return=no_return, **kw)
             if no_return is not None and not ranked[0] and recovered:
-                unbarred = self._rank_candidates(no_return=None, **kw)
+                unbarred = self._rank_reserve_aware(no_return=None, **kw)
                 if unbarred[0]:
                     return unbarred
             return ranked
@@ -1414,7 +1828,7 @@ class AutoSwitchEngine:
             thresholds=thresholds,
         )
 
-        if (trigger == "consume-first" or priority_mode) and ordered:
+        if (trigger in ("consume-first", "manual") or priority_mode) and ordered:
             # Two-phase commit: the provisional pick may have ridden a
             # snapshot up to CANDIDATE_MAX_INTERVAL_S stale — consume-first
             # decides below the threshold, where the collector only escalates
@@ -1449,14 +1863,37 @@ class AutoSwitchEngine:
         priority_active_ready = priority_mode and current in switchable and self._priority_ready(
             usage.get(current), headroom.get(current), settings, thresholds[current]
         )
+        if target is not None:
+            # Manual pick, on the phase-2 data: refused exactly where `n`'s
+            # landing gate would refuse the same account this tick.
+            refusal = self._target_usage_refusal(
+                target,
+                consume_first=consume_first,
+                oauth_candidates=oauth_candidates,
+                usage=usage,
+                headroom=headroom,
+                current=current,
+                active_headroom=active_headroom,
+                settings=settings,
+                now=decided_now,
+                thresholds=thresholds,
+            )
+            if refusal is not None:
+                self._emit(refusal)
+                return TickOutcome.NO_ACTION
+
         if (
             not ordered and api_key_candidates
             and trigger not in ("consume-first", "priority")
+            and not (trigger == "manual" and consume_first)
             and not priority_active_ready
         ):
             # Last resort when we must move: metered API-key accounts
             # (unmeasurable headroom). Never for a below-threshold consume-first
             # nudge — those API-key accounts have no weekly window to consume.
+            # A `manual` request follows its STRATEGY here rather than its
+            # urgency: under consume-first an API-key account is not a
+            # consumable target whoever asked for the move.
             ordered = api_key_candidates
 
         if not ordered:
@@ -1464,6 +1901,11 @@ class AutoSwitchEngine:
                 self._emit(NoSwitchEvent(
                     reason="already-consuming-priority",
                     detail="no usable account has higher priority or an earlier weekly reset in this tier",
+                ) if trigger != "manual" else NoSwitchEvent(
+                    # Fork: `n` keeps priority's outrank filter; `m` (the
+                    # held manual pick) is the explicit override.
+                    reason="already-consuming-priority",
+                    detail="no account outranks the active one under priority; use m to pick",
                 ))
                 return TickOutcome.NO_ACTION
             if priority_mode:
@@ -1472,6 +1914,23 @@ class AutoSwitchEngine:
                     detail="no candidate is below every switch line with readable usage; waiting for recovery",
                 ))
                 return TickOutcome.BLOCKED
+            if (
+                trigger == "manual"
+                and consume_first
+                and not oauth_candidates
+                and api_key_candidates
+            ):
+                # The API-key last resort above is deliberately closed to
+                # this combination, so the fleet is not "unreadable" (the
+                # `no-comparison` story below) — it holds nothing this
+                # strategy can target. Say so, or `n` looks broken.
+                self._emit(
+                    NoSwitchEvent(
+                        reason="no-oauth-candidate",
+                        detail="consume-first never targets API-key accounts",
+                    )
+                )
+                return TickOutcome.NO_ACTION
             if not any_known:
                 # No candidate readable this tick — true for every strategy,
                 # and must not be dressed up as a consume-first hold.
@@ -1486,6 +1945,19 @@ class AutoSwitchEngine:
                 # Below the threshold and healthy: staying put is a correct
                 # outcome, never a block. Distinguish *why* nothing qualified
                 # so an opted-in user can see the strategy working (or inert).
+                if current in reserve_accounts(settings):
+                    # Fork (reserve): the sooner-reset gate is waived on a
+                    # reserve, so empty means no non-reserve landing exists.
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="reserve-hold",
+                            detail=(
+                                "on reserve account; no non-reserve account "
+                                "is below the threshold with room"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
                 if active_reset_ts is None:
                     # The strictly-sooner filter skips every candidate when the
                     # active account's weekly reset is unknown — without this
@@ -1526,10 +1998,17 @@ class AutoSwitchEngine:
                 self._emit(
                     NoSwitchEvent(
                         reason="no-qualifying-candidate",
+                        # Trigger-aware: `manual` waives the hysteresis
+                        # margin, so naming it would send the user hunting
+                        # for a setting that had nothing to do with it.
                         detail=(
-                            "no candidate is below its switch lines and better "
-                            "than the active account by the hysteresis "
-                            "margin, or usage is unreadable this tick"
+                            "no candidate is below the threshold, or usage "
+                            "is unreadable this tick"
+                            if trigger == "manual"
+                            else "no candidate is below its switch lines and "
+                            "better than the active account by the "
+                            "hysteresis margin, or usage is unreadable "
+                            "this tick"
                         ),
                     )
                 )
@@ -1624,7 +2103,17 @@ class AutoSwitchEngine:
                 ) < _SYSTEMIC_STATUSES.index(systemic):
                     systemic = status
                 continue
-            if status == "skip-live-session":
+            if status in ("skip-live-session", "warmup-in-flight"):
+                if target is not None:
+                    # Manual pick (`ordered` is exactly the target): name the
+                    # cause, which a bare `no-viable-target` would hide.
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="target-busy",
+                            detail=f"Account-{num}: " + _TARGET_BUSY_DETAIL[status],
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
                 continue
             return self._perform(num, email, trigger, left_snapshot)
 
@@ -1640,6 +2129,126 @@ class AutoSwitchEngine:
             return TickOutcome.ERROR
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
+
+    # -- manual pick (`m`) ------------------------------------------------------
+
+    def _target_refusal(
+        self, target: str, current: str, quarantined: set[str]
+    ) -> NoSwitchEvent | None:
+        """Why a manual-pick target can't be taken, before any usage data.
+
+        None = proceed. Cooldown, hysteresis, strictly-sooner and the
+        no-return bar are NOT here: the human overrode them by picking. Nor
+        is ``cswap disable``: like ``cswap switch``, a pick may name a
+        disabled slot (it only leaves AUTOMATIC rotation), as long as it is
+        managed and has a usable stored login."""
+        if target == current:
+            return NoSwitchEvent(
+                reason="already-active",
+                detail=f"Account-{target} is the active account",
+            )
+        if target not in self.switcher.switchable_account_numbers() and not (
+            target in self.switcher.disabled_account_numbers()
+            # The same stored-login test `switchable_account_numbers` applies,
+            # minus its disabled filter.
+            and self.switcher._account_is_switchable(target)
+        ):
+            return NoSwitchEvent(
+                reason="target-unavailable",
+                detail=(
+                    f"Account-{target} cannot be switched to (unknown slot "
+                    "or no usable stored login)"
+                ),
+            )
+        if target in quarantined:
+            return NoSwitchEvent(
+                reason="target-quarantined",
+                detail=(
+                    f"Account-{target} is quarantined; run 'cswap "
+                    f"--add-account --slot {target}' to recover it"
+                ),
+            )
+        if (
+            self.switcher.account_kind_for(target) == "api_key"
+            and not self.settings.include_api_key_accounts
+        ):
+            return NoSwitchEvent(
+                reason="target-unavailable",
+                detail=(
+                    f"Account-{target} is an API-key account and "
+                    "autoswitch.includeApiKeyAccounts is off"
+                ),
+            )
+        return None
+
+    def _target_usage_refusal(
+        self,
+        target: str,
+        *,
+        consume_first: bool,
+        oauth_candidates: list[str],
+        usage: dict[str, dict | str | None],
+        headroom: dict[str, float | None],
+        current: str,
+        active_headroom: float | None,
+        settings: AutoSwitchSettings,
+        now: float,
+        thresholds: Mapping[str, float] | None = None,
+    ) -> NoSwitchEvent | None:
+        """The manual-pick landing check, on the post-refetch data.
+
+        Decided BY `n`'s own ranking rather than a copy of its rule: the
+        target is accepted iff the ``manual`` ranking of this same fleet
+        would keep it. That ranking waives every anti-flap margin for
+        ``manual`` and ``_no_return_account`` returns None for it, so what
+        is left is exactly the landing gate — readable, headroom > 0, and
+        below its own switch lines unless the active is unreadable (escape)
+        or the whole fleet is at/over them (``all_above``). API-key targets
+        have no measurable quota and pass."""
+        if self.switcher.account_kind_for(target) == "api_key":
+            return None
+        if thresholds is None:
+            thresholds = ThresholdMap({}, settings.threshold)
+        kept, _, _ = self._rank_candidates(
+            trigger="manual",
+            consume_first=consume_first,
+            oauth_candidates=oauth_candidates,
+            no_return=None,
+            usage=usage,
+            headroom=headroom,
+            current=current,
+            active_headroom=active_headroom,
+            settings=settings,
+            now=now,
+            thresholds=thresholds,
+        )
+        if target in kept:
+            return None
+        h = headroom.get(target)
+        if h is None:
+            return NoSwitchEvent(
+                reason="target-usage-unknown",
+                detail=f"Account-{target} usage could not be read this tick",
+            )
+        utilization = 100.0 - h
+        # Quote the comparison actually made: the binding window against ITS
+        # own line (per-account / weekly lines), as `_below_line_detail` does.
+        binding = self._binding(usage.get(target), settings, thresholds[target])
+        over_line = (
+            f"{binding.label} {pct_label(binding.pct)}% >= "
+            f"{pct_label(binding.line)}%"
+            if binding is not None
+            else f"{pct_label(utilization)}% >= {pct_label(thresholds[target])}%"
+        )
+        return NoSwitchEvent(
+            reason="target-over-threshold",
+            detail=(
+                f"Account-{target} is at its limit ({pct_label(utilization)}%)"
+                if h <= 0
+                else f"Account-{target} at {over_line}; it would switch "
+                "away again on the next tick"
+            ),
+        )
 
     def _no_return_account(
         self,
@@ -1909,9 +2518,27 @@ class AutoSwitchEngine:
         # this field existed has no such key, so fall back to the old
         # two-null inference for it (unchanged behaviour for pre-upgrade
         # state).
+        #
+        # A `manual` departure from an UNREADABLE active writes the same two
+        # nulls for the same reason a failover does — nothing was measurable
+        # to record — so it must take the same legs. An unmeasured departure
+        # is unmeasured whoever asked for it, and the ordinary legs read
+        # `was = inf` from those nulls and release the bar unconditionally,
+        # which lets the first proactive tick after the cooldown undo the
+        # user's own switch. SCOPED to `manual`, and to BOTH nulls: the
+        # consume-first split shape above is the one case that must not take
+        # these legs, and a `manual` record with a measured baseline has a
+        # real one to diff against.
         left_trigger = state.get("leftTrigger")
         is_failover_snapshot = (
-            left_trigger == "failover"
+            (
+                left_trigger == "failover"
+                or (
+                    left_trigger == "manual"
+                    and left_headroom is None
+                    and left_recovery is None
+                )
+            )
             if left_trigger is not None
             else (left_headroom is None and left_recovery is None)
         )
@@ -2115,6 +2742,7 @@ class AutoSwitchEngine:
         # for every account, so a caller without per-account context behaves
         # exactly as this function did before per-account thresholds existed.
         thresholds: Mapping[str, float] | None = None,
+        waive_sooner: bool = False,
     ) -> tuple[list[str], bool, float | None]:
         """Filter and rank OAuth candidates for this tick's trigger.
 
@@ -2122,11 +2750,51 @@ class AutoSwitchEngine:
         no state writes — so the consume-first two-phase commit can run it
         twice per tick: on the stored snapshot to decide provisionally, then
         on the escalated refetch to re-verify before switching.
+
+        THE ``manual`` TRIGGER RANKS LIKE THE STRATEGY'S PROACTIVE PATH AND
+        WAIVES ITS MARGINS. It is `proactive_like` everywhere the strategy is
+        chosen — the landing-health gate, the ``all_above`` recovery axis, and
+        both key selections — so `n` takes the same row the "Next best" panel
+        shows. What it drops are the four ANTI-FLAP margins, each of which
+        exists to stop the ENGINE oscillating on its own: the `best`
+        hysteresis, the ``all_above`` recovery hysteresis, the headroom ratio,
+        and consume-first's strictly-sooner reset. A human asking for a switch
+        has already decided the move is worth it; refusing it because the gain
+        is under a margin would make the key inert exactly when it is pressed.
+        (The no-return bar goes with them, upstream: ``_no_return_account``
+        returns None for any trigger outside proactive/consume-first.)
+
+        THE LANDING-HEALTH GATE IS KEPT, though, and is not a margin: a
+        candidate at/over the threshold re-triggers on the very next tick, so
+        `n` would buy a switch and an immediate switch back. With every
+        candidate unhealthy, manual returns nothing and `_tick_inner` reports
+        no-qualifying-candidate. ONE exception, at the gate itself: with the
+        ACTIVE account unreadable there is no next trigger to protect against
+        and manual behaves as an escape. `m` (a named target) is checked
+        against this same ranking — ``_target_usage_refusal`` asks whether
+        the ``manual`` pass keeps it — so the two keys apply the same
+        threshold check. Two deliberate differences remain: `m` takes an
+        included API-key target even under consume-first, and `m` always
+        decides on the fresh second fetch (`n` re-fetches only when its first
+        ranking is non-empty).
         """
         if thresholds is None:
             thresholds = ThresholdMap({}, settings.threshold)
-        # consume-first ranks by soonest weekly reset; a proactive (below-
-        # threshold) target must reset strictly sooner than where we are.
+        # consume-first ranks a qualifying candidate cool-before-5h-hot,
+        # then by soonest weekly reset, then soonest 5-hour reset, then
+        # most-used (`consume_first_key`, which owns that whole chain);
+        # a proactive (below-threshold) target must reset strictly sooner
+        # than where we are. That whole ranking is scoped to the "proactive"/
+        # "consume-first" triggers only — an "at-limit"/"failover" escape
+        # always ranks by headroom instead, regardless of strategy, so it
+        # lands on an account that can actually work rather than the one
+        # nearest its own limit.
+        # Every gate and key below that asks "is this the strategy's own
+        # proactive path?" — as opposed to an at-limit/failover escape, which
+        # ranks by headroom whatever the strategy. `manual` joins that set: it
+        # follows the strategy and only the anti-flap margins are waived
+        # inside, by explicit `trigger == "manual"` tests. See the docstring.
+        proactive_like = trigger in ("proactive", "consume-first", "manual")
         active_reset_ts = (
             _seven_day_reset_ts(usage.get(current), now) if consume_first else None
         )
@@ -2223,12 +2891,26 @@ class AutoSwitchEngine:
             reset_ts = (
                 _seven_day_reset_ts(usage.get(num), now) if consume_first else None
             )
-            if trigger in ("proactive", "consume-first"):
+            if proactive_like:
                 # Landing must be healthy: an account at/over any of its own
                 # lines would re-trigger on the very next tick. At-limit and
                 # failover are escapes that skip this whole block — any account
                 # with real headroom beats a blocked or dead one.
-                if over and not all_above:
+                if (
+                    over
+                    and not all_above
+                    and not (trigger == "manual" and active_headroom is None)
+                ):
+                    # `manual` with an UNREADABLE active is an escape, not an
+                    # optimisation: there is no "re-triggers next tick" to
+                    # protect against, because the thing that would re-trigger
+                    # is the number we cannot read. `all_above` cannot rescue
+                    # it either — `_every_account_above_threshold` is False
+                    # whenever `active_headroom is None` — so without this the
+                    # request would be spent on `no-qualifying-candidate`
+                    # while `failover` from the same state switches happily.
+                    # Any candidate with headroom > 0 qualifies; the strategy
+                    # key below still decides WHICH.
                     continue
                 if all_above:
                     # Checked before the strategies, because with nothing under
@@ -2240,26 +2922,33 @@ class AutoSwitchEngine:
                     # consume_first` catching first filtered on weekly ordering
                     # while the key sorted on room, two different axes, and
                     # left consume-first users with no anti-flap guard at all.)
-                    if not _all_above_margin_met(h, active_headroom or 0.0):
+                    # `manual` waives the margin: it bounds the engine's own
+                    # flap rate, and a human asking to move now overrode it.
+                    if trigger != "manual" and not _all_above_margin_met(
+                        h, active_headroom or 0.0
+                    ):
                         continue
                 elif consume_first:
                     # Purely proactive on reset ordering: below the threshold,
                     # only move to accounts whose weekly window resets sooner
                     # than the active one (above the threshold we must move, so
                     # any healthy account qualifies and the sort picks soonest).
-                    if trigger == "consume-first" and (
+                    if trigger == "consume-first" and not waive_sooner and (
                         reset_ts is None
                         or active_reset_ts is None
                         or reset_ts >= active_reset_ts
                     ):
                         continue
-                elif active_headroom is not None:
+                elif active_headroom is not None and trigger != "manual":
                     # best: the candidate must beat the active account by the
                     # full hysteresis margin (a one-way move like 99%→89%
                     # qualifies; near-line pairs can't flap back). Measured in
                     # policy headroom, so a 7d 93% candidate under a 97 line
                     # beats a 5h 95% active under 85 — raw headroom (7 vs 5)
-                    # would park on the account about to hit its limit.
+                    # would park on the account about to hit its limit. Waived
+                    # for `manual`: the margin bounds the engine's own flap
+                    # rate, and there is no flap to bound when a human presses
+                    # a key.
                     if lh - active_lh < settings.hysteresis_pct:
                         continue
             if all_above:
@@ -2276,16 +2965,608 @@ class AutoSwitchEngine:
                     -h,
                     _binding_recovery_ts(usage.get(num), self._models, now),
                 )
-            elif consume_first:
-                # Soonest weekly reset first (unknown resets sort last), most
-                # policy headroom breaks ties, then sequence order.
-                key = (reset_ts if reset_ts is not None else float("inf"), -lh)
+            elif consume_first and proactive_like:
+                # Cool candidates before 5h-hot ones, then soonest weekly
+                # reset (unknown last), then soonest 5-hour reset breaks a
+                # weekly tie, then — the opposite of `best`'s ``-lh`` below —
+                # the MORE-used account wins any remaining tie, then sequence
+                # order. Built by `consume_first_key`, which owns the tier
+                # semantics and is what the TUI's "Next best" panel imports so
+                # the display cannot rank differently from the decision.
+                #
+                # Scoped to the SAME triggers as the ``all_above`` key above,
+                # for the same reason (#305): `consume_first` is the
+                # STRATEGY setting, not the trigger, so an unscoped elif here
+                # would also catch "at-limit"/"failover" escapes and rank
+                # them by reset instead of headroom — landing the escape on
+                # whichever account is closest to ALSO being out of quota
+                # instead of the one that can actually do work. The hot tier
+                # is scoped with it: an escape needs the account that works,
+                # not the one with the coolest 5-hour window.
+                key = consume_first_key(
+                    usage.get(num),
+                    lh,
+                    threshold=thresholds[num],
+                    hysteresis_pct=settings.hysteresis_pct,
+                    now=now,
+                )
             else:
                 key = (-lh,)
             qualifying.append((key, num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying.sort(key=lambda t: t[0])
         return [num for _, num in qualifying], any_known, active_reset_ts
+
+    def _rank_reserve_aware(self, **kw) -> tuple[list[str], bool, float | None]:
+        """``_rank_candidates`` under consume-first-reserve-jj (fork-only).
+
+        With no reserve configured this IS ``_rank_candidates``. Otherwise:
+
+        - The ``consume-first`` nudge never ranks a reserve (from a
+          non-reserve nothing forces the move; from a reserve it is leaving
+          it). On a reserve the strictly-sooner gate is waived so the move
+          happens right away; landing health, the no-return bar, cooldown,
+          the pin and the two-phase fetch all still apply.
+        - Every other trigger ranks WITHOUT reserves while any non-reserve
+          candidate is a usable landing (``_usable_landing``). Only when none
+          is does it rank everyone exactly as today and then stable-sort by
+          ``_reserve_tier``: a healthy reserve beats a non-reserve at/over the
+          threshold, and every other reserve sorts after the non-reserves.
+
+        `m` does not come through here: an explicit pick of a reserve is
+        allowed under the same rules as any other account.
+        """
+        reserves = reserve_accounts(kw["settings"])
+        if not reserves:
+            return self._rank_candidates(**kw)
+        candidates = kw["oauth_candidates"]
+        others = _without_reserves(candidates, reserves)
+        if kw["trigger"] == "consume-first":
+            return self._rank_candidates(
+                **{**kw, "oauth_candidates": others},
+                waive_sooner=kw["current"] in reserves,
+            )
+        if len(others) == len(candidates):
+            return self._rank_candidates(**kw)
+        headroom = kw["headroom"]
+        settings = kw["settings"]
+        threshold = settings.threshold
+        thresholds = kw.get("thresholds") or ThresholdMap({}, threshold)
+        # Each account against its OWN lines (per-account / weekly), the
+        # same verdict `_rank_candidates`' landing gate reads.
+        over = {}
+        for n in candidates:
+            b = self._binding(kw["usage"].get(n), settings, thresholds[n])
+            over[n] = b.over if b is not None else None
+        if any(_usable_landing(headroom.get(n), threshold, over[n]) for n in others):
+            return self._rank_candidates(**{**kw, "oauth_candidates": others})
+        ordered, any_known, active_reset_ts = self._rank_candidates(**kw)
+        ordered = sorted(
+            ordered,
+            key=lambda n: _reserve_tier(n, reserves, headroom, threshold, over),
+        )
+        return ordered, any_known, active_reset_ts
+
+    # -- warmup ----------------------------------------------------------------
+
+    def _warmup_section(self, state: dict) -> dict:
+        section = state.get("warmup")
+        return section if isinstance(section, dict) else {}
+
+    def _drain_pings(self) -> list[tuple[str, str, str, "warmup.PingResult"]]:
+        """Take whatever the ping threads have finished since the last tick."""
+        with self._warm_lock:
+            drained = self._warm_results
+            self._warm_results = []
+        return drained
+
+    def _record_ping_result(
+        self, number: str, model: str, result: "warmup.PingResult"
+    ) -> None:
+        """Persist one outcome under ``warmup.<num>`` and set the backoff.
+
+        Three consecutive failures buy a day off rather than a half hour: at
+        that point the cause is structural (no ``claude`` on PATH, a slot
+        that cannot bootstrap, a revoked account), and retrying it every 30
+        minutes spawns a process to learn nothing.
+        """
+        if self.dry_run or result.skipped:
+            # A skip means nothing was spawned, so there is no outcome to
+            # record and — critically — no strike to earn. ``lastPingAt``
+            # from the start stamp stands, which holds the anti-loop
+            # cooldown; the account is reconsidered when it lifts.
+            return
+        now = self.clock()
+
+        def note(state: dict) -> None:
+            record = warmup.warmup_record(state, number)
+            record["lastPingModel"] = model
+            record["lastResult"] = (
+                "ok" if result.ok else (result.error or "failed")[: warmup.STDERR_CAP]
+            )
+            if result.ok:
+                record["failures"] = 0
+                record.pop("backoffUntil", None)
+                return
+            failures = record.get("failures")
+            failures = int(failures) + 1 if isinstance(failures, int) else 1
+            record["failures"] = failures
+            record["backoffUntil"] = now + (
+                warmup.FAILURE_LONG_BACKOFF_S
+                if failures >= warmup.FAILURE_STRIKES
+                else warmup.FAILURE_BACKOFF_S
+            )
+
+        self._mutate_state(note)
+
+    def _note_warm_deadline(self, ts: float) -> None:
+        if ts <= self.clock():
+            return
+        if self._warm_deadline_ts is None or ts < self._warm_deadline_ts:
+            self._warm_deadline_ts = ts
+
+    def _start_ping(
+        self, number: str, email: str, model: str, label: str | None
+    ) -> None:
+        """Spawn one hello on a daemon thread. One in flight per account."""
+        with self._warm_lock:
+            if number in self._warm_inflight:
+                return
+            self._warm_inflight.add(number)
+        now = self.clock()
+        try:
+            # Same stamps the manual path writes (``warmup.note_ping_started``)
+            # — the per-day model guard and the anti-loop cooldown belong to
+            # the ACCOUNT, not to the surface that sent the hello.
+            self._mutate_state(
+                lambda state: warmup.stamp_ping_started(
+                    state, number, model, label, now
+                )
+            )
+        except Exception as e:  # bookkeeping must not block the hello
+            _logger.debug("warmup state write failed for %s: %r", number, e)
+        active = self.switcher.current_account_number()
+        threading.Thread(
+            target=self._ping_worker,
+            args=(number, email, model, active),
+            daemon=True,
+            name=f"cswap-warmup-{number}",
+        ).start()
+
+    def _ping_worker(
+        self, number: str, email: str, model: str, active: str | None
+    ) -> None:
+        """Resolve the config dir and hello, on a daemon thread.
+
+        The ROLE is re-checked here, not trusted from the plan. Warmup runs
+        before the switch decision in the same tick, so a tick that plans a
+        hello and then switches would leave this thread resolving the
+        "active" path to :func:`paths.get_claude_config_home` — which by
+        then holds the NEW account's credentials. That warms the wrong
+        account and records it under the old one's number. The mirror case
+        is as bad: an account that BECOMES active loses its slot profile
+        (``setup_session`` refuses the active login), so the hello would die
+        with a SessionError and earn an undeserved strike.
+
+        Either way the answer is the same — abort, report ``skipped``, take
+        no strike.
+        """
+        try:
+            current = self.switcher.current_account_number()
+            if (number == active) != (number == current):
+                self._finish_ping(
+                    number, email, model,
+                    warmup.PingResult(
+                        ok=False, model=model, skipped=True,
+                        error="active account changed mid-tick",
+                    ),
+                )
+                return
+            cwd = warmup.warmup_cwd(self.switcher)
+            # Registers in the process-wide live-hello registry for the whole
+            # preparation + child, so a switch from ANY surface (not just
+            # this engine's own decision) can refuse the slot meanwhile.
+            result = warmup.perform_hello(
+                self.switcher, number, model, current, self.ping_runner, cwd,
+                warmup.PING_TIMEOUT_S,
+            )
+        except Exception as e:
+            # Type only: a SessionError from the slot preparation can embed
+            # slot and config-dir paths, and these strings are logged,
+            # scrolled and pasted into issues.
+            _logger.debug("warmup failed for account %s: %r", number, e)
+            result = warmup.PingResult(
+                ok=False,
+                model=model,
+                error=f"{warmup.safe_error(e)} preparing the account's profile",
+            )
+        self._finish_ping(number, email, model, result)
+
+    def _finish_ping(
+        self, number: str, email: str, model: str, result: "warmup.PingResult"
+    ) -> None:
+        with self._warm_lock:
+            self._warm_inflight.discard(number)
+            self._warm_results.append((number, email, model, result))
+        # A landed hello is worth a tick: the next one drains it and asks
+        # for a refetch of that account.
+        self._wake.set()
+
+    def _run_warmup(
+        self,
+        current: str,
+        quarantined: set[str],
+        entries: dict,
+        usage: dict,
+        headroom: dict,
+        warm_request: bool,
+    ) -> tuple[dict, dict, dict]:
+        """Drain finished hellos and refetch; PLAN, but do not spawn.
+
+        The spawn half runs after the switch decision
+        (:meth:`_spawn_planned_warmups`); this half runs before it, because
+        a landed hello's account is worth refetching before the tick
+        decides. Draining runs even when warmup is disabled — a hello
+        started before the setting was flipped still has a result to record.
+        """
+        self._warm_ran = True
+        refetch: set[str] = set()
+        for number, email, model, result in self._drain_pings():
+            self._record_ping_result(number, model, result)
+            self._emit(
+                WarmupEvent(
+                    action=(
+                        "skipped" if result.skipped
+                        else "pinged" if result.ok
+                        else "failed"
+                    ),
+                    number=number,
+                    email=email,
+                    model=model,
+                    detail=result.summary(),
+                )
+            )
+            if result.ok:
+                # Best effort only: ``UsageStore.reserve(respect_plans=False)``
+                # still gates on `poll_due or stale`, so a row fetched
+                # earlier in this same tick will NOT be refetched here. The
+                # new stamp then arrives whenever the row next goes stale or
+                # due, and `warmup.PING_COOLDOWN_S` is what keeps the
+                # meanwhile-still-cold row from being re-pinged every tick.
+                refetch.add(number)
+
+        enabled = bool(self.settings.warmup_enabled) or warm_request
+        # Switched off is a STANDING state the panel should show as "off";
+        # a session-shell refusal is a condition of this process, not a
+        # statement that nothing is planned — recorded before that check so
+        # the two cannot be confused downstream.
+        self._warm_off = not enabled
+        if enabled and not self._session_shell_ok():
+            enabled = False
+        if not enabled and not refetch:
+            # The common case with warmup off: touch nothing, and in
+            # particular do not read the clock (ticks are tested against
+            # exact clock() call sequences).
+            return entries, usage, headroom
+        now = self.clock()
+        # One read for the whole step: `_warm_candidates` may run twice.
+        warm_state = self._warmup_section(self._read_state())
+        candidates = None
+        if enabled:
+            candidates = self._warm_candidates(entries, quarantined, now, warm_state)
+            if candidates.stale:
+                # ONE extra fetch per tick, stalest first — warmup shares the
+                # engine's 429 budget and must not turn a tick into an
+                # all-accounts refresh just because several rows look cold.
+                refetch.add(
+                    min(
+                        candidates.stale,
+                        key=lambda n: (
+                            entries[n].fetched_at
+                            if entries.get(n) is not None
+                            and entries[n].fetched_at is not None
+                            else 0.0
+                        ),
+                    )
+                )
+        if refetch:
+            entries = self.switcher.usage_entries_by_account(
+                fetch=refetch, scheduled=False
+            )
+            usage = {num: entry.decision_value() for num, entry in entries.items()}
+            headroom = _headroom_by_account(usage, self._models)
+            if enabled:
+                candidates = self._warm_candidates(
+                    entries, quarantined, now, warm_state
+                )
+        if not enabled or candidates is None:
+            return entries, usage, headroom
+
+        # Handed to the post-decision spawn phase. `usage`/`headroom` ride
+        # along so the spawn phase can rank the cold accounts with the
+        # engine's own switch ranking without refetching anything.
+        self._warm_plan = (
+            now,
+            candidates,
+            # A manual request is a request for DATA now — the stagger is
+            # exactly the thing the user is overriding by pressing `p`.
+            bool(self.settings.warmup_stagger) and not warm_request,
+            current,
+            usage,
+            headroom,
+        )
+        return entries, usage, headroom
+
+    def _session_shell_ok(self) -> bool:
+        """False (once-warned) inside a ``cswap run`` shell.
+
+        There, ``CLAUDE_CONFIG_DIR`` points at a session profile, so
+        ``current_account_number()`` reports the SESSION's account — and the
+        machine's real default login reads as just another candidate.
+        ``config_dir_for`` would then hand it to ``setup_session``: a slot
+        copy of the live login, rotating the backup while ``~/.claude``
+        keeps the predecessor. Upstream refuses every live-store mutation
+        from such a shell for exactly this reason; a warmup rotates
+        credentials, so it is one.
+        """
+        try:
+            self.switcher._refuse_session_shell()
+            return True
+        except ClaudeSwitchError as e:
+            if not self._warm_shell_warned:
+                self._warm_shell_warned = True
+                self._emit(
+                    ConfigWarningEvent(message=f"warmup disabled: {e}")
+                )
+            return False
+
+    def _spawn_planned_warmups(self, outcome: TickOutcome) -> None:
+        """Start the hellos this tick planned, now that the switch is done.
+
+        Excludes the account the tick just switched TO: it has become the
+        default login, its credentials were installed moments ago, and on
+        macOS the Keychain pickup has a ~30s tail — a hello racing that is
+        all risk and no benefit, and it will be reconsidered next tick. The
+        account switched away FROM is fine: it is an ordinary slot again.
+
+        Never raises: a warmup problem must not escape into the loop.
+        """
+        plan = self._warm_plan
+        self._warm_plan = None
+        if plan is None:
+            # A missing plan is NOT the same as "nothing is planned": this
+            # method runs for every tick outcome, including the ones that
+            # returned before the warmup step (no/unmanaged active account,
+            # a usage collection that raised) and the ones where warmup was
+            # refused for this process (a `cswap run` shell). Wiping the
+            # panel on those would report an absence the engine never
+            # established. Only a tick that RAN the step and found warmup
+            # switched off clears it — and not while a hello it planned is
+            # still in flight (`p` warms with the setting off).
+            if self._warm_ran and self._warm_off:
+                with self._warm_lock:
+                    busy = bool(self._warm_inflight)
+                if not busy:
+                    self._set_warm_schedule({})
+            return
+        try:
+            now, candidates, stagger, current, usage, headroom = plan
+            spawned: set[str] = set()
+            exclude: set[str] = set()
+            if outcome is TickOutcome.SWITCHED and not self.dry_run:
+                landed = self.switcher.current_account_number()
+                if landed:
+                    exclude.add(str(landed))
+                    # `current` was captured before the decision. The account
+                    # we switched AWAY from is an ordinary slot now and must
+                    # rank as one; the ranking's "active account" is the one
+                    # we actually landed on.
+                    current = str(landed)
+            labels = {
+                acct.number: (
+                    acct.state.cold_models[0] if acct.state.cold_models else None
+                )
+                for acct in candidates.eligible
+            }
+            decisions = warmup.plan_warmups(
+                now,
+                # Priority order, not slot order: `plan_warmups` hands the
+                # earliest instant to the first cold account it is given.
+                self._warmup_order(
+                    candidates, current, usage, headroom, now, exclude
+                ),
+                stagger=stagger,
+                # One poll interval plus slack: the tolerance answers "is the
+                # next tick close enough to the target", nothing wider.
+                tolerance_s=(
+                    self.settings.interval_seconds
+                    + warmup.DEFAULT_TOLERANCE_MARGIN_S
+                ),
+            )
+            for decision in decisions:
+                if not decision.is_now:
+                    if decision.at_ts is not None:
+                        self._note_warm_deadline(decision.at_ts)
+                    continue
+                if decision.number in exclude:
+                    continue
+                email = self.switcher.account_email(decision.number)
+                if self.dry_run:
+                    self._emit(
+                        WarmupEvent(
+                            action="would-ping",
+                            number=decision.number,
+                            email=email,
+                            model=decision.model,
+                            detail=decision.reason,
+                        )
+                    )
+                    continue
+                self._start_ping(
+                    decision.number, email, decision.model,
+                    labels.get(decision.number),
+                )
+                spawned.add(decision.number)
+            # Confirm a lapse promptly: a window whose stamp expires during
+            # the next sleep leaves the account cold and invisible until the
+            # following poll.
+            for acct in candidates.eligible:
+                if acct.state.reset_ts is not None:
+                    self._note_warm_deadline(acct.state.reset_ts + 60.0)
+            # Display only, and strictly downstream of the spawning above —
+            # this mirrors what was just decided, it never feeds it.
+            self._set_warm_schedule(
+                warmup.build_schedule(
+                    now,
+                    candidates,
+                    decisions,
+                    emails={
+                        number: self.switcher.account_email(number)
+                        for number in (
+                            {a.number for a in candidates.eligible}
+                            | set(candidates.skipped)
+                        )
+                    },
+                    exclude=exclude,
+                    spawned=spawned,
+                    dry_run=self.dry_run,
+                )
+            )
+        except Exception as e:  # pragma: no cover - safety net
+            _logger.debug("warmup spawn phase failed: %r", e)
+
+    def _warmup_order(
+        self,
+        candidates: "warmup.Candidates",
+        current: str,
+        usage: dict,
+        headroom: dict,
+        now: float,
+        exclude: frozenset[str] | set[str] = frozenset(),
+    ) -> list["warmup.WarmupAccount"]:
+        """Eligible accounts with the COLD ones in switch-target order.
+
+        `plan_warmups` gives its earliest instant to the first cold account
+        it is handed, so this is what makes "next up gets warmed first" true:
+        the account you are most likely to move to next is the one whose
+        window is started first. The ranking is `_rank_candidates` itself —
+        the engine's own, for the configured strategy — never a second
+        implementation of it that could disagree with the switch it is
+        supposed to anticipate.
+
+        THE TRIGGER IS ``manual``, which is the CANDIDATES PANEL's ranking,
+        not the switch decision's. Ordering is not a decision to move, so
+        the anti-flap margins have nothing to protect here — and they are
+        precisely what would empty the list: under `best` the proactive path
+        drops every candidate that does not beat the ACTIVE account by the
+        hysteresis margin, and under consume-first it drops every candidate
+        that does not reset strictly sooner than the active. In the ordinary
+        "healthy active, several cold peers" case that leaves nothing ranked
+        and the order silently collapses to slot order — the exact failure
+        this method exists to fix. `manual` ranks like the strategy's own
+        proactive path, waives those margins and KEEPS the landing-health
+        gate (see :meth:`_rank_candidates`), so the queue matches what the
+        "Next best" panel shows.
+
+        Order of the cold accounts, in tiers: ranked candidates first, then
+        anything the ranking filtered out (slot order), then the ACTIVE
+        account, then ``exclude``. The active account is not a switch target
+        and must not take an instant off one just because its slot number is
+        low. ``exclude`` (the account this tick switched TO) goes last: it is
+        exactly the account the ranking likes best, so left at the front it
+        would take the earliest instant — which the spawn loop then drops,
+        spending the bootstrap anchor on a hello that never happens and
+        leaving the tick with nothing warmed.
+
+        Warm accounts contribute phases only, and keep their place at the
+        back. A ranking that raises costs the ORDER, never the warmup: slot
+        order is a perfectly good plan, just a less useful one.
+        """
+        eligible = list(candidates.eligible)
+        cold = [acct for acct in eligible if acct.state.five_hour_cold]
+        warm = [acct for acct in eligible if not acct.state.five_hour_cold]
+        if len(cold) < 2:
+            return eligible
+        order: dict[str, int] = {}
+        try:
+            # The same per-account lines the switch decision ranks on.
+            policies = self.switcher.account_policies()
+            thresholds = self._resolve_thresholds(policies=policies)
+            cold_numbers = [acct.number for acct in cold if acct.number != current]
+            if self.settings.strategy == "priority-consume-first":
+                # Ordering, not deciding: the priority ranking without its
+                # "must outrank the active" filter.
+                ranked, _known, _reset = self._rank_priority_candidates(
+                    oauth_candidates=cold_numbers,
+                    usage=usage, headroom=headroom, current=current,
+                    active_enabled=False, settings=self.settings, now=now,
+                    thresholds=thresholds, policies=policies,
+                )
+            else:
+                ranked, _known, _reset = self._rank_reserve_aware(
+                    # Ordering, not deciding: the strategy's proactive ranking
+                    # WITHOUT the anti-flap margins (see the docstring).
+                    trigger="manual",
+                    consume_first=is_consume_first(self.settings.strategy),
+                    oauth_candidates=cold_numbers,
+                    no_return=None,
+                    usage=usage,
+                    headroom=headroom,
+                    current=current,
+                    active_headroom=headroom.get(current),
+                    settings=self.settings,
+                    now=now,
+                    thresholds=thresholds,
+                )
+            order = {number: i for i, number in enumerate(ranked)}
+        except Exception as e:  # pragma: no cover - safety net
+            _logger.debug("warmup ranking failed, using slot order: %r", e)
+            return eligible
+        cold.sort(
+            key=lambda acct: (
+                acct.number in exclude,
+                acct.number == current,
+                order.get(acct.number, len(order)),
+                acct.number in reserve_accounts(self.settings),  # fork: reserves last
+                warmup.slot_sort_key(acct.number),
+            )
+        )
+        return cold + warm
+
+    def _set_warm_schedule(self, schedule: dict[str, "warmup.WarmupSlot"]) -> None:
+        with self._warm_lock:
+            self._warm_schedule = schedule
+
+    def warmup_schedule(self) -> dict[str, "warmup.WarmupSlot"]:
+        """Snapshot of the last planning pass, per account. Thread-safe.
+
+        For the TUI's warmup panel: a plain copy taken under ``_warm_lock``,
+        of frozen slots, so the caller can render it on another thread while
+        a tick replaces it. Empty when warmup is off or nothing has been
+        planned yet.
+        """
+        with self._warm_lock:
+            return dict(self._warm_schedule)
+
+    @property
+    def warmup_enabled(self) -> bool:
+        """Whether automatic warmup is on in the engine's settings."""
+        return bool(self.settings.warmup_enabled)
+
+    def _warm_candidates(
+        self, entries: dict, quarantined: set[str], now: float, warm_state: dict
+    ) -> "warmup.Candidates":
+        with self._warm_lock:
+            in_flight = set(self._warm_inflight)
+        return warmup.collect_candidates(
+            self.switcher,
+            entries,
+            now,
+            models=self._models,
+            quarantined=quarantined,
+            warmup_state=warm_state,
+            in_flight=in_flight,
+        )
 
     # -- adaptive usage scheduling ---------------------------------------------
 
@@ -2461,6 +3742,9 @@ class AutoSwitchEngine:
                     from_ref=_ref(current, current_email) if current else None,
                     to_ref=_ref(number, email),
                     dry_run=True,
+                    note=_reserve_departure_note(
+                        current, reserve_accounts(self.settings)
+                    ),
                 )
             )
             return TickOutcome.SWITCHED
@@ -2510,12 +3794,32 @@ class AutoSwitchEngine:
             state["leftTrigger"] = trigger
             atomic_write_json(self.state_path, state)
 
+        note = ""
+        if trigger == "manual":
+            # Live manual switch: `m` pins its target (held until the
+            # threshold); `n` (no target) replaces any earlier pin with none.
+            self._pinned = self._tick_target
+            if (
+                self._pinned is not None
+                and self.switcher.account_kind_for(self._pinned) == "api_key"
+            ):
+                # No measurable headroom: the engine fails over off it after
+                # the unhealthy ticks, so a "holding #N" would be a lie.
+                self._pinned = None
+                note = "API-key account: not held (no quota to measure)"
+        departure = _reserve_departure_note(
+            (result.get("from") or {}).get("number"), reserve_accounts(self.settings)
+        )
+        if departure:
+            note = f"{note} · {departure}" if note else departure
+
         self._emit(
             SwitchEvent(
                 trigger=trigger,
                 from_ref=result.get("from"),
                 to_ref=result.get("to"),
                 warnings=result.get("warnings", []),
+                note=note,
             )
         )
         return TickOutcome.SWITCHED
@@ -2628,6 +3932,22 @@ class AutoSwitchEngine:
 
     def _emit(self, event: AutoSwitchEvent) -> None:
         self.on_event(event)
+        tick_events = self._tick_events  # fork: engine_control
+        if tick_events is not None:
+            tick_events.append(event)
+
+    def _finish_switch_request(self, outcome: TickOutcome) -> None:
+        """Fork (engine_control): stamp the tick and hand a consumed
+        request's outcome to its callback. Never raises into the loop."""
+        self.last_tick_at = self.clock()
+        on_result, events = self._tick_on_result, self._tick_events
+        self._tick_on_result = None
+        self._tick_events = None
+        if on_result is not None:
+            try:
+                on_result(outcome, list(events or ()))
+            except Exception as e:  # pragma: no cover - safety net
+                _logger.debug("switch-request callback failed: %r", e)
 
     # -- loop -------------------------------------------------------------------
 
@@ -2640,6 +3960,83 @@ class AutoSwitchEngine:
 
     def wake(self) -> None:
         """Cut the current inter-tick sleep short and tick now."""
+        self._wake.set()
+
+    def request_switch(
+        self, target: str | None = None, *, on_result: Callable | None = None
+    ) -> None:
+        """One-shot "switch now" request from the TUI, for THIS session only.
+
+        Sets a flag the NEXT tick consumes (and clears) before deciding, then
+        wakes the loop so that tick happens immediately. The tick then decides
+        with trigger ``"manual"``: the strategy's own ranking, without the
+        anti-flap margins or the cooldown. Nothing is persisted — a request
+        that a tick has already spent cannot fire twice, and a request made
+        while the engine is stopping simply dies with it.
+
+        ``target`` (the TUI's `m`, manual pick) names the account to take
+        instead of ranking: refused with a ``target-*``/``already-active``
+        reason if it is unavailable, quarantined, busy, or a landing `n`
+        itself would refuse (at/over the threshold outside the escape and
+        all-over states). A disabled slot is a valid target, as with ``cswap
+        switch``. After a live switch it is held (``pinned``) until the
+        threshold — unless it is an API-key account, which is never held. The
+        latest request wins: a ``target=None`` call clears a pending target.
+
+        Fork (engine_control): ``on_result(outcome, events)`` is called on the
+        engine thread at the end of THE tick that consumes this request, with
+        that tick's events; a request replaced before any tick consumed it
+        gets ``on_result(None, [])``."""
+        with self._switch_lock:
+            superseded = self._switch_on_result  # fork: engine_control
+            self._switch_on_result = on_result  # fork: engine_control
+            self._switch_target = None if target is None else str(target)
+            self._switch_now.set()
+        if superseded is not None:  # fork: engine_control
+            try:
+                superseded(None, [])
+            except Exception as e:  # pragma: no cover - safety net
+                _logger.debug("switch-request callback failed: %r", e)
+        self._wake.set()
+
+    def withdraw_switch(self, on_result: Callable) -> bool:
+        """Fork (engine_control): cancel a request no tick has consumed yet,
+        if it is still the one carrying ``on_result``. True = withdrawn (it
+        will never run); False = already consumed or replaced."""
+        with self._switch_lock:
+            if self._switch_on_result is not on_result or not self._switch_now.is_set():
+                return False
+            self._switch_now.clear()
+            self._switch_target = None
+            self._switch_on_result = None
+        return True
+
+    def apply_strategy(self, strategy: str) -> None:
+        """Fork (engine_control): retarget the strategy mid-run, for the
+        `cswap auto` host (the TUI rebuilds instead, like its `s`). Same
+        atomic frozen-settings swap as ``apply_threshold``; nothing else in
+        the engine derives state from the strategy at construction. Wakes
+        the loop so the next decision uses it now."""
+        self.settings = replace(self.settings, strategy=strategy)
+        self._wake.set()
+
+    @property
+    def pinned(self) -> str | None:
+        """The manual pick being held below the threshold, or None.
+
+        Session-only; pass it as ``pinned=`` to a rebuilt engine to carry it
+        over (the TUI's `s`/`l` restarts)."""
+        return self._pinned
+
+    def request_warm(self) -> None:
+        """One-shot "ping/warm now" request from the TUI's `p`.
+
+        The next tick hellos EVERY cold eligible account immediately — the
+        stagger is ignored on purpose, because the point of the keypress is
+        to get the missing reset stamps on screen now. Warmup does not have
+        to be enabled in settings for this: an explicit request is its own
+        authorization, the same way `n` switches below the threshold."""
+        self._warm_now.set()
         self._wake.set()
 
     def apply_threshold(self, threshold: float) -> None:
@@ -2657,6 +4054,19 @@ class AutoSwitchEngine:
         )
 
     def _next_delay(self, outcome: TickOutcome) -> float:
+        """The cadence delay, then clamped to any pending warmup deadline.
+
+        A staggered hello is due at a specific instant, and a 5-hour stamp
+        lapses at one — both are useless if the loop is asleep past them,
+        and the BLOCKED/idle branches below can sleep for tens of minutes.
+        The clamp only ever SHORTENS, and never below a second (a zero sleep
+        would spin the loop)."""
+        delay = self._cadence_delay(outcome)
+        if self._warm_deadline_ts is None:
+            return delay
+        return min(delay, max(self._warm_deadline_ts - self.clock(), 1.0))
+
+    def _cadence_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds
         if outcome is TickOutcome.BLOCKED:
             if self._sleep_until_ts is not None:

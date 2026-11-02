@@ -26,6 +26,8 @@ from claude_swap.autoswitch import (
     SwitchEvent,
     TickOutcome,
     UnquarantineEvent,
+    WarmupEvent,
+    consume_first_key,
     pct_label,
 )
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
@@ -2948,6 +2950,20 @@ def _usage7(pct5: float, pct7: float, reset7: str | None = None) -> dict:
     return {"five_hour": {"pct": pct5}, "seven_day": seven}
 
 
+def _usage75(
+    pct5: float, pct7: float, reset7: str | None = None, reset5: str | None = None
+) -> dict:
+    """Like ``_usage7`` but with an explicit 5-hour reset too, for the
+    5-hour-breaks-a-weekly-tie ranking axis."""
+    seven: dict = {"pct": pct7}
+    if reset7:
+        seven["resets_at"] = reset7
+    five: dict = {"pct": pct5}
+    if reset5:
+        five["resets_at"] = reset5
+    return {"five_hour": five, "seven_day": seven}
+
+
 class TestConsumeFirstStrategy:
     def _harness(self, temp_home: Path) -> EngineHarness:
         h = EngineHarness(temp_home, strategy="consume-first")
@@ -2994,6 +3010,26 @@ class TestConsumeFirstStrategy:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
+    def test_hot_tier_steers_proactive_switch(self, temp_home):
+        """The hot tier is not consume-first-trigger bookkeeping: the same key
+        runs on the `proactive` trigger (active AT/OVER the threshold under
+        strategy consume-first), where every healthy account qualifies and the
+        sort alone decides. Same shape as
+        `test_over_threshold_prefers_soonest_reset_over_max_headroom` — #2
+        resets soonest and wins #313's chain outright — except #2's 5-hour
+        window now sits at 82 (bar 90 - 10 = 80), so the cool #3 takes it."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 20, _R_LATER),   # active over threshold: must move
+            "2": _usage7(82, 40, _R_SOON),    # soonest weekly, but 5h-hot
+            "3": _usage7(10, 10, _R_LATEST),  # cool, resets latest
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3, (
+            "a 5h-hot candidate must rank behind every cool one on the "
+            "proactive trigger too, not just on consume-first"
+        )
+
     def test_a_consume_first_target_must_still_be_healthy(self, temp_home):
         """The threshold landing gate has no cover on the consume-first path.
 
@@ -3028,6 +3064,216 @@ class TestConsumeFirstStrategy:
             "its weekly window resets sooner — it re-triggers next tick"
         )
         assert h.active_number() == 1
+    def test_at_limit_escape_ranks_by_headroom_not_reset(self, temp_home):
+        """#305: `consume_first` is the STRATEGY flag, not the trigger, and
+        the ranking key checked only the flag. Under strategy=consume-first,
+        an at-limit escape (active hard blocked) landed on whichever
+        candidate's WEEKLY window reset soonest — which is, by definition,
+        the most-consumed candidate — instead of the one that can actually
+        do work. #2 resets soonest but has almost no headroom left; #3 has
+        far more headroom but resets later. The escape must take #3."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage(
+            {
+                "1": _usage7(100, 100, _R_LATEST),  # active, hard at its limit
+                "2": _usage7(30, 95, _R_SOON),  # resets soonest, barely any room
+                "3": _usage7(20, 20, _R_LATER),  # more headroom, resets later
+            }
+        )
+        assert outcome is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit"
+        assert h.active_number() == 3, (
+            "at-limit must escape to the most headroom, not the soonest reset"
+        )
+
+    def test_weekly_tie_breaks_on_soonest_five_hour_reset(self, temp_home):
+        """The user-requested tiebreak chain: 7-day first, then 5-hour. #2
+        and #3 share the same weekly reset; #2's 5-hour window rolls over
+        first, so it is drained first — even though #2 has LESS headroom
+        than #3, so a headroom-only tiebreak (the pre-fix behavior) would
+        have picked #3 instead."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage(
+            {
+                "1": _usage75(20, 20, _R_LATEST),
+                "2": _usage75(10, 30, _R_SOON, reset5=_R_SOON),  # less headroom
+                "3": _usage75(10, 10, _R_SOON, reset5=_R_LATER),  # more headroom
+            }
+        )
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_full_tie_breaks_on_most_used(self, temp_home):
+        """Last link in the chain: when both resets tie, the MORE-used
+        account wins — the opposite of `best`'s own headroom-maximizing tie
+        rule — so a quota that is closer to expiring gets finished off
+        instead of leaving it half-drained next to a fresher peer."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage(
+            {
+                "1": _usage75(20, 20, _R_LATEST),
+                "2": _usage75(10, 80, _R_SOON, reset5=_R_SOON),  # more used
+                "3": _usage75(10, 30, _R_SOON, reset5=_R_SOON),  # more headroom
+            }
+        )
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2, (
+            "an equally-soon tie must favor the more-used account"
+        )
+
+    def test_hot_five_hour_candidate_ranks_after_cool_ones(self, temp_home):
+        """The 5h-hot demotion: consume-first exists to spend perishable
+        WEEKLY quota, so a candidate whose 5-hour window already sits within
+        the hysteresis margin of the threshold (defaults 90 - 10 = 80,
+        boundary INCLUSIVE) is a last-resort landing — it buys minutes of
+        work before the next trigger fires. #2 resets soonest and would win
+        #313's chain outright; the cool #3 must take it instead.
+        """
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATEST),  # active, resets last
+            "2": _usage7(80, 10, _R_SOON),    # soonest weekly, 5h AT the bar
+            "3": _usage7(10, 10, _R_LATER),   # cool, resets later
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3, (
+            "a 5h-hot candidate must rank behind every cool one, even when "
+            "its weekly window resets sooner"
+        )
+
+    def test_hot_candidate_is_demoted_not_excluded(self, temp_home):
+        """Demotion, not exclusion — the whole point of using the margin
+        instead of a hard filter. With no cool peer, the hot account is
+        still a valid consume-first target."""
+        h = self._harness(temp_home)
+        ranked, any_known, _ = h.engine._rank_candidates(
+            trigger="consume-first",
+            consume_first=True,
+            oauth_candidates=["2"],
+            no_return=None,
+            usage={
+                "1": _usage7(20, 20, _R_LATEST),
+                "2": _usage7(80, 10, _R_SOON),  # hot, and the only candidate
+            },
+            headroom={"1": 80.0, "2": 20.0},
+            current="1",
+            active_headroom=80.0,
+            settings=h.settings,
+            now=h.clock.now,
+        )
+        assert ranked == ["2"]
+        assert any_known is True
+
+    def test_hot_guard_ignored_on_at_limit_and_failover(self, temp_home):
+        """Escapes rank by headroom (#305) and the hot tier is scoped with
+        them: at-limit and failover need the account that can WORK, not the
+        one with the coolest 5-hour window.
+
+        The HOT candidate is deliberately the headroom WINNER here, so the
+        two orders DISAGREE and only the escape's `(-h,)` key can produce
+        this answer: the hot account has 18 pts left and the cool one 15, so
+        a hot tier leaking into an escape would land it on the cooler but
+        emptier account. Confirmed to fail if the `trigger in ("proactive",
+        "consume-first")` scoping is dropped from the consume-first key
+        branch."""
+        h = self._harness(temp_home)
+        at_limit = {
+            "1": _usage7(100, 100, _R_LATEST),  # active hard at its limit
+            "2": _usage7(82, 10, _R_SOON),      # hot, 18 pts: MOST headroom
+            "3": _usage7(10, 85, _R_LATER),     # cool, 15 pts: less headroom
+        }
+        outcome = h.tick_with_usage(at_limit)
+        assert outcome is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit"
+        assert h.active_number() == 2, (
+            "at-limit must take the most headroom (the hot #2), not the "
+            "cooler but emptier #3"
+        )
+
+        # Failover: same candidate shapes, the (now #2) active row
+        # unreadable. The escape still ranks by headroom, unaffected by the
+        # hot tier.
+        h.events.clear()
+        h.clock.advance(h.settings.cooldown_seconds + 1)
+        failover = {
+            "2": None,                          # active, auth likely dead
+            "1": _usage7(82, 10, _R_SOON),      # hot, 18 pts: MOST headroom
+            "3": _usage7(10, 85, _R_LATER),     # cool, 15 pts: less headroom
+        }
+        for _ in range(h.settings.unhealthy_ticks - 1):
+            assert h.tick_with_usage(failover) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage(failover) is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "failover"
+        assert h.active_number() == 1
+
+    def test_hot_guard_uses_hysteresis_margin(self, temp_home):
+        """The bar is ``threshold - hysteresisPct``, so the margin moves it.
+        A 5-hour window at 70% is cool at the defaults (bar 80) and hot once
+        the margin widens to 25 (bar 65) — same usage, opposite ranking."""
+        h = self._harness(temp_home)
+        args = dict(
+            trigger="consume-first",
+            consume_first=True,
+            oauth_candidates=["2", "3"],
+            no_return=None,
+            usage={
+                "1": _usage7(20, 20, _R_LATEST),
+                "2": _usage7(70, 10, _R_SOON),   # 5h at 70
+                "3": _usage7(10, 10, _R_LATER),  # always cool
+            },
+            headroom={"1": 80.0, "2": 30.0, "3": 90.0},
+            current="1",
+            active_headroom=80.0,
+            now=h.clock.now,
+        )
+        wide, _, _ = h.engine._rank_candidates(
+            settings=replace(h.settings, hysteresis_pct=25.0), **args
+        )
+        assert wide == ["3", "2"], "bar 65: #2 is hot and must be demoted"
+        narrow, _, _ = h.engine._rank_candidates(
+            settings=replace(h.settings, hysteresis_pct=10.0), **args
+        )
+        assert narrow == ["2", "3"], (
+            "bar 80: #2 is cool, so #313's soonest-weekly-reset order stands"
+        )
+
+    def test_consume_first_key_tiers_and_unknowns(self):
+        """The extracted key itself (module-level so the TUI's "Next best"
+        panel can rank identically, which makes its contract worth its own
+        test): hot tier first, unknown resets last inside a tier, unknown
+        5-hour pct == cool, least headroom breaks a full tie.
+
+        ``headroom`` is an independent input to the key, not derived from the
+        usage dict, so the explicit values below are picked to exercise the
+        tie axis rather than to mirror the fixture pcts."""
+        now = 1_000_000.0
+        kw = dict(threshold=90.0, hysteresis_pct=10.0, now=now)
+        cool = consume_first_key(_usage75(79, 10, _R_SOON, _R_SOON), 90.0, **kw)
+        boundary = consume_first_key(_usage75(80, 10, _R_SOON, _R_SOON), 90.0, **kw)
+        assert cool[0] == 0
+        assert boundary[0] == 1, "the bar is inclusive: 80 >= 90 - 10 is hot"
+        assert cool < boundary, "every cool candidate outranks every hot one"
+
+        # Unknown/past resets sort last within the tier; unknown 5h pct and
+        # unreadable usage are cool, never punished.
+        unknown = consume_first_key(_usage7(10, 10, _R_PAST), 50.0, **kw)
+        assert unknown == (0, float("inf"), float("inf"), 50.0)
+        assert consume_first_key({"seven_day": {"pct": 10.0}}, 50.0, **kw)[0] == 0
+        assert consume_first_key(None, None, **kw) == (
+            0, float("inf"), float("inf"), float("inf")
+        )
+
+        # Inside a tier: soonest weekly, then soonest 5-hour, then most-used.
+        soon = consume_first_key(_usage75(10, 10, _R_SOON, _R_LATER), 90.0, **kw)
+        later = consume_first_key(_usage75(10, 10, _R_LATER, _R_SOON), 90.0, **kw)
+        assert soon < later
+        five_soon = consume_first_key(_usage75(10, 10, _R_SOON, _R_SOON), 90.0, **kw)
+        assert five_soon < soon
+        used = consume_first_key(_usage75(10, 10, _R_SOON, _R_SOON), 20.0, **kw)
+        assert used < five_soon, "the more-used account wins a full tie"
 
     def test_respects_cooldown(self, temp_home):
         h = self._harness(temp_home)  # default cooldown 300s
@@ -3677,11 +3923,12 @@ class TestEveryAccountAboveThreshold:
         assert sw.trigger == "failover"
         assert h.active_number() == 3
 
-    def test_a_failover_with_a_healthy_candidate_keeps_its_strategy(
+    def test_a_failover_with_a_healthy_candidate_ranks_by_room(
         self, temp_home
     ):
-        """One candidate below the line keeps consume-first's own ordering,
-        as before: the weekly-soonest account wins."""
+        """Fork (#305, 0a000f3): upstream keeps consume-first's weekly order
+        for a failover with a healthy candidate; the fork scopes that key to
+        the proactive triggers, so every escape lands on the most room."""
         h = self._fleet(temp_home, 3, strategy="consume-first")
         outcome = None
         for _ in range(3):
@@ -3692,6 +3939,32 @@ class TestEveryAccountAboveThreshold:
             })
             h.clock.advance(60.0)
         assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_a_failover_with_a_healthy_candidate_ranks_by_line_headroom(
+        self, temp_home
+    ):
+        """...and "room" there is LINE headroom, not the all-above key's raw
+        room: with a healthy peer the all-above path must not engage. Lines
+        90/97: #2 at 7d 93% has raw room 7 but line headroom 10 + 90*4/97 ~
+        13.7; #3 at 5h 88% has raw room 12 and line headroom 12. Line headroom
+        picks #2; raw room (or consume-first's weekly key, #3 resets soonest)
+        would pick #3."""
+        h = self._fleet(
+            temp_home, 3, strategy="consume-first",
+            threshold=90, weekly_threshold=97,
+        )
+        outcome = None
+        for _ in range(3):
+            outcome = h.tick_with_usage({
+                "1": None,
+                "2": _usage7(10, 93, _R_LATEST),
+                "3": _usage7(88, 10, _R_SOON),
+            })
+            h.clock.advance(60.0)
+        assert outcome is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "failover"
         assert h.active_number() == 2
 
     def test_a_single_healthy_peer_still_wins_normally(self, harness):
@@ -7200,3 +7473,1726 @@ class TestWeeklyThreshold:
         h.engine.apply_threshold(72.0)
         assert h.switcher._poll_inputs_override == (72.0, 97.0, ())
         assert h.engine.settings.weekly_threshold == 97.0
+
+
+class TestManualSwitch:
+    """`request_switch()` — the TUI's `n` ("switch now").
+
+    The contract in one line: the STRATEGY's ranking, none of the ANTI-FLAP
+    margins, and still the landing-health gate. Each test below pins one leg
+    of that, plus the two properties that keep a keypress from becoming a
+    standing order: it is consumed by exactly one tick, and the switch it
+    performs is recorded like any other (so the ordinary cooldown protects
+    the landing).
+    """
+
+    def _cf_harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_best_ignores_hysteresis_and_takes_the_most_headroom(self, harness):
+        """Under `best`, well below the threshold and with no candidate
+        clearing the hysteresis margin, a normal tick does nothing — the
+        engine never even reaches candidate selection. The same tick after
+        `request_switch()` moves to the most-headroom account, 5 points
+        better than the active one against a 10-point margin."""
+        usage = {"1": _usage7(30, 30), "2": _usage7(25, 25), "3": _usage7(60, 60)}
+
+        assert harness.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert [
+            e.reason for e in harness.events if isinstance(e, NoSwitchEvent)
+        ] == ["below-threshold"]
+        assert harness.active_number() == 1
+        harness.events.clear()
+
+        harness.engine.request_switch()
+        assert harness.tick_with_usage(usage) is TickOutcome.SWITCHED
+        sw = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "manual"
+        assert harness.active_number() == 2
+
+    def test_wakes_the_loop_so_the_request_is_not_left_sleeping(self, harness):
+        """`n` must tick NOW, not at the next poll: a request that only set
+        its own flag would sit unnoticed for up to `interval_seconds`."""
+        assert not harness.engine._wake.is_set()
+        harness.engine.request_switch()
+        assert harness.engine._switch_now.is_set()
+        assert harness.engine._wake.is_set()
+
+    def test_consume_first_ignores_strictly_sooner_and_cooldown(self, temp_home):
+        """The active account's own weekly window resets soonest, so the
+        strictly-sooner gate refuses every candidate and the strategy is
+        correctly idle; the engine is also inside its cooldown. `n` overrides
+        both and takes the soonest-resetting of the OTHERS."""
+        h = self._cf_harness(temp_home)
+        usage = {
+            "1": _usage7(20, 20, _R_SOON),    # active: nothing resets sooner
+            "2": _usage7(10, 10, _R_LATER),   # soonest among the candidates
+            "3": _usage7(10, 10, _R_LATEST),
+        }
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
+            "already-consuming-soonest"
+        ]
+        h.events.clear()
+        h.engine._mutate_state(
+            lambda st: st.__setitem__("lastSwitchAt", h.clock.now)
+        )
+
+        h.engine.request_switch()
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert "cooldown" not in [
+            e.reason for e in h.events if isinstance(e, NoSwitchEvent)
+        ]
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "manual"
+        assert h.active_number() == 2
+
+    def test_consume_first_keeps_the_five_hour_hot_tier(self, temp_home):
+        """Margins are waived; the strategy's own KEY is not. #2 resets
+        sooner but its 5-hour window sits at 82 (bar: threshold 90 -
+        hysteresis 10), so the cool #3 wins — the same order the "Next best"
+        panel renders."""
+        h = self._cf_harness(temp_home)
+        h.engine.request_switch()
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_SOON),
+            "2": _usage7(82, 10, _R_LATER),   # soonest weekly, but 5h-hot
+            "3": _usage7(10, 10, _R_LATEST),  # cool, resets latest
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_never_lands_on_an_unhealthy_candidate(self, temp_home):
+        """The landing-health gate is NOT one of the waived margins: an
+        account at/over the threshold would re-trigger on the very next tick,
+        so `n` would buy a switch and an immediate switch back. The only
+        candidate is at 96% against a 95% threshold, so the request is spent
+        on a tick that goes nowhere."""
+        h = EngineHarness(temp_home, threshold=95.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        h.engine.request_switch()
+        outcome = h.tick_with_usage({"1": _usage7(30, 30), "2": _usage7(96, 96)})
+
+        assert outcome is not TickOutcome.SWITCHED
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+        assert h.active_number() == 1
+        assert "no-qualifying-candidate" in [
+            e.reason for e in h.events if isinstance(e, NoSwitchEvent)
+        ]
+        assert not h.engine._switch_now.is_set()  # consumed even when refused
+
+    def test_consumed_by_one_tick_and_the_landing_is_protected(self, harness):
+        """A keypress is a one-shot, not a mode. The tick after a manual
+        switch is an ordinary poll: no second SwitchEvent, `leftTrigger` is
+        recorded as `manual`, and the normal cooldown — which the manual tick
+        itself ignored — now refuses the proactive flap back."""
+        harness.engine.request_switch()
+        assert harness.tick_with_usage({
+            "1": _usage7(30, 30), "2": _usage7(25, 25), "3": _usage7(60, 60),
+        }) is TickOutcome.SWITCHED
+        assert harness.state()["leftTrigger"] == "manual"
+        assert not harness.engine._switch_now.is_set()
+        harness.events.clear()
+
+        # Account 2 is now active and over the threshold: without the record
+        # above this tick would be a proactive switch back to 1.
+        outcome = harness.tick_with_usage({
+            "1": _usage7(30, 30), "2": _usage7(95, 95), "3": _usage7(60, 60),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+        assert [
+            e.reason for e in harness.events if isinstance(e, NoSwitchEvent)
+        ] == ["cooldown"]
+
+    def test_unreadable_active_makes_manual_an_escape(self, temp_home):
+        """With the ACTIVE unreadable there is no "re-triggers next tick" to
+        protect against — the number that would re-trigger is the one we
+        cannot read — so the landing-health gate must not apply. It cannot be
+        rescued by `all_above` either (`_every_account_above_threshold` is
+        False on a None active), so without the exception `n` reports
+        no-qualifying-candidate on a fleet `failover` escapes to happily."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        h.engine.request_switch()
+        outcome = h.tick_with_usage({"1": None, "2": _usage7(92, 92)})
+
+        assert outcome is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "manual"
+        assert h.active_number() == 2
+
+    def test_an_unmeasured_manual_departure_is_not_undone(self, temp_home):
+        """A manual switch off an UNREADABLE active records (None, None) —
+        the same shape a failover writes, because the same thing is true:
+        nothing was measurable. The no-return bar must therefore read it with
+        the failover legs. Read with the ordinary ones, `was = inf` and any
+        finite peer reset releases the bar on no evidence, so the first
+        proactive tick after the cooldown undoes the user's own switch.
+
+        Constructed so the ranking genuinely WANTS the account we left (the
+        all_above headroom ratio, 9 >= 4x2) and so the failover legs both
+        say no (the peer is itself over the threshold, and its reset is far
+        past the horizon rather than sooner than the active's) — the second
+        half proves the bar is what held it, by popping the record and
+        watching the same tick switch."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        h.engine.request_switch()
+        assert h.tick_with_usage(
+            {"1": None, "2": _usage7(92, 92)}
+        ) is TickOutcome.SWITCHED
+        assert h.state()["leftTrigger"] == "manual"
+        assert h.state()["leftHeadroom"] is None
+        assert h.state()["leftRecoveryAt"] is None
+        h.clock.advance(h.settings.cooldown_seconds + 1)
+        h.events.clear()
+
+        # Both over the threshold (all_above); #1 holds 9 points against the
+        # active's 4, which clears the horizon ratio. Its BINDING window is
+        # the weekly one (5h sits at 10), so it has a real, finite reset for
+        # the ordinary legs to mistake for recovery — and that reset is
+        # decades out, so the failover legs correctly see none.
+        later = {"1": _usage7(10, 91, _R_SOON), "2": _usage7(96, 96)}
+        outcome = h.tick_with_usage(later)
+        assert outcome is not TickOutcome.SWITCHED
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+        assert h.active_number() == 2
+
+        # ...and the ranking really did want it: without the record there is
+        # nothing to bar, and the identical tick moves.
+        h.engine._mutate_state(lambda st: st.pop("lastSwitchFrom", None))
+        h.events.clear()
+        assert h.tick_with_usage(later) is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_all_above_manual_takes_the_soonest_recovery(self, temp_home):
+        """With the whole fleet at/over the threshold the strategy question
+        is moot and both strategies rank by binding-window recovery. Manual
+        keeps that axis and drops only its hysteresis: here BOTH candidates
+        recover LATER than the active, so a proactive tick refuses them
+        outright, and `n` takes the sooner of the two."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        usage = {
+            "1": _usage75(95, 10, _R_LATEST, reset5=_iso_at(now + 600)),
+            "2": _usage75(95, 10, _R_LATEST, reset5=_iso_at(now + 3600)),
+            "3": _usage75(95, 10, _R_LATEST, reset5=_iso_at(now + 7200)),
+        }
+
+        assert h.tick_with_usage(usage) is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        h.events.clear()
+
+        h.engine.request_switch()
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "manual"
+        assert h.active_number() == 2
+
+    def test_consume_first_manual_says_why_an_api_key_fleet_is_untakeable(
+        self, temp_home
+    ):
+        """The API-key last resort is closed to manual-under-consume-first
+        (an API-key account has no weekly window to consume, whoever asked),
+        so with no OAuth peer at all there is nothing to take. That is not
+        `no-comparison` — the fleet is not unreadable, it is unsuitable — and
+        saying so is the difference between "cswap is thinking" and "`n` is
+        broken"."""
+        h = EngineHarness(
+            temp_home, strategy="consume-first", include_api_key_accounts=True
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("a@example.com", 1)
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["2"]["kind"] = "api_key"
+        h.switcher._write_json(h.switcher.sequence_file, data)
+
+        h.engine.request_switch()
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATEST), "2": "api key",
+        })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
+            "no-oauth-candidate"
+        ]
+
+    def test_refusal_detail_never_blames_a_margin_manual_waived(self, harness):
+        """`manual` waives the hysteresis margin, so naming it in the refusal
+        would send the user hunting for a setting that had nothing to do with
+        the outcome."""
+        harness.engine.request_switch()
+        harness.tick_with_usage({
+            "1": _usage7(30, 30), "2": _usage7(96, 96), "3": _usage7(97, 97),
+        })
+        refusal = next(
+            e
+            for e in harness.events
+            if isinstance(e, NoSwitchEvent) and e.reason == "no-qualifying-candidate"
+        )
+        assert "hysteresis" not in refusal.detail
+        assert "below the threshold" in refusal.detail
+
+    def test_dry_run_manual_is_a_preview(self, temp_home):
+        """`n` in DRY-RUN reports the move it would make and writes nothing —
+        the same contract every other trigger has there."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        h.engine = h._make_engine(dry_run=True)
+
+        h.engine.request_switch()
+        with patch.object(h.switcher, "switch_to") as mock_switch:
+            outcome = h.tick_with_usage({"1": _usage7(30, 30), "2": _usage7(25, 25)})
+
+        assert outcome is TickOutcome.SWITCHED
+        mock_switch.assert_not_called()
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.dry_run is True and sw.trigger == "manual"
+        assert h.active_number() == 1
+        assert h.state() == {}
+
+
+class TestManualPick:
+    """`request_switch(target=...)` — the TUI's `m` ("manual pick").
+
+    The contract: the candidate list is exactly the target (no strategy, no
+    anti-flap gate), refused only for a stated reason; one-shot like `n`; and
+    after a live switch the engine holds the pick until the threshold.
+    """
+
+    def _cf(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="consume-first", **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _reasons(self, h: EngineHarness) -> list[str]:
+        return [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+
+    # Under consume-first: #2 resets soonest (the nudge target), #3 latest.
+    _CF_USAGE = {
+        "1": _usage7(20, 20, _R_LATER),
+        "2": _usage7(10, 10, _R_SOON),
+        "3": _usage7(10, 10, _R_LATEST),
+    }
+
+    def _pin_on_3(self, h: EngineHarness) -> None:
+        h.engine.request_switch(target="3")
+        assert h.tick_with_usage(self._CF_USAGE) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        assert h.engine.pinned == "3"
+        h.clock.advance(h.settings.cooldown_seconds + 1)
+        h.events.clear()
+
+    def test_takes_the_target_even_when_not_the_strategys_pick(self, harness):
+        """`n` would take #2 (most headroom); `m` names #3 and gets #3."""
+        harness.engine.request_switch(target="3")
+        outcome = harness.tick_with_usage({
+            "1": _usage7(30, 30), "2": _usage7(25, 25), "3": _usage7(60, 60),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        sw = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "manual"
+        assert harness.active_number() == 3
+        assert harness.state()["leftTrigger"] == "manual"
+
+    def test_ignores_cooldown_and_consume_first_ordering(self, temp_home):
+        h = self._cf(temp_home)
+        h.engine._mutate_state(lambda st: st.__setitem__("lastSwitchAt", h.clock.now))
+        h.engine.request_switch(target="3")
+        assert h.tick_with_usage(self._CF_USAGE) is TickOutcome.SWITCHED
+        assert "cooldown" not in self._reasons(h)
+        assert h.active_number() == 3
+
+    def test_refuses_the_active_account(self, harness):
+        harness.engine.request_switch(target="1")
+        outcome = harness.tick_with_usage({
+            "1": _usage7(30, 30), "2": _usage7(25, 25), "3": _usage7(60, 60),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert self._reasons(harness) == ["already-active"]
+        assert harness.active_number() == 1
+
+    def test_refuses_an_unknown_slot(self, harness):
+        harness.engine.request_switch(target="9")
+        assert harness.tick_with_usage({"1": _usage7(30, 30)}) is TickOutcome.NO_ACTION
+        assert self._reasons(harness) == ["target-unavailable"]
+        assert harness.active_number() == 1
+
+    def _disable(self, h: EngineHarness, num: str) -> None:
+        data = h.switcher._get_sequence_data()
+        data["accounts"][num]["disabled"] = True
+        h.switcher._write_json(h.switcher.sequence_file, data)
+
+    def test_takes_a_disabled_slot(self, harness):
+        """Like `cswap switch`, a pick may name a disabled slot; it joins
+        the phase-2 refetch, so the landing check reads it fresh."""
+        self._disable(harness, "3")
+        assert "3" not in harness.switcher.switchable_account_numbers()
+        usage = {"1": _usage7(30, 30), "2": _usage7(25, 25), "3": _usage7(10, 10)}
+        now = harness.clock.now
+        fetches: list[set] = []
+
+        def entries(fetch=None, **_kw):
+            fetches.append(set(fetch or ()))
+            return {n: _entry_for(v, now) for n, v in usage.items()}
+
+        harness.engine.request_switch(target="3")
+        with patch.object(
+            harness.switcher, "usage_entries_by_account", side_effect=entries
+        ):
+            outcome = harness.engine.tick()
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 3
+        assert harness.engine.pinned == "3"
+        assert any("3" in f for f in fetches)
+        # Still disabled: the pick does not put it back in rotation.
+        assert "3" not in harness.switcher.switchable_account_numbers()
+
+    def test_a_disabled_target_still_gets_the_landing_check(self, harness):
+        self._disable(harness, "3")
+        harness.engine.request_switch(target="3")
+        outcome = harness.tick_with_usage({
+            "1": _usage7(30, 30), "2": _usage7(25, 25), "3": _usage7(95, 95),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert self._reasons(harness) == ["target-over-threshold"]
+        assert harness.active_number() == 1
+
+    def test_a_disabled_quarantined_target_is_still_quarantined(self, harness):
+        self._disable(harness, "3")
+        harness.engine._quarantine("3", "c@example.com", "invalid_grant")
+        harness.events.clear()
+        harness.engine.request_switch(target="3")
+        harness.tick_with_usage({
+            "1": _usage7(30, 30), "2": _usage7(25, 25), "3": _usage7(10, 10),
+        })
+        assert self._reasons(harness) == ["target-quarantined"]
+        assert harness.active_number() == 1
+
+    def test_refuses_a_disabled_slot_without_a_stored_login(self, harness):
+        """Disabled is allowed; unusable is not. A managed, disabled record
+        with no stored credentials stays `target-unavailable`."""
+        data = harness.switcher._get_sequence_data()
+        data["accounts"]["4"] = {"email": "d@example.com", "disabled": True}
+        data["sequence"].append(4)
+        harness.switcher._write_json(harness.switcher.sequence_file, data)
+        harness.engine.request_switch(target="4")
+        outcome = harness.tick_with_usage({
+            "1": _usage7(30, 30), "2": _usage7(25, 25), "4": _usage7(10, 10),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert self._reasons(harness) == ["target-unavailable"]
+        assert harness.active_number() == 1
+
+    def test_a_disabled_active_holds_then_leaves_for_rotation(self, temp_home):
+        """After `m` onto a disabled slot the engine holds it like any pick,
+        then escapes at the threshold to a SWITCHABLE account and never
+        ranks the disabled one again."""
+        h = self._cf(temp_home)
+        self._disable(h, "3")
+        self._pin_on_3(h)
+        assert h.tick_with_usage(self._CF_USAGE) is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["pinned"]
+        h.events.clear()
+        hot = {**self._CF_USAGE, "3": _usage7(95, 95, _R_LATEST)}
+        assert h.tick_with_usage(hot) is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
+        assert h.active_number() in (1, 2)
+        assert h.engine.pinned is None
+        # Back in rotation: #3 (now cool again) is never a candidate.
+        h.clock.advance(h.settings.cooldown_seconds + 1)
+        h.events.clear()
+        h.engine.request_switch()
+        cool3 = {
+            "1": _usage7(80, 80, _R_LATER), "2": _usage7(85, 85, _R_SOON),
+            "3": _usage7(1, 1, _R_SOON),
+        }
+        h.tick_with_usage(cool3)
+        assert h.active_number() in (1, 2)
+
+    def test_a_disabled_active_with_unreadable_usage_fails_over(self, temp_home):
+        h = self._cf(temp_home)
+        self._disable(h, "3")
+        self._pin_on_3(h)
+        dead = {**self._CF_USAGE, "3": None}
+        outcomes = [
+            h.tick_with_usage(dead) for _ in range(h.settings.unhealthy_ticks)
+        ]
+        assert outcomes[-1] is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "failover"
+        assert h.active_number() in (1, 2)
+
+    def test_refuses_a_quarantined_target(self, harness):
+        harness.engine._quarantine("3", "c@example.com", "invalid_grant")
+        harness.events.clear()
+        harness.engine.request_switch(target="3")
+        outcome = harness.tick_with_usage({
+            "1": _usage7(30, 30), "2": _usage7(25, 25), "3": _usage7(10, 10),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert self._reasons(harness) == ["target-quarantined"]
+        assert harness.active_number() == 1
+
+    def _api_key_slot(self, h: EngineHarness, num: str) -> None:
+        data = h.switcher._get_sequence_data()
+        data["accounts"][num]["kind"] = "api_key"
+        h.switcher._write_json(h.switcher.sequence_file, data)
+
+    def test_refuses_an_api_key_target_unless_included(self, harness):
+        self._api_key_slot(harness, "3")
+        harness.engine.request_switch(target="3")
+        outcome = harness.tick_with_usage({
+            "1": _usage7(30, 30), "2": _usage7(25, 25), "3": "api key",
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        refusal = next(e for e in harness.events if isinstance(e, NoSwitchEvent))
+        assert refusal.reason == "target-unavailable"
+        assert "API-key" in refusal.detail
+        assert harness.active_number() == 1
+
+    def test_takes_an_included_api_key_target_even_under_consume_first(
+        self, temp_home
+    ):
+        h = self._cf(temp_home, include_api_key_accounts=True)
+        self._api_key_slot(h, "3")
+        h.engine.request_switch(target="3")
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER), "2": _usage7(10, 10, _R_SOON),
+            "3": "api key",
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_an_api_key_target_is_switched_to_but_never_pinned(self, temp_home):
+        """No measurable headroom: the engine would fail over off it after
+        the unhealthy ticks, so holding it would make the summary lie."""
+        h = self._cf(temp_home, include_api_key_accounts=True)
+        self._api_key_slot(h, "3")
+        h.engine.request_switch(target="3")
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER), "2": _usage7(10, 10, _R_SOON),
+            "3": "api key",
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        assert h.engine.pinned is None
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert "not held" in sw.note and "not held" in sw.human()
+        assert sw.to_json()["note"] == sw.note
+
+    def test_an_oauth_pick_carries_no_note(self, harness):
+        harness.engine.request_switch(target="3")
+        harness.tick_with_usage({
+            "1": _usage7(30, 30), "2": _usage7(25, 25), "3": _usage7(60, 60),
+        })
+        sw = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert sw.note == "" and "·" not in sw.human()
+        assert "note" not in sw.to_json()
+        assert harness.engine.pinned == "3"
+
+    @pytest.mark.parametrize(
+        "status, cause",
+        [
+            ("skip-live-session", "live cswap run session"),
+            ("warmup-in-flight", "press m again"),
+        ],
+    )
+    def test_a_busy_target_names_the_cause(self, harness, status, cause):
+        harness.engine.request_switch(target="3")
+        with patch.object(
+            harness.engine, "_freshen_target", return_value=status
+        ) as fresh, patch.object(harness.switcher, "switch_to") as mock_switch:
+            outcome = harness.tick_with_usage({
+                "1": _usage7(30, 30), "2": _usage7(25, 25), "3": _usage7(60, 60),
+            })
+        assert outcome is TickOutcome.NO_ACTION
+        assert [c.args[0] for c in fresh.call_args_list] == ["3"]
+        mock_switch.assert_not_called()
+        busy = [e for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert [e.reason for e in busy] == ["target-busy"]
+        assert "Account-3" in busy[0].detail and cause in busy[0].detail
+
+    @pytest.mark.parametrize("status", ["transient", "invalid_grant"])
+    def test_a_target_that_cannot_freshen_never_slides_to_another(
+        self, harness, status
+    ):
+        """The pick is the whole candidate list: a failed freshen ends the
+        tick, it never falls through to the strategy's next account."""
+        harness.engine.request_switch(target="3")
+        with patch.object(
+            harness.engine, "_freshen_target", return_value=status
+        ) as fresh, patch.object(harness.switcher, "switch_to") as mock_switch:
+            outcome = harness.tick_with_usage({
+                "1": _usage7(30, 30), "2": _usage7(25, 25), "3": _usage7(60, 60),
+            })
+        assert outcome is not TickOutcome.SWITCHED
+        assert [c.args[0] for c in fresh.call_args_list] == ["3"]
+        mock_switch.assert_not_called()
+        assert harness.active_number() == 1
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+        assert harness.engine.pinned is None
+
+    def test_refuses_a_target_at_or_over_the_threshold(self, harness):
+        harness.engine.request_switch(target="3")
+        outcome = harness.tick_with_usage({
+            "1": _usage7(30, 30), "2": _usage7(25, 25), "3": _usage7(90, 40),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        refusal = next(e for e in harness.events if isinstance(e, NoSwitchEvent))
+        assert refusal.reason == "target-over-threshold"
+        assert "90%" in refusal.detail
+        assert harness.active_number() == 1
+
+    # `m` lands exactly where `n` would: each case below previews `n` on the
+    # same fleet first (a dry-run engine: no writes, no pin), so the parity
+    # is asserted, not assumed.
+
+    def _n_lands_on(self, h: EngineHarness, usage: dict) -> int | None:
+        live = h.engine
+        h.engine = h._make_engine(dry_run=True)
+        try:
+            h.engine.request_switch()
+            h.tick_with_usage(usage)
+        finally:
+            h.engine = live
+        sw = [e for e in h.events if isinstance(e, SwitchEvent)]
+        h.events.clear()
+        return sw[0].to_ref["number"] if sw else None
+
+    def test_takes_an_over_threshold_target_when_the_active_is_unreadable(
+        self, harness
+    ):
+        """Active unreadable: `n` is an escape and lands over the threshold,
+        so `m` may too."""
+        usage = {"1": None, "2": _usage7(97, 97), "3": _usage7(95, 95)}
+        assert self._n_lands_on(harness, usage) == 3
+        harness.engine.request_switch(target="2")
+        assert harness.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+
+    def test_takes_an_over_threshold_target_when_the_whole_fleet_is_over(
+        self, harness
+    ):
+        usage = {
+            "1": _usage7(95, 95), "2": _usage7(92, 92), "3": _usage7(96, 96),
+        }
+        assert self._n_lands_on(harness, usage) in (2, 3)
+        harness.engine.request_switch(target="3")
+        assert harness.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert harness.active_number() == 3
+
+    def test_refuses_a_target_at_its_limit_even_when_the_fleet_is_over(
+        self, harness
+    ):
+        """`n` never lands on an account with no headroom; neither does `m`."""
+        harness.engine.request_switch(target="3")
+        outcome = harness.tick_with_usage({
+            "1": _usage7(95, 95), "2": _usage7(92, 92), "3": _usage7(100, 100),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        refusal = next(e for e in harness.events if isinstance(e, NoSwitchEvent))
+        assert refusal.reason == "target-over-threshold"
+        assert "limit" in refusal.detail
+
+    def test_refuses_an_unknown_target_even_when_the_active_is_unreadable(
+        self, harness
+    ):
+        harness.engine.request_switch(target="3")
+        outcome = harness.tick_with_usage({
+            "1": None, "2": _usage7(25, 25), "3": None,
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert self._reasons(harness) == ["target-usage-unknown"]
+
+    def test_refuses_an_over_threshold_target_when_a_healthy_peer_exists(
+        self, harness
+    ):
+        """The normal case, with the active also over: one healthy peer means
+        `all_above` is off, so `n` refuses #3 and so does `m`."""
+        usage = {
+            "1": _usage7(95, 95), "2": _usage7(30, 30), "3": _usage7(93, 93),
+        }
+        assert self._n_lands_on(harness, usage) == 2
+        harness.engine.request_switch(target="3")
+        assert harness.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert self._reasons(harness) == ["target-over-threshold"]
+        assert harness.active_number() == 1
+
+    @pytest.mark.parametrize(
+        "stale_pct, fresh_pct, expected",
+        [(20, 95, TickOutcome.NO_ACTION), (95, 20, TickOutcome.SWITCHED)],
+    )
+    def test_threshold_check_reads_the_fresh_phase_two_data(
+        self, harness, stale_pct, fresh_pct, expected
+    ):
+        """The provisional snapshot and the pre-switch refetch (the
+        full-fleet fetch) disagree about #3; the refetch decides, both ways."""
+        stale = {
+            "1": _usage7(30, 30), "2": _usage7(25, 25),
+            "3": _usage7(stale_pct, stale_pct),
+        }
+        fresh = {**stale, "3": _usage7(fresh_pct, fresh_pct)}
+        now = harness.clock.now
+        served_stale = []
+
+        def entries(fetch=None, **_kw):
+            full = bool(fetch) and {"1", "2", "3"} <= set(fetch)
+            served_stale.append(not full)
+            src = fresh if full else stale
+            return {n: _entry_for(v, now) for n, v in src.items()}
+
+        harness.engine.request_switch(target="3")
+        with patch.object(
+            harness.switcher, "usage_entries_by_account", side_effect=entries
+        ):
+            outcome = harness.engine.tick()
+        assert any(served_stale)  # the provisional pass really saw the stale row
+        assert outcome is expected
+        if expected is TickOutcome.NO_ACTION:
+            assert self._reasons(harness) == ["target-over-threshold"]
+        else:
+            assert harness.active_number() == 3
+
+    def test_refuses_a_target_with_unknown_usage(self, harness):
+        harness.engine.request_switch(target="3")
+        outcome = harness.tick_with_usage({
+            "1": _usage7(30, 30), "2": _usage7(25, 25), "3": None,
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert self._reasons(harness) == ["target-usage-unknown"]
+
+    def test_a_refused_pick_is_spent(self, harness):
+        """One-shot: the refusal consumes the request, so the next tick is an
+        ordinary below-threshold poll, not a retry of the pick."""
+        usage = {"1": _usage7(30, 30), "2": _usage7(25, 25), "3": _usage7(95, 95)}
+        harness.engine.request_switch(target="3")
+        assert harness.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert not harness.engine._switch_now.is_set()
+        assert harness.engine._switch_target is None
+        harness.events.clear()
+        assert harness.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert self._reasons(harness) == ["below-threshold"]
+
+    def test_latest_request_wins(self, harness):
+        """`m` then `n` before the tick: the plain `n` is what runs."""
+        harness.engine.request_switch(target="3")
+        harness.engine.request_switch()
+        assert harness.tick_with_usage({
+            "1": _usage7(30, 30), "2": _usage7(25, 25), "3": _usage7(60, 60),
+        }) is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+        assert harness.engine.pinned is None
+
+    def test_dry_run_previews_without_writing_or_pinning(self, harness):
+        harness.engine = harness._make_engine(dry_run=True)
+        harness.engine.request_switch(target="3")
+        with patch.object(harness.switcher, "switch_to") as mock_switch:
+            outcome = harness.tick_with_usage({
+                "1": _usage7(30, 30), "2": _usage7(25, 25), "3": _usage7(60, 60),
+            })
+        assert outcome is TickOutcome.SWITCHED
+        mock_switch.assert_not_called()
+        sw = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert sw.dry_run is True and sw.to_ref["number"] == 3
+        assert "would switch" in sw.human()
+        assert harness.state() == {}
+        assert harness.engine.pinned is None
+
+    # -- the hold ------------------------------------------------------------
+
+    def test_pin_holds_the_pick_under_consume_first(self, temp_home):
+        """Below the threshold consume-first would nudge #3 -> #2 (#2 resets
+        sooner); the pin replaces that nudge. Clearing the pin by hand lets
+        the identical tick nudge, proving the pin is what held it."""
+        h = self._cf(temp_home)
+        self._pin_on_3(h)
+        assert h.tick_with_usage(self._CF_USAGE) is TickOutcome.NO_ACTION
+        held = [e for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert [e.reason for e in held] == ["pinned"]
+        assert "holding manual pick" in held[0].detail
+        assert h.active_number() == 3
+        assert "pinned" not in json.dumps(h.state())  # never persisted
+
+        h.engine._pinned = None
+        h.events.clear()
+        assert h.tick_with_usage(self._CF_USAGE) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_pin_clears_at_the_threshold_and_the_escape_runs(self, temp_home):
+        h = self._cf(temp_home)
+        self._pin_on_3(h)
+        hot = {**self._CF_USAGE, "3": _usage7(95, 95, _R_LATEST)}
+        assert h.tick_with_usage(hot) is TickOutcome.SWITCHED
+        assert h.active_number() != 3
+        assert h.engine.pinned is None
+        assert "pinned" not in self._reasons(h)
+
+    def test_pin_clears_when_the_active_account_changes(self, temp_home):
+        h = self._cf(temp_home)
+        self._pin_on_3(h)
+        h.switcher.switch_to("1", json_output=True)  # by hand, outside the engine
+        h.tick_with_usage(self._CF_USAGE)
+        assert h.engine.pinned is None
+        assert "pinned" not in self._reasons(h)
+
+    def test_pin_survives_a_tick_with_an_unreadable_live_login(self, temp_home):
+        """A transient `current is None` is not a move off the pick."""
+        h = self._cf(temp_home)
+        self._pin_on_3(h)
+        with patch.object(h.switcher, "current_account_number", return_value=None):
+            assert h.tick_with_usage(self._CF_USAGE) is TickOutcome.NO_ACTION
+        assert h.engine.pinned == "3"
+        h.events.clear()
+        assert h.tick_with_usage(self._CF_USAGE) is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["pinned"]
+
+    def test_pin_never_blocks_at_limit(self, temp_home):
+        h = self._cf(temp_home)
+        h.engine = h._make_engine(pinned="1")
+        assert h.engine.pinned == "1"
+        outcome = h.tick_with_usage({
+            "1": _usage7(100, 100, _R_LATER),
+            "2": _usage7(10, 10, _R_SOON),
+            "3": _usage7(10, 10, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit"
+        assert h.engine.pinned is None
+
+    def test_pin_carries_over_to_a_rebuilt_engine(self, temp_home):
+        h = self._cf(temp_home)
+        self._pin_on_3(h)
+        h.engine = h._make_engine(pinned=h.engine.pinned)
+        assert h.tick_with_usage(self._CF_USAGE) is TickOutcome.NO_ACTION
+        assert self._reasons(h) == ["pinned"]
+
+    def test_switch_now_overrides_the_pin(self, temp_home):
+        h = self._cf(temp_home)
+        self._pin_on_3(h)
+        h.engine.request_switch()
+        assert h.tick_with_usage(self._CF_USAGE) is TickOutcome.SWITCHED
+        assert h.active_number() != 3
+        assert h.engine.pinned is None
+
+    def test_a_later_pick_replaces_the_pin(self, temp_home):
+        h = self._cf(temp_home)
+        self._pin_on_3(h)
+        h.engine.request_switch(target="2")
+        assert h.tick_with_usage(self._CF_USAGE) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert h.engine.pinned == "2"
+
+
+class TestWarmup:
+    """The engine's warmup hook (`warmup.py` driven from `_tick_inner`).
+
+    Two invariants sit above every individual case. **No test may spawn a
+    real ``claude``** — the runner is injected here and never the real
+    :class:`SubprocessPingRunner` (a real child escapes the real-store audit
+    hook entirely and would authenticate as whoever is logged in on the
+    machine running the suite). And a warmup problem must never cost a
+    switch decision: the hook is shielded inside the tick, which the last
+    test pins.
+    """
+
+    class FakeRunner:
+        """Records what it was asked to hello; never touches a process."""
+
+        def __init__(self, ok: bool = True, gate: threading.Event | None = None):
+            self.ok = ok
+            self.gate = gate
+            self.calls: list[tuple[Path, str]] = []
+            self.started = threading.Event()
+
+        def ping(self, config_dir, model, cwd, timeout_s=120.0):
+            from claude_swap.warmup import PingResult
+
+            self.calls.append((Path(config_dir), model))
+            self.started.set()
+            if self.gate is not None:
+                self.gate.wait(5)
+            return PingResult(
+                ok=self.ok, model=model, input_tokens=431, output_tokens=79,
+                error="" if self.ok else "rc=1: boom",
+            )
+
+    # -- harness helpers ---------------------------------------------------
+
+    def _warm_harness(self, temp_home: Path, monkeypatch, **kwargs) -> EngineHarness:
+        """Three accounts, warmup on, the spawn seam and the slot lookup faked.
+
+        #1 is the ACTIVE account, so with three equally cold accounts the
+        warmup anchor is #2: the active account is not a switch target and
+        `_warmup_order` gives it the LAST instant, not the first. Fixtures
+        below name #2 for that reason, not by accident.
+        """
+        from claude_swap import warmup as warmup_mod
+
+        kwargs.setdefault("warmup_enabled", True)
+        h = EngineHarness(temp_home, **kwargs)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        h.runner = self.FakeRunner()
+        h.engine.ping_runner = h.runner
+        monkeypatch.setattr(
+            warmup_mod,
+            "config_dir_for",
+            lambda sw, num, active: temp_home / f"cfg-{num}",
+        )
+        return h
+
+    def _tick(self, h, usage):
+        """One tick against a canned usage dict; returns (outcome, mock)."""
+        entries = {
+            num: _entry_for(value, h.clock.now) for num, value in usage.items()
+        }
+        with patch.object(
+            h.switcher, "usage_entries_by_account", return_value=entries
+        ) as mock:
+            outcome = h.engine.tick()
+        return outcome, mock
+
+    @staticmethod
+    def _settle(engine, timeout: float = 5.0) -> None:
+        """Wait for every in-flight hello thread to hand its result back."""
+        import time as _time
+
+        deadline = _time.monotonic() + timeout
+        while _time.monotonic() < deadline:
+            with engine._warm_lock:
+                if not engine._warm_inflight:
+                    return
+            _time.sleep(0.005)
+        raise AssertionError("warmup thread did not finish")
+
+    @staticmethod
+    def _cold() -> dict:
+        return {"1": _usage(30), "2": _usage(30), "3": _usage(30)}
+
+    # -- the default ---------------------------------------------------------
+
+    def test_warmup_is_off_by_default(self, harness, monkeypatch):
+        """An upgrade may not start spending tokens and spawning children on
+        its own: `warmupEnabled` defaults to false and nothing runs."""
+        harness.runner = self.FakeRunner()
+        harness.engine.ping_runner = harness.runner
+        assert harness.tick_with_usage(self._cold()) is TickOutcome.NO_ACTION
+        assert harness.runner.calls == []
+        assert "warmup" not in harness.state()
+
+    # -- the happy path ------------------------------------------------------
+
+    def test_a_cold_account_is_warmed_and_the_result_lands_next_tick(
+        self, temp_home, monkeypatch
+    ):
+        """Tick 1 spawns the hello; the thread hands the result back and
+        tick 2 reports it. The event carries a token summary and nothing
+        else."""
+        h = self._warm_harness(temp_home, monkeypatch)
+        self._tick(h, self._cold())
+        self._settle(h.engine)
+        assert [model for _, model in h.runner.calls] == ["haiku"]
+        h.events.clear()
+
+        self._tick(h, self._cold())
+        warmed = [e for e in h.events if isinstance(e, WarmupEvent)]
+        assert [e.action for e in warmed] == ["pinged"]
+        assert warmed[0].number == "2"
+        assert warmed[0].email == "b@example.com"
+        assert "431 in / 79 out" in warmed[0].detail
+
+    def test_the_landed_hello_forces_a_refetch_of_that_account(
+        self, temp_home, monkeypatch
+    ):
+        """The whole point is the new reset stamp — it has to show within one
+        tick, not whenever the candidate rotation gets around to that slot."""
+        h = self._warm_harness(temp_home, monkeypatch)
+        self._tick(h, self._cold())
+        self._settle(h.engine)
+        _, mock = self._tick(h, self._cold())
+        forced = [
+            call for call in mock.call_args_list if call.kwargs.get("fetch")
+        ]
+        assert any(
+            call.kwargs["fetch"] == {"2"} and call.kwargs.get("scheduled") is False
+            for call in forced
+        )
+
+    def test_the_ping_is_recorded_in_the_state_file(self, temp_home, monkeypatch):
+        h = self._warm_harness(temp_home, monkeypatch)
+        self._tick(h, self._cold())
+        self._settle(h.engine)
+        self._tick(h, self._cold())
+        record = h.state()["warmup"]["2"]
+        assert record["lastPingModel"] == "haiku"
+        assert record["lastResult"] == "ok"
+        assert record["failures"] == 0
+        assert record["lastPingAt"] == h.clock.now
+
+    def test_only_one_hello_per_account_is_ever_in_flight(
+        self, temp_home, monkeypatch
+    ):
+        """A slow hello must not accumulate one child per tick."""
+        gate = threading.Event()
+        h = self._warm_harness(temp_home, monkeypatch)
+        h.runner = self.FakeRunner(gate=gate)
+        h.engine.ping_runner = h.runner
+        try:
+            self._tick(h, self._cold())
+            assert h.runner.started.wait(5)
+            self._tick(h, self._cold())
+            self._tick(h, self._cold())
+            assert len(h.runner.calls) == 1
+        finally:
+            gate.set()
+            self._settle(h.engine)
+
+    # -- the guards ----------------------------------------------------------
+
+    def test_a_stale_row_is_refetched_instead_of_pinged(
+        self, temp_home, monkeypatch
+    ):
+        """Never spend a token on a stale read: the stamp may have landed
+        since the last fetch, in which case the account is not cold at all.
+
+        Exactly ONE such refetch per tick, stalest first — warmup shares the
+        engine's 429 budget and must not turn a tick into an all-accounts
+        refresh because three rows happen to look cold."""
+        h = self._warm_harness(temp_home, monkeypatch)
+
+        def stale(age: float) -> UsageEntry:
+            return UsageEntry(
+                last_good=_usage(30), fetched_at=h.clock.now - age, age_s=age
+            )
+
+        entries = {"1": stale(200.0), "2": stale(280.0), "3": stale(240.0)}
+        with patch.object(
+            h.switcher, "usage_entries_by_account", return_value=entries
+        ) as mock:
+            h.engine.tick()
+        assert h.runner.calls == []
+        warm_fetches = [
+            call.kwargs["fetch"]
+            for call in mock.call_args_list
+            if call.kwargs.get("scheduled") is False
+        ]
+        assert warm_fetches == [{"2"}]  # the stalest of the three
+
+    def test_api_key_token_dead_and_at_limit_accounts_are_left_alone(
+        self, temp_home, monkeypatch
+    ):
+        """#1 is at its limit (a hello would 429 or burn the last of the
+        window), #2's refresh lineage is provably dead, #3 is an API key —
+        which has no quota window to warm and which ``setup_session``
+        refuses (``_ensure_not_api_key``)."""
+        h = self._warm_harness(temp_home, monkeypatch)
+        entries = {
+            "1": _entry_for(_usage(100), h.clock.now),
+            "2": UsageEntry(
+                last_good=_usage(30), fetched_at=h.clock.now, age_s=0.0,
+                auth_dead_strikes=99,
+            ),
+            "3": _entry_for(_usage(30), h.clock.now),
+        }
+        with (
+            patch.object(
+                h.switcher, "account_kind_for",
+                side_effect=lambda n: "api_key" if n == "3" else "oauth",
+            ),
+            patch.object(
+                h.switcher, "usage_entries_by_account", return_value=entries
+            ),
+        ):
+            h.engine.tick()
+        self._settle(h.engine)
+        assert h.runner.calls == []
+
+    def test_dry_run_previews_and_spawns_nothing(self, temp_home, monkeypatch):
+        h = self._warm_harness(temp_home, monkeypatch)
+        h.engine = h._make_engine(dry_run=True)
+        h.engine.ping_runner = h.runner
+        self._tick(h, self._cold())
+        assert h.runner.calls == []
+        previews = [e for e in h.events if isinstance(e, WarmupEvent)]
+        assert [e.action for e in previews] == ["would-ping"]
+        assert "warmup" not in h.state()
+
+    # -- the credential boundary --------------------------------------------
+
+    def test_the_active_account_uses_the_live_config_home_and_others_a_slot(
+        self, temp_home, monkeypatch
+    ):
+        """The two paths look alike in the code and must stay distinct.
+
+        The ACTIVE account is the global login and is pinged through the
+        live config home. Nothing downstream enforces that: ``setup_session``
+        does NOT refuse the active login — the refusal lives in
+        ``SessionManager.run`` (and only when ``CLAUDE_CONFIG_DIR`` is
+        unset), which warmup never calls — so ``config_dir_for``'s
+        ``number == active`` comparison IS the guard against building a slot
+        copy of the live login. Every other account goes through the exact
+        ``cswap run`` preparation.
+        """
+        import claude_swap.session as session_mod
+        from claude_swap import warmup as warmup_mod
+
+        live = temp_home / "live-claude"
+        monkeypatch.setattr(warmup_mod.paths, "get_claude_config_home", lambda: live)
+        seen: list[tuple[str, bool]] = []
+
+        class FakeSessionManager:
+            def __init__(self, switcher):
+                pass
+
+            def setup_session(self, identifier, share, share_history=False):
+                seen.append((identifier, share))
+                return temp_home / f"slot-{identifier}", identifier, "x@example.com"
+
+        monkeypatch.setattr(session_mod, "SessionManager", FakeSessionManager)
+
+        h = EngineHarness(temp_home, warmup_enabled=True, warmup_stagger=False)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        h.runner = self.FakeRunner()
+        h.engine.ping_runner = h.runner
+
+        self._tick(h, {"1": _usage(30), "2": _usage(30)})
+        self._settle(h.engine)
+        dirs = {path for path, _ in h.runner.calls}
+        assert live in dirs
+        assert temp_home / "slot-2" in dirs
+        assert seen == [("2", True)]  # never called for the active account
+
+    # -- failures ------------------------------------------------------------
+
+    def test_a_failed_hello_earns_a_thirty_minute_backoff(
+        self, temp_home, monkeypatch
+    ):
+        h = self._warm_harness(temp_home, monkeypatch)
+        h.runner = self.FakeRunner(ok=False)
+        h.engine.ping_runner = h.runner
+        self._tick(h, self._cold())
+        self._settle(h.engine)
+        h.events.clear()
+        self._tick(h, self._cold())
+
+        failed = [e for e in h.events if isinstance(e, WarmupEvent)]
+        assert [e.action for e in failed] == ["failed"]
+        record = h.state()["warmup"]["2"]
+        assert record["failures"] == 1
+        assert record["backoffUntil"] == pytest.approx(h.clock.now + 30 * 60)
+
+    def test_three_strikes_buy_a_day_off(self, temp_home, monkeypatch):
+        """A structural cause (no `claude` on PATH, a slot that cannot
+        bootstrap) is not worth a child process every half hour."""
+        h = self._warm_harness(temp_home, monkeypatch)
+        h.runner = self.FakeRunner(ok=False)
+        h.engine.ping_runner = h.runner
+        for _ in range(3):
+            self._tick(h, self._cold())
+            self._settle(h.engine)
+            self._tick(h, self._cold())  # drain the result
+            recorded_at = h.clock.now
+            h.clock.advance(31 * 60)     # past the short backoff
+        record = h.state()["warmup"]["2"]
+        assert record["failures"] == 3
+        assert record["backoffUntil"] == pytest.approx(recorded_at + 24 * 3600)
+
+    def test_a_warmup_explosion_never_costs_a_switch_decision(
+        self, temp_home, monkeypatch
+    ):
+        """The hook is shielded inside the tick. A planner that raises must
+        leave the engine's actual job untouched."""
+        from claude_swap import warmup as warmup_mod
+
+        h = self._warm_harness(temp_home, monkeypatch, threshold=90.0)
+        monkeypatch.setattr(
+            warmup_mod,
+            "plan_warmups",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        outcome, _ = self._tick(
+            h, {"1": _usage(95), "2": _usage(10), "3": _usage(10)}
+        )
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_an_unchanged_cold_refetch_does_not_re_ping_every_tick(
+        self, temp_home, monkeypatch
+    ):
+        """The post-hello refetch is BEST EFFORT and normally a no-op:
+        ``UsageStore.reserve(respect_plans=False)`` still gates on
+        `poll_due or stale`, so a row fetched earlier in the same tick keeps
+        its pre-hello (cold) stamp. Cold AND fresh is exactly the state that
+        would re-ping every tick — `warmup.PING_COOLDOWN_S` is the only
+        thing standing between that and a hello a minute."""
+        from claude_swap import warmup as warmup_mod
+
+        h = self._warm_harness(temp_home, monkeypatch)
+        for _ in range(4):
+            self._tick(h, self._cold())  # the entries never change: still cold
+            self._settle(h.engine)
+            h.clock.advance(60)
+        assert len(h.runner.calls) == 1
+
+        h.clock.advance(warmup_mod.PING_COOLDOWN_S)
+        self._tick(h, self._cold())
+        self._settle(h.engine)
+        assert len(h.runner.calls) == 2
+        assert [path.name for path, _ in h.runner.calls] == ["cfg-2", "cfg-2"]
+
+    # -- the role boundary ----------------------------------------------------
+
+    def test_a_switch_mid_tick_aborts_the_active_account_hello(
+        self, temp_home, monkeypatch
+    ):
+        """Warmup plans before the switch decision runs. If the tick then
+        moves 1→2, the "active" config home holds #2's credentials by the
+        time the worker resolves it — pinging it would warm #2 and record
+        the hello under #1. Abort instead, and take no strike."""
+        h = self._warm_harness(temp_home, monkeypatch)
+        with h.engine._warm_lock:
+            h.engine._warm_inflight.add("1")
+        with patch.object(
+            h.switcher, "current_account_number", return_value="2"
+        ):
+            h.engine._ping_worker("1", "a@example.com", "haiku", "1")
+
+        assert h.runner.calls == []
+        drained = h.engine._drain_pings()
+        assert len(drained) == 1
+        result = drained[0][3]
+        assert result.skipped is True
+        assert "active account changed" in result.error
+        h.engine._record_ping_result("1", "haiku", result)
+        assert "backoffUntil" not in h.state().get("warmup", {}).get("1", {})
+
+    def test_becoming_active_mid_tick_aborts_the_slot_hello(
+        self, temp_home, monkeypatch
+    ):
+        """The mirror case. Only `config_dir_for`'s `number == active` check
+        keeps the live login out of a slot dir, so a stale capture would build
+        one and rotate a second token family; abort instead of striking."""
+        h = self._warm_harness(temp_home, monkeypatch)
+        with h.engine._warm_lock:
+            h.engine._warm_inflight.add("2")
+        with patch.object(
+            h.switcher, "current_account_number", return_value="2"
+        ):
+            h.engine._ping_worker("2", "b@example.com", "haiku", "1")
+
+        assert h.runner.calls == []
+        assert h.engine._drain_pings()[0][3].skipped is True
+
+    def test_a_switch_that_does_not_change_THIS_account_still_pings(
+        self, temp_home, monkeypatch
+    ):
+        """1→2 while #3's hello is in flight changes nothing about #3: it
+        was a slot before and it is a slot now. Aborting there would be a
+        needless miss."""
+        h = self._warm_harness(temp_home, monkeypatch)
+        with h.engine._warm_lock:
+            h.engine._warm_inflight.add("3")
+        with patch.object(
+            h.switcher, "current_account_number", return_value="2"
+        ):
+            h.engine._ping_worker("3", "c@example.com", "haiku", "1")
+
+        assert [path.name for path, _ in h.runner.calls] == ["cfg-3"]
+        assert h.engine._drain_pings()[0][3].skipped is False
+
+    def test_a_skip_is_reported_and_never_becomes_a_strike(
+        self, temp_home, monkeypatch
+    ):
+        h = self._warm_harness(temp_home, monkeypatch)
+        with h.engine._warm_lock:
+            h.engine._warm_inflight.add("1")
+        with patch.object(
+            h.switcher, "current_account_number", return_value="2"
+        ):
+            h.engine._ping_worker("1", "a@example.com", "haiku", "1")
+        h.events.clear()
+        self._tick(h, self._cold())
+        self._settle(h.engine)
+        skipped = [
+            e for e in h.events
+            if isinstance(e, WarmupEvent) and e.number == "1"
+        ]
+        assert skipped[0].action == "skipped"
+        assert "warmup skipped" in skipped[0].human()
+
+    def test_a_slot_preparation_failure_never_leaks_a_path(
+        self, temp_home, monkeypatch
+    ):
+        """`setup_session` errors can embed slot and config-dir paths, and
+        these lines are logged, scrolled and pasted into issues."""
+        from claude_swap import warmup as warmup_mod
+
+        def boom(sw, num, active):
+            raise RuntimeError(f"cannot bootstrap {temp_home / 'slot-1-secret'}")
+
+        monkeypatch.setattr(warmup_mod, "config_dir_for", boom)
+        h = self._warm_harness(temp_home, monkeypatch)
+        monkeypatch.setattr(warmup_mod, "config_dir_for", boom)
+        self._tick(h, self._cold())
+        self._settle(h.engine)
+        h.events.clear()
+        self._tick(h, self._cold())
+        failed = [e for e in h.events if isinstance(e, WarmupEvent)]
+        assert failed[0].action == "failed"
+        assert "slot-1-secret" not in failed[0].detail
+        assert "RuntimeError" in failed[0].detail
+        assert "slot-1-secret" not in h.state()["warmup"]["2"]["lastResult"]
+
+    # -- the switch/warmup race -----------------------------------------------
+
+    def test_a_target_with_a_hello_in_flight_is_never_activated(
+        self, temp_home, monkeypatch
+    ):
+        """A hello runs the full ``setup_session`` preparation, whose consume
+        gate POSTs a refresh OUTSIDE the backup lock and persists the
+        successor by CAS. Activating that slot mid-flight installs
+        generation N as the LIVE login while the gate lands N+1 — the
+        default login then holds a spent refresh token and finds out at its
+        next expiry, with nothing anywhere naming the cause."""
+        h = self._warm_harness(temp_home, monkeypatch, threshold=90.0)
+        with h.engine._warm_lock:
+            h.engine._warm_inflight.add("2")
+
+        assert h.engine._freshen_target("2", "b@example.com") == "warmup-in-flight"
+        self._tick(h, {"1": _usage(95), "2": _usage(5), "3": _usage(96)})
+        h.engine._warm_inflight.discard("2")
+        self._settle(h.engine)  # hellos are daemon threads: never leak one
+        assert h.active_number() != 2
+        assert not any(
+            isinstance(e, SwitchEvent) and (e.to_ref or {}).get("number") == 2
+            for e in h.events
+        )
+
+    def test_a_tick_that_switches_never_spawns_a_hello_for_the_new_login(
+        self, temp_home, monkeypatch
+    ):
+        """The other end of the same window: the account we just landed on
+        had its credentials installed moments ago (with a ~30s Keychain
+        pickup tail on macOS). A hello racing that is all risk — it will be
+        reconsidered next tick."""
+        h = self._warm_harness(temp_home, monkeypatch, threshold=90.0)
+        outcome, _ = self._tick(
+            h, {"1": _usage(95), "2": _usage(5), "3": _usage(96)}
+        )
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        self._settle(h.engine)
+        assert "cfg-2" not in [path.name for path, _ in h.runner.calls]
+
+    def test_hellos_spawn_only_after_the_decision(self, temp_home, monkeypatch):
+        """Ordering pinned directly: nothing may be in flight while the
+        decision runs, because that window IS the race."""
+        h = self._warm_harness(temp_home, monkeypatch, threshold=90.0)
+        seen: list[set] = []
+        real = h.engine._freshen_target
+
+        def spy(number, email):
+            with h.engine._warm_lock:
+                seen.append(set(h.engine._warm_inflight))
+            return real(number, email)
+
+        monkeypatch.setattr(h.engine, "_freshen_target", spy)
+        self._tick(h, {"1": _usage(95), "2": _usage(5), "3": _usage(96)})
+        self._settle(h.engine)
+        assert seen and all(not s for s in seen)
+        assert h.runner.calls  # ...and hellos did go out afterwards
+
+    # -- the session shell ------------------------------------------------------
+
+    def test_warmup_is_disabled_inside_a_cswap_run_shell(
+        self, temp_home, monkeypatch
+    ):
+        """There, ``current_account_number()`` reports the SESSION's account,
+        so the machine's real default login reads as a plain candidate and
+        would be handed to ``setup_session``: a slot copy of the live login,
+        rotating the backup while ``~/.claude`` keeps the predecessor."""
+        from claude_swap.exceptions import SwitchError
+
+        h = self._warm_harness(temp_home, monkeypatch)
+        monkeypatch.setattr(
+            h.switcher,
+            "_refuse_session_shell",
+            lambda: (_ for _ in ()).throw(SwitchError("inside a session profile")),
+        )
+        self._tick(h, self._cold())
+        self._settle(h.engine)
+        assert h.runner.calls == []
+        warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1
+        assert "warmup disabled" in warnings[0].message
+
+        # A standing condition, not an event: warned once per engine.
+        h.events.clear()
+        self._tick(h, self._cold())
+        assert [e for e in h.events if isinstance(e, ConfigWarningEvent)] == []
+
+    # -- the manual request ---------------------------------------------------
+
+    def test_request_warm_pings_every_cold_account_now(
+        self, temp_home, monkeypatch
+    ):
+        """`p` is a request for DATA now, so the stagger — the thing that
+        would otherwise leave three of four accounts waiting hours — is
+        exactly what it overrides."""
+        h = self._warm_harness(temp_home, monkeypatch, warmup_enabled=False)
+        h.engine.request_warm()
+        assert h.engine._wake.is_set()
+        self._tick(h, self._cold())
+        self._settle(h.engine)
+        assert sorted(path.name for path, _ in h.runner.calls) == [
+            "cfg-1", "cfg-2", "cfg-3"
+        ]
+
+    def test_the_warm_request_is_consumed_by_exactly_one_tick(
+        self, temp_home, monkeypatch
+    ):
+        h = self._warm_harness(temp_home, monkeypatch, warmup_enabled=False)
+        h.engine.request_warm()
+        self._tick(h, self._cold())
+        self._settle(h.engine)
+        first = len(h.runner.calls)
+        self._tick(h, self._cold())
+        self._settle(h.engine)
+        assert len(h.runner.calls) == first  # no standing order
+
+    # -- scheduling -----------------------------------------------------------
+
+    def test_a_staggered_deadline_shortens_the_sleep(self, temp_home, monkeypatch):
+        """A hello due in 30s is useless if the loop is asleep for 5 minutes
+        on a BLOCKED outcome."""
+        h = self._warm_harness(temp_home, monkeypatch)
+        h.engine._blocked_wait_long = True
+        assert h.engine._next_delay(TickOutcome.BLOCKED) == pytest.approx(
+            NO_RESET_FALLBACK_S
+        )
+        h.engine._warm_deadline_ts = h.clock.now + 30
+        assert h.engine._next_delay(TickOutcome.BLOCKED) == pytest.approx(30)
+
+    def test_the_clamp_never_lengthens_a_sleep_or_returns_zero(
+        self, temp_home, monkeypatch
+    ):
+        h = self._warm_harness(temp_home, monkeypatch)
+        h.engine._warm_deadline_ts = h.clock.now + 10_000
+        assert h.engine._next_delay(TickOutcome.NO_ACTION) <= 66.0
+        h.engine._warm_deadline_ts = h.clock.now - 500
+        assert h.engine._next_delay(TickOutcome.NO_ACTION) == pytest.approx(1.0)
+
+    def test_a_lapsing_stamp_is_confirmed_promptly(self, temp_home, monkeypatch):
+        """A window that expires during the next sleep would otherwise leave
+        the account cold and invisible until the following poll."""
+        h = self._warm_harness(temp_home, monkeypatch)
+        soon = h.clock.now + 900
+        self._tick(h, {
+            "1": _usage(30, _iso_at(soon)),
+            "2": _usage(30, _iso_at(h.clock.now + 99_999)),
+            "3": _usage(30, _iso_at(h.clock.now + 88_888)),
+        })
+        assert h.engine._warm_deadline_ts == pytest.approx(soon + 60)
+
+    # -- the display schedule -------------------------------------------------
+    #
+    # `warmup_schedule()` is what the TUI's countdown panel renders. It is a
+    # MIRROR of the pass that just ran, so the panel can never show a plan
+    # the engine did not make: these pin it against `plan_warmups` itself.
+
+    def test_the_schedule_mirrors_the_plan_this_tick_made(
+        self, temp_home, monkeypatch
+    ):
+        """Dry-run so the pass is pure: no hellos, no state writes, and the
+        planner can be re-run on the same inputs for the expected instants."""
+        from claude_swap import warmup as warmup_mod
+
+        h = self._warm_harness(temp_home, monkeypatch)
+        h.engine = h._make_engine(dry_run=True)
+        h.engine.ping_runner = h.runner
+        warm_at = h.clock.now + 3 * 3600
+        usage = {
+            "1": _usage(30),
+            "2": _usage(30),
+            "3": _usage(30, _iso_at(warm_at)),
+        }
+        entries = {n: _entry_for(v, h.clock.now) for n, v in usage.items()}
+        with patch.object(
+            h.switcher, "usage_entries_by_account", return_value=entries
+        ):
+            h.engine.tick()
+
+        # Re-run the planner exactly as the engine calls it: the same
+        # priority order and the same tick-sized tolerance, or this mirrors
+        # a plan nobody made.
+        candidates = h.engine._warm_candidates(entries, set(), h.clock.now, {})
+        headroom = {
+            num: 100.0 - value["five_hour"]["pct"] for num, value in usage.items()
+        }
+        expected = {
+            d.number: d
+            for d in warmup_mod.plan_warmups(
+                h.clock.now,
+                h.engine._warmup_order(
+                    candidates, "1", usage, headroom, h.clock.now
+                ),
+                tolerance_s=(
+                    h.engine.settings.interval_seconds
+                    + warmup_mod.DEFAULT_TOLERANCE_MARGIN_S
+                ),
+            )
+        }
+        schedule = h.engine.warmup_schedule()
+        assert set(schedule) == {"1", "2", "3"}
+        # The warm account gets no decision at all, and its row carries the
+        # reset the countdown is measured against.
+        assert "3" not in expected
+        assert schedule["3"].status == "warm"
+        assert schedule["3"].reset_ts == pytest.approx(warm_at)
+        assert schedule["3"].email == "c@example.com"
+        for number, decision in expected.items():
+            slot = schedule[number]
+            if decision.is_now:
+                assert slot.status == "due"  # dry-run previews, never spawns
+                assert slot.at_ts is None
+            else:
+                assert slot.status == "scheduled"
+                assert slot.at_ts == pytest.approx(decision.at_ts)
+            assert slot.model == decision.model
+
+    def test_a_spawned_hello_shows_as_in_flight(self, temp_home, monkeypatch):
+        h = self._warm_harness(temp_home, monkeypatch, warmup_stagger=False)
+        self._tick(h, self._cold())
+        self._settle(h.engine)
+        assert h.engine.warmup_schedule()["1"].status == "in-flight"
+
+    def test_an_ineligible_account_keeps_its_row_and_its_reason(
+        self, temp_home, monkeypatch
+    ):
+        """"Why is #1 not being warmed" has to answer itself on screen —
+        an omitted row reads as a bug."""
+        h = self._warm_harness(temp_home, monkeypatch)
+        self._tick(h, {"1": _usage(100), "2": _usage(30), "3": _usage(30)})
+        self._settle(h.engine)
+        slot = h.engine.warmup_schedule()["1"]
+        assert (slot.status, slot.reason) == ("skipped", "at-limit")
+
+    def test_the_account_just_switched_to_is_held_not_warmed(
+        self, temp_home, monkeypatch
+    ):
+        """The spawn phase excludes the landing account (its credentials were
+        installed moments ago); the panel has to say so rather than showing a
+        hello that will never happen."""
+        h = self._warm_harness(temp_home, monkeypatch, warmup_stagger=False)
+        outcome, _ = self._tick(
+            h, {"1": _usage(100), "2": _usage(30), "3": _usage(30)}
+        )
+        self._settle(h.engine)
+        assert outcome is TickOutcome.SWITCHED
+        landed = str(h.active_number())
+        slot = h.engine.warmup_schedule()[landed]
+        assert slot.status == "excluded"
+        # `config_dir_for` is faked to `cfg-<num>`: nothing was spawned for it.
+        assert f"cfg-{landed}" not in [path.name for path, _ in h.runner.calls]
+        assert h.runner.calls  # the OTHER cold account was warmed
+
+    def test_the_account_switched_away_from_ranks_as_an_ordinary_slot(
+        self, temp_home, monkeypatch
+    ):
+        """`current` was captured before the decision. Ranking against it
+        would demote the account we just LEFT — which is a plain candidate
+        again the moment the switch lands — and hand its instant to a worse
+        one."""
+        h = self._warm_harness(temp_home, monkeypatch, threshold=90.0)
+        # #1 (active) is over the threshold and must move; #2 is the healthy
+        # landing; among the remaining cold accounts #1 has the most
+        # headroom, so with `current` updated it takes the earliest instant.
+        outcome, _ = self._tick(
+            h, {"1": _usage(91), "2": _usage(10), "3": _usage(95)}
+        )
+        self._settle(h.engine)
+        assert outcome is TickOutcome.SWITCHED
+        assert str(h.active_number()) == "2"
+        schedule = h.engine.warmup_schedule()
+        assert schedule["2"].status == "excluded"
+        assert schedule["1"].status == "in-flight"  # ranked first, spawned
+        assert schedule["3"].status == "scheduled"
+
+    def test_a_hello_still_running_from_a_previous_tick_reads_as_in_flight(
+        self, temp_home, monkeypatch
+    ):
+        """`collect_candidates` writes the reason and `build_schedule` matches
+        on it — one constant, so the two cannot drift apart into a row that
+        silently falls through to "skipped"."""
+        from claude_swap import warmup as warmup_mod
+
+        gate = threading.Event()
+        h = self._warm_harness(temp_home, monkeypatch, warmup_stagger=False)
+        h.runner = self.FakeRunner(gate=gate)
+        h.engine.ping_runner = h.runner
+        try:
+            self._tick(h, self._cold())
+            assert h.runner.started.wait(5)
+            self._tick(h, self._cold())  # plans while the hello is running
+            slot = h.engine.warmup_schedule()["1"]
+            assert slot.status == "in-flight"
+            assert slot.reason == warmup_mod.IN_FLIGHT_REASON
+        finally:
+            gate.set()
+            self._settle(h.engine)
+
+    def test_a_tick_that_never_reached_the_warmup_step_keeps_the_schedule(
+        self, temp_home, monkeypatch
+    ):
+        """`_spawn_planned_warmups` runs for every outcome, including the
+        early returns. "No plan handed over" is not evidence that nothing is
+        planned — wiping the panel there would report an absence the engine
+        never established."""
+        h = self._warm_harness(temp_home, monkeypatch)
+        self._tick(h, self._cold())
+        self._settle(h.engine)
+        before = h.engine.warmup_schedule()
+        assert before
+        with patch.object(h.switcher, "current_account_number", return_value=None):
+            assert h.engine.tick() is TickOutcome.NO_ACTION
+        assert h.engine.warmup_schedule() == before
+
+    # -- who gets warmed first ------------------------------------------------
+    #
+    # `plan_warmups` hands its earliest instant to the first cold account it
+    # is given, so the ENGINE's ordering is what makes "next up gets warmed
+    # first" true. It ranks with `_rank_candidates` — its own switch
+    # ranking, for the configured strategy — so the panel's "Next best" and
+    # the warmup queue can never disagree.
+
+    def test_best_warms_the_account_with_the_most_headroom_first(
+        self, temp_home, monkeypatch
+    ):
+        h = self._warm_harness(temp_home, monkeypatch)
+        h.engine = h._make_engine(dry_run=True)  # order only: spawn nothing
+        h.engine.ping_runner = h.runner
+        # #3 has the most headroom, #2 the least; #1 is the active account.
+        # `manual` waives the anti-flap margins, so BOTH candidates rank —
+        # under the proactive trigger #2 (less headroom than the active)
+        # would be dropped and the order would collapse to slot order.
+        self._tick(h, {"1": _usage(30), "2": _usage(80), "3": _usage(10)})
+        schedule = h.engine.warmup_schedule()
+        assert schedule["3"].status == "due"  # the earliest instant
+        # Full order: ranked candidates, then the ACTIVE account last — it
+        # is not a switch target and must not take an instant off one just
+        # because its slot number is low.
+        assert schedule["3"].at_ts is None
+        assert schedule["2"].at_ts < schedule["1"].at_ts
+        assert schedule["1"].status == "scheduled"
+
+    def test_consume_first_warms_the_soonest_weekly_reset_first(
+        self, temp_home, monkeypatch
+    ):
+        """Same fixture shape as `TestConsumeFirstStrategy`: the strategy's
+        own key decides, not headroom."""
+        h = self._warm_harness(temp_home, monkeypatch, strategy="consume-first")
+        h.engine = h._make_engine(dry_run=True)
+        h.engine.ping_runner = h.runner
+        self._tick(h, {
+            "1": _usage7(20, 20, _R_LATER),    # active
+            "2": _usage7(10, 10, _R_LATEST),
+            "3": _usage7(10, 10, _R_SOON),     # consumed first -> warmed first
+        })
+        schedule = h.engine.warmup_schedule()
+        assert schedule["3"].status == "due"
+        assert schedule["2"].at_ts < schedule["1"].at_ts
+
+    def test_a_ranking_failure_falls_back_to_slot_order(
+        self, temp_home, monkeypatch
+    ):
+        """Ordering is a nicety; warming is not. A ranking that raises costs
+        the priority, never the plan."""
+        h = self._warm_harness(temp_home, monkeypatch)
+        h.engine = h._make_engine(dry_run=True)
+        h.engine.ping_runner = h.runner
+        monkeypatch.setattr(
+            h.engine,
+            "_rank_candidates",
+            lambda **kw: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        self._tick(h, {"1": _usage(30), "2": _usage(80), "3": _usage(10)})
+        schedule = h.engine.warmup_schedule()
+        assert schedule["1"].status == "due"  # slot order: #1 anchors
+        assert schedule["2"].at_ts < schedule["3"].at_ts
+
+    def test_a_scheduled_hello_fires_on_the_tick_at_its_deadline(
+        self, temp_home, monkeypatch
+    ):
+        """The stagger is only worth anything if the loop wakes for it: the
+        deadline clamps the sleep, and the tick that lands there finds the
+        account on phase and hellos immediately."""
+        from claude_swap import warmup as warmup_mod
+
+        h = self._warm_harness(temp_home, monkeypatch)
+        first = h.clock.now
+        self._tick(h, {"1": _usage(30), "2": _usage(10), "3": _usage(80)})
+        self._settle(h.engine)
+        schedule = h.engine.warmup_schedule()
+        assert schedule["2"].status == "in-flight"  # most headroom, anchors
+        # The next instant in the plan. WHICH account fills it is decided
+        # afresh each tick (instants are assigned by priority, not owned by
+        # an account) — what is pinned here is that the instant is honoured
+        # on time.
+        due_at = min(
+            slot.at_ts for slot in schedule.values() if slot.at_ts is not None
+        )
+        # The loop is woken for it rather than sleeping through it: the
+        # deadline is recorded, and `_next_delay` never sleeps past it.
+        assert h.engine._warm_deadline_ts == pytest.approx(due_at)
+        assert h.engine._next_delay(TickOutcome.NO_ACTION) <= due_at - first
+
+        h.clock.advance(due_at - first)
+        h.events.clear()
+        self._tick(h, {
+            # #2's hello landed: it is warm at the phase it just created.
+            "1": _usage(30),
+            "2": _usage(10, _iso_at(first + warmup_mod.PERIOD_S)),
+            "3": _usage(80),
+        })
+        self._settle(h.engine)
+        spawned = [path.name for path, _ in h.runner.calls]
+        assert len(spawned) == 2  # the anchor, then this deadline's hello
+        assert "cfg-2" not in spawned[1:]  # ...and not the warm one again
+
+    def test_no_schedule_while_warmup_is_off(self, temp_home, monkeypatch):
+        h = self._warm_harness(temp_home, monkeypatch, warmup_enabled=False)
+        self._tick(h, self._cold())
+        assert h.engine.warmup_schedule() == {}
+        assert h.engine.warmup_enabled is False

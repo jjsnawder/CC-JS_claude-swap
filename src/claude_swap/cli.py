@@ -757,6 +757,71 @@ def _priority_command(argv: list[str]) -> None:
         sys.exit(130)
 
 
+def _reserve_accounts_arg(value: str) -> str:
+    """argparse ``type`` for ``cswap auto --reserve``: the strict
+    ``autoswitch.reserveAccounts`` parser, so a typo errors at the prompt."""
+    from claude_swap.exceptions import ConfigError
+    from claude_swap.settings import SETTING_SPECS, parse_setting_value
+
+    try:
+        return parse_setting_value(SETTING_SPECS["autoswitch.reserveAccounts"], value)
+    except ConfigError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+
+
+# Fork (consume-first-reserve-jj): session-only auto-screen overrides on a TUI
+# launch. Peeled off BEFORE the main parser, whose own --strategy belongs to
+# bare `switch` with different choices.
+_TUI_LAUNCH_VERBS = ("tui", "watch", "--tui", "--watch")
+_TUI_OVERRIDE_FLAGS = ("--strategy", "--reserve")
+
+
+def _tui_override_parser(verb: str | None = None) -> argparse.ArgumentParser:
+    """``verb``: the launch token (``tui``, ``--watch``...) so an error
+    reads ``cswap watch: ...``; None (bare ``cswap``) reads ``cswap: ...``."""
+    from claude_swap.settings import SETTING_SPECS
+
+    prog = _prog_name() + (f" {verb}" if verb else "")
+    parser = argparse.ArgumentParser(prog=prog, add_help=False, allow_abbrev=False)
+    parser.add_argument(
+        "--strategy", choices=SETTING_SPECS["autoswitch.strategy"].choices
+    )
+    parser.add_argument("--reserve", type=_reserve_accounts_arg)
+    return parser
+
+
+def _pop_tui_overrides(argv: list[str]) -> tuple[list[str], argparse.Namespace | None]:
+    """Split ``--strategy S`` / ``--reserve NUMS|none`` off a TUI launch
+    (``cswap tui|watch ...``, or bare ``cswap`` given ONLY those flags).
+
+    Returns (argv without them, Namespace or None when none were given).
+    Any other argv is returned untouched, so ``cswap switch --strategy
+    best`` keeps reaching the main parser. Nothing is ever persisted: the
+    auto screen overlays these onto settings.json via ``merged_with_cli``.
+    """
+    if argv and argv[0] in _TUI_LAUNCH_VERBS:
+        head, tail = argv[:1], argv[1:]
+    else:
+        # Bare form: every token must be one of the override flags or its
+        # value; anything else is not a TUI launch.
+        i = 0
+        while i < len(argv):
+            token = argv[i]
+            if token in _TUI_OVERRIDE_FLAGS:
+                i += 2
+            elif token.startswith(tuple(f + "=" for f in _TUI_OVERRIDE_FLAGS)):
+                i += 1
+            else:
+                return argv, None
+        if not argv:
+            return argv, None
+        head, tail = [], argv
+    ns, rest = _tui_override_parser(head[0] if head else None).parse_known_args(tail)
+    if ns.strategy is None and ns.reserve is None:
+        return argv, None
+    return head + rest, ns
+
+
 def _auto_command(argv: list[str]) -> None:
     """Handle `cswap auto [--once] [--json] [...]`.
 
@@ -793,6 +858,10 @@ Examples:
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
   cswap auto --dry-run             # log decisions, never actually switch
+  cswap auto --strategy consume-first-reserve-jj --reserve 1,4
+                                   # consume-first, accounts 1 and 4 used last
+  cswap auto --strategy consume-first-reserve-jj --reserve none
+                                   # same strategy, no reserve (= consume-first)
 
 Defaults live in settings.json in the backup root; flags override them.
         """,
@@ -867,6 +936,20 @@ Defaults live in settings.json in the backup root; flags override them.
             "'consume-first' (proactively use the account whose weekly window "
             "resets soonest), or 'priority-consume-first' (highest account "
             "priority, then soonest weekly reset; only targets below all switch lines)"
+            # Fork-only addition, kept as its own literal for rebases.
+            "; 'consume-first-reserve-jj' is consume-first with the --reserve "
+            "accounts used last"
+        ),
+    )
+    parser.add_argument(
+        "--reserve",
+        type=_reserve_accounts_arg,
+        default=None,
+        metavar="NUMS|none",
+        help=(
+            "consume-first-reserve-jj: account number(s) consumed last, "
+            "comma-separated (e.g. 1 or 1,4), or 'none'; overrides "
+            "autoswitch.reserveAccounts (default 1)"
         ),
     )
     parser.add_argument(
@@ -895,6 +978,13 @@ Defaults live in settings.json in the backup root; flags override them.
             line = accent(line)
         elif event.kind in ("error", "account-quarantined"):
             line = yellowed(line)
+        elif event.kind == "warmup":
+            # Background noise, except when it stops working.
+            line = (
+                yellowed(line)
+                if getattr(event, "action", "") == "failed"
+                else dimmed(line)
+            )
         elif event.kind in ("poll", "no-switch", "sleep"):
             line = dimmed(line)
         print(f"{stamp}  {line}", flush=True)
@@ -932,7 +1022,22 @@ Defaults live in settings.json in the backup root; flags override them.
                     f"{' (dry-run)' if args.dry_run else ''} — Ctrl-C to stop"
                 )
             )
-        sys.exit(engine.run_loop())
+        # Fork (engine_control): `cswap engine` channel, loop mode only.
+        from claude_swap import engine_control
+
+        control = engine_control.start_server(
+            lambda: engine, host="auto", backup_root=switcher.backup_dir
+        )
+        if control is None:  # else the hub falls back to a competing switch
+            print(
+                dimmed("cswap engine control unavailable: outside picks/strategy "
+                       "cannot reach this engine"),
+                file=sys.stderr if args.json else sys.stdout,
+            )
+        try:
+            sys.exit(engine.run_loop())
+        finally:
+            engine_control.stop_server(control)
     except ClaudeSwitchError as e:
         if args.json:
             print(json.dumps(error_envelope(e)))
@@ -944,6 +1049,116 @@ Defaults live in settings.json in the backup root; flags override them.
             f"\n{dimmed('Auto-switch stopped')}",
             file=sys.stderr if args.json else sys.stdout,
         )
+        sys.exit(130)
+
+
+def _warm_command(argv: list[str]) -> None:
+    """Handle `cswap warm [--dry-run] [--json] [--all]`.
+
+    Pre-dispatched before the main parser is built, like `run`, `auto` and
+    `config` (same limitation: `warm` must be the first argument). Sends a
+    tiny headless ``claude -p`` hello to every managed account whose 5-hour
+    window has lapsed, which is what makes its reset stamp exist — after an
+    Anthropic-side reset the 5h/7d/per-model stamps stay blank until the
+    account is actually used. Cold accounts only unless ``--all``.
+
+    Exit codes: 0 every attempted hello succeeded, 1 at least one failed,
+    2 nothing to do (no eligible cold account).
+    """
+    parser = argparse.ArgumentParser(
+        prog="cswap warm",
+        description=(
+            "Send a minimal headless Claude Code hello to every managed "
+            "account whose 5-hour window has lapsed, so its reset time is "
+            "known again. Costs a few hundred tokens per account."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Exit codes:
+  0  every attempted ping succeeded
+  1  at least one ping failed
+  2  nothing to do (no eligible cold account)
+
+Examples:
+  cswap warm                 # ping the cold accounts, then show usage
+  cswap warm --dry-run       # say which accounts would be pinged
+  cswap warm --all           # ping every eligible account, cold or not
+  cswap warm --json          # machine-readable result
+        """,
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report which accounts would be pinged; spawn nothing",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit a machine-readable JSON result instead of the tables",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        dest="force_all",
+        help="Ping every eligible account, not only the cold ones",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    from claude_swap import warmup
+    from claude_swap.json_output import SCHEMA_VERSION
+    from claude_swap.settings import load_settings, parse_model_names
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        settings = load_settings(switcher.backup_dir)
+        summary = warmup.warm_now(
+            switcher,
+            models=parse_model_names(settings.model),
+            dry_run=args.dry_run,
+            force_all=args.force_all,
+        )
+        if args.json:
+            print(json.dumps({
+                "schemaVersion": SCHEMA_VERSION,
+                "dryRun": summary.dry_run,
+                "results": [
+                    {
+                        "number": int(row.number),
+                        "email": row.email,
+                        "action": row.action,
+                        "model": row.model,
+                        "detail": row.detail,
+                    }
+                    for row in summary.rows
+                ],
+            }))
+        else:
+            for row in summary.rows:
+                who = f"Account-{row.number}" + (f" ({row.email})" if row.email else "")
+                tail = f" — {row.detail}" if row.detail else ""
+                if row.action == "would-ping":
+                    print(dimmed(f"[dry-run] would warm {who} with {row.model}"))
+                elif row.action == "pinged":
+                    print(f"{accent('Warmed')} {who}{tail}")
+                elif row.action == "failed":
+                    print(warning(f"Warmup failed for {who}{tail}"))
+                else:
+                    print(dimmed(f"Skipped {who}{tail}"))
+            if not summary.attempted:
+                print(dimmed("Nothing to warm."))
+            elif not summary.dry_run:
+                print()
+                switcher.list_accounts()
+        sys.exit(summary.exit_code())
+    except ClaudeSwitchError as e:
+        if args.json:
+            print(json.dumps(error_envelope(e)))
+        else:
+            error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Warmup cancelled')}")
         sys.exit(130)
 
 
@@ -1202,6 +1417,14 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
         return
+    if argv and argv[0] == "warm":
+        _warm_command(argv[1:])
+        return
+    if argv and argv[0] == "engine":  # fork: engine_control (`cswap engine`)
+        from claude_swap import engine_control
+
+        engine_control.main(argv[1:])
+        return
     if argv and argv[0] == "map":
         _map_command(argv[1:])
         return
@@ -1226,6 +1449,10 @@ def main() -> None:
     if argv and argv[0] == "move":
         _move_command(argv[1:])
         return
+
+    # Fork: `cswap [tui|watch] --strategy S --reserve NUMS|none`.
+    argv, tui_overrides = _pop_tui_overrides(argv)
+    tui_kwargs = {"auto_overrides": tui_overrides} if tui_overrides else {}
 
     # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
     # lazygit/k9s). TTY-gated on both ends so scripts and pipes keep getting
@@ -1270,6 +1497,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s warm                       ping cold accounts to restart their 5h window
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts
@@ -1296,6 +1524,9 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s run 2 -- --resume                 # forward args after '--' to claude
   %(prog)s auto --once                       # single auto-switch tick (cron-friendly)
   %(prog)s config set autoswitch.threshold 80
+  %(prog)s tui --strategy consume-first-reserve-jj --reserve 1,4
+                                          # auto screen overrides, this session only
+  %(prog)s watch --reserve none              # (also bare %(prog)s; never saved)
 
 The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep working.
         """,
@@ -1683,11 +1914,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         elif args.tui:
             from claude_swap.tui import run as tui_run
 
-            sys.exit(tui_run(switcher))
+            sys.exit(tui_run(switcher, **tui_kwargs))
         elif args.watch:
             from claude_swap.tui import run as tui_run
 
-            sys.exit(tui_run(switcher, start="watch"))
+            sys.exit(tui_run(switcher, start="watch", **tui_kwargs))
         elif args.menubar:
             if sys.platform != "darwin":
                 error("The menu bar is only available on macOS.")

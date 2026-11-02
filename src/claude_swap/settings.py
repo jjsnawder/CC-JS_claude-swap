@@ -26,7 +26,9 @@ from claude_swap.fsutil import atomic_write_text, publish_target
 
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
-AUTOSWITCH_STRATEGIES = ("best", "consume-first", "priority-consume-first")
+AUTOSWITCH_STRATEGIES = (
+    "best", "consume-first", "priority-consume-first", "consume-first-reserve-jj",
+)
 
 _logger = logging.getLogger("claude-swap")
 
@@ -49,7 +51,10 @@ class AutoSwitchSettings:
     re-triggers next tick) and beat the active account by at least
     ``hysteresis_pct`` points of headroom measured against those lines, so two
     accounts hovering at the line never ping-pong while a strictly better
-    account is always taken.
+    account is always taken. Under ``strategy="consume-first"`` that same
+    margin also sets the 5h-hot bar: a candidate whose 5-hour window is within
+    ``hysteresis_pct`` of the threshold ranks behind every cooler one, since
+    landing there buys only minutes of work before the next trigger.
     """
 
     threshold: float = 90.0
@@ -69,6 +74,22 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Warmup (see claude_swap/warmup.py): send a tiny headless `claude -p`
+    # hello to any managed account whose 5-hour window has lapsed, so its
+    # reset stamp exists and the accounts' resets end up spread across the
+    # day. Default OFF — it spends (a few hundred) tokens and spawns a child
+    # process, neither of which an upgrade may start doing unasked.
+    # ``warmup_stagger`` off degrades to plain keep-alive: every cold
+    # account is warmed as soon as it lapses, wherever that lands its reset.
+    warmup_enabled: bool = False
+    warmup_stagger: bool = True
+    # Fork-only (consume-first-reserve-jj): comma-separated account numbers
+    # (e.g. "1" or "1,4") consumed LAST under that strategy. Ignored by every
+    # other strategy. Default "1" (a missing account 1 is a no-op).
+    # "none" (``RESERVE_NONE``; None, "" or false too) = no reserve,
+    # and the strategy then equals consume-first. Canonicalised by
+    # ``_clamped`` via ``parse_account_numbers``.
+    reserve_accounts: str | None = "1"
 
 
 @dataclass(frozen=True)
@@ -115,7 +136,7 @@ class SettingSpec:
     section: str  # top-level JSON section ("autoswitch", "ui", "updates")
     json_key: str  # camelCase key inside the section
     field: str  # snake_case AutoSwitchSettings field
-    kind: str  # "float" | "int" | "bool" | "choice"
+    kind: str  # "float" | "int" | "bool" | "choice" | "string" | "accounts"
     lo: float | None = None
     hi: float | None = None
     choices: tuple[str, ...] = ()
@@ -153,7 +174,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "hysteresisPct", "hysteresis_pct", "float", 0.0, 50.0,
-            help="A target must beat the active account by this many pct of headroom",
+            help="A target must beat the active by this many pct of headroom (also consume-first's 5h-hot bar)",
         ),
         SettingSpec(
             "autoswitch", "strategy", "strategy", "choice",
@@ -171,6 +192,18 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "warmupEnabled", "warmup_enabled", "bool",
+            help="Keep every account's 5h window alive with a tiny headless ping",
+        ),
+        SettingSpec(
+            "autoswitch", "warmupStagger", "warmup_stagger", "bool",
+            help="Space warmup pings so the accounts' 5h resets spread across the day",
+        ),
+        SettingSpec(
+            "autoswitch", "reserveAccounts", "reserve_accounts", "accounts",
+            help="consume-first-reserve-jj: account numbers used last (e.g. 1 or 1,4), or none",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
@@ -212,6 +245,42 @@ def parse_model_names(value: str | None) -> tuple[str, ...]:
     return tuple(seen.values())
 
 
+#: Fork (consume-first-reserve-jj): the explicit "no reserve" value of
+#: ``autoswitch.reserveAccounts`` (accepted case-insensitively).
+RESERVE_NONE = "none"
+
+
+def _is_reserve_none(value) -> bool:
+    """An explicit empty reserve: "none" (any case), "", None or []."""
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in ("", RESERVE_NONE)
+    return isinstance(value, (list, tuple)) and not value
+
+
+def parse_account_numbers(value) -> tuple[str, ...]:
+    """Lenient account-number list: ``"1,4"``, ``4`` or ``[1, "4"]`` ->
+    ``("1", "4")``. Slot numbers are positive integers, normalised through
+    ``int`` (``"01"`` -> ``"1"``) and deduped in first-seen order; anything
+    else is dropped. ``parse_setting_value`` is the strict twin."""
+    if value is None or isinstance(value, bool):
+        return ()
+    parts = value if isinstance(value, (list, tuple)) else str(value).split(",")
+    seen: list[str] = []
+    for part in parts:
+        if isinstance(part, bool):
+            continue
+        text = str(part).strip()
+        # isascii: "²".isdigit() is True but int("²") raises.
+        if not (text.isascii() and text.isdigit()) or int(text) <= 0:
+            continue
+        num = str(int(text))
+        if num not in seen:
+            seen.append(num)
+    return tuple(seen)
+
+
 def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
     """Clamp values into the SETTING_SPECS ranges; bad types → the default."""
 
@@ -243,6 +312,28 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
             # A non-empty string keeps as-is; anything else reverts to default
             # (None) so a null/garbage settings.json value disables the filter.
             kwargs[spec.field] = value if isinstance(value, str) and value else spec.default
+        elif spec.kind == "accounts":
+            nums = parse_account_numbers(value)
+            if value is False or _is_reserve_none(value):
+                kwargs[spec.field] = RESERVE_NONE
+            elif not nums:  # junk ("0", true, "x", ["", " "]): the default
+                _logger.warning(
+                    "settings.json: unsupported %s %r; using %r",
+                    spec.dotted, value, spec.default,
+                )
+                kwargs[spec.field] = spec.default
+            else:
+                parts = (
+                    value if isinstance(value, (list, tuple))
+                    else str(value).split(",")
+                )
+                if any(not parse_account_numbers([p]) for p in parts):
+                    _logger.warning(
+                        "settings.json: %s %r has entries that are not "
+                        "account numbers; using %r",
+                        spec.dotted, value, ",".join(nums),
+                    )
+                kwargs[spec.field] = ",".join(nums)
         else:  # choice
             if value not in spec.choices:
                 _logger.warning(
@@ -381,6 +472,20 @@ def parse_setting_value(spec: SettingSpec, raw_value: str):
                 f"{spec.dotted} must be one of: {', '.join(spec.choices)}"
             )
         return raw_value
+    if spec.kind == "accounts":
+        if raw_value.strip().lower() == RESERVE_NONE:
+            return RESERVE_NONE
+        parts = [part.strip() for part in raw_value.split(",")]
+        bad = [
+            p for p in parts
+            if not (p.isascii() and p.isdigit()) or int(p) <= 0  # "²" too
+        ]
+        if not raw_value.strip() or bad:
+            raise ConfigError(
+                f"{spec.dotted} expects comma-separated account numbers "
+                f"(e.g. 1 or 1,4) or 'none', got '{raw_value}'"
+            )
+        return ",".join(parse_account_numbers(raw_value))
     if spec.kind == "string":
         value = raw_value.strip()
         if not value:
@@ -521,6 +626,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("include_api_key_accounts", "include_api_key_accounts"),
         ("model", "model"),
         ("strategy", "strategy"),
+        ("reserve", "reserve_accounts"),
     ):
         value = getattr(args, attr, None)
         if value is not None:

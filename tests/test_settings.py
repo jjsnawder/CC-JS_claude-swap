@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import stat
 import os
 import sys
@@ -269,6 +270,28 @@ class TestSetUnsetSetting:
         with pytest.raises(ConfigError, match="true or false"):
             set_setting(tmp_path, "autoswitch.includeApiKeyAccounts", "falsy")
 
+    def test_warmup_keys_round_trip(self, tmp_path: Path):
+        """Warmup is OFF by default (it spends tokens and spawns a child
+        process; an upgrade may not start doing that unasked) and staggered
+        when on."""
+        defaults = AutoSwitchSettings()
+        assert defaults.warmup_enabled is False
+        assert defaults.warmup_stagger is True
+
+        assert set_setting(tmp_path, "autoswitch.warmupEnabled", "true") is True
+        assert set_setting(tmp_path, "autoswitch.warmupStagger", "no") is False
+        loaded = load_settings(tmp_path)
+        assert loaded.warmup_enabled is True
+        assert loaded.warmup_stagger is False
+
+    def test_garbage_warmup_values_clamp_to_bools(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"warmupEnabled": "yes", "warmupStagger": 0}})
+        )
+        loaded = load_settings(tmp_path)
+        assert loaded.warmup_enabled is True
+        assert loaded.warmup_stagger is False
+
     def test_set_on_corrupt_file_raises_and_preserves_it(self, tmp_path: Path):
         settings_path(tmp_path).write_text("{not json")
         with pytest.raises(ConfigError, match="not valid JSON"):
@@ -491,3 +514,124 @@ class TestWeeklyThreshold:
     def test_cli_value_is_clamped(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(weekly_threshold=970.0))
         assert merged.weekly_threshold == 99.9
+
+
+class TestReserveAccountsSetting:
+    """Fork-only: autoswitch.reserveAccounts (consume-first-reserve-jj)."""
+
+    def test_reserve_strategy_is_a_valid_choice(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"strategy": "consume-first-reserve-jj"}})
+        )
+        assert load_settings(tmp_path).strategy == "consume-first-reserve-jj"
+
+    def test_default_is_account_1(self):
+        assert AutoSwitchSettings().reserve_accounts == "1"
+        assert SETTING_SPECS["autoswitch.reserveAccounts"].default == "1"
+
+    def test_missing_key_loads_the_default(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"autoswitch": {}}))
+        assert load_settings(tmp_path).reserve_accounts == "1"
+
+    @pytest.mark.parametrize(
+        "raw, expected",
+        [
+            ("1", "1"),
+            ("1,4", "1,4"),
+            (" 4 , 01,4 ", "4,1"),
+            (2, "2"),
+            ([1, "3"], "1,3"),
+            ("x,2", "2"),        # lenient load drops the junk part
+            ("4,²", "4"),     # "²".isdigit() is True; int("²") raises
+            ("1,²", "1"),
+            ("²", "1"),       # junk only -> the default
+            ("0", "1"),
+            (True, "1"),
+            ("none", "none"),    # explicit no-reserve survives the clamp
+            ("NONE", "none"),
+            (" None ", "none"),
+            ("", "none"),
+            (None, "none"),
+            ([], "none"),
+            (False, "none"),     # JSON false reads as no reserve
+            (0, "1"),
+            ("4;2", "1"),
+            ("4 2", "1"),
+            (["", " "], "1"),
+        ],
+    )
+    def test_lenient_load(self, tmp_path: Path, raw, expected):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"reserveAccounts": raw}})
+        )
+        assert load_settings(tmp_path).reserve_accounts == expected
+
+    @staticmethod
+    def _load_warnings(tmp_path: Path, caplog, raw) -> list[str]:
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"reserveAccounts": raw}})
+        )
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            load_settings(tmp_path)
+        return [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and "reserveAccounts" in r.getMessage()
+        ]
+
+    @pytest.mark.parametrize(
+        "raw", ["0", 0, True, "x", "4;2", "4 2", ["", " "], "²"]
+    )
+    def test_junk_load_warns_and_uses_the_default(self, tmp_path, caplog, raw):
+        warnings = self._load_warnings(tmp_path, caplog, raw)
+        assert len(warnings) == 1
+        assert "unsupported" in warnings[0] and "'1'" in warnings[0]
+
+    @pytest.mark.parametrize(
+        "raw, kept", [("x,2", "2"), ("4,²", "4"), ([1, "x"], "1"), ("1,4,", "1,4")]
+    )
+    def test_partly_bad_list_warns(self, tmp_path, caplog, raw, kept):
+        warnings = self._load_warnings(tmp_path, caplog, raw)
+        assert len(warnings) == 1
+        assert "not account numbers" in warnings[0] and repr(kept) in warnings[0]
+        assert load_settings(tmp_path).reserve_accounts == kept
+
+    @pytest.mark.parametrize(
+        "raw", ["1", "1,4", " 4 , 01,4 ", 2, [1, "3"], "none", "", None, [], False]
+    )
+    def test_clean_values_load_silently(self, tmp_path, caplog, raw):
+        assert self._load_warnings(tmp_path, caplog, raw) == []
+
+    def test_strict_set_canonicalises(self, tmp_path: Path):
+        assert set_setting(tmp_path, "autoswitch.reserveAccounts", "4, 1") == "4,1"
+        assert load_settings(tmp_path).reserve_accounts == "4,1"
+
+    @pytest.mark.parametrize("raw", ["none", "NONE", " None "])
+    def test_strict_set_accepts_none(self, tmp_path: Path, raw):
+        assert set_setting(tmp_path, "autoswitch.reserveAccounts", raw) == "none"
+        assert load_settings(tmp_path).reserve_accounts == "none"
+
+    def test_unset_returns_to_the_default(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.reserveAccounts", "none")
+        assert unset_setting(tmp_path, "autoswitch.reserveAccounts") is True
+        assert load_settings(tmp_path).reserve_accounts == "1"
+
+    @pytest.mark.parametrize(
+        "bad", ["", "  ", "a", "1,b", "0", "1,,2", "1.5", "²", "1,²", "1,none"]
+    )
+    def test_strict_set_rejects(self, tmp_path: Path, bad):
+        with pytest.raises(ConfigError):
+            set_setting(tmp_path, "autoswitch.reserveAccounts", bad)
+
+    def test_cli_override(self):
+        merged = merged_with_cli(AutoSwitchSettings(), _args(reserve="1,4"))
+        assert merged.reserve_accounts == "1,4"
+        merged = merged_with_cli(AutoSwitchSettings(), _args(reserve="none"))
+        assert merged.reserve_accounts == "none"
+
+    def test_save_round_trip(self, tmp_path: Path):
+        s = AutoSwitchSettings(
+            strategy="consume-first-reserve-jj", reserve_accounts="1"
+        )
+        save_settings(tmp_path, s)
+        assert load_settings(tmp_path) == s

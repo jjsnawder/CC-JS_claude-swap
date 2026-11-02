@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from claude_swap import cli
+from claude_swap.settings import SETTING_SPECS
 
 
 def _run(argv: list[str], capsys) -> tuple[int, str, str]:
@@ -49,12 +50,15 @@ class TestConfigList:
             "autoswitch.includeApiKeyAccounts",
             "autoswitch.unhealthyTicks",
             "autoswitch.model",
+            "autoswitch.warmupEnabled",
+            "autoswitch.warmupStagger",
+            "autoswitch.reserveAccounts",
             "ui.theme",
             "run.shareHistory",
             "updates.check",
         ):
             assert key in out
-        assert out.count("(default)") == 12
+        assert out.count("(default)") == len(SETTING_SPECS)
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -81,7 +85,7 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 12
+        assert len(by_key) == len(SETTING_SPECS)
         assert by_key["autoswitch.threshold"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
         # An unset weekly line reports null, not the threshold it falls back
@@ -331,3 +335,36 @@ class TestWeeklyThresholdConfig:
                 cli.main()
         assert captured["settings"].threshold == 85.0
         assert captured["settings"].weekly_threshold == 97.0
+
+
+class TestConfigReserveAccounts:
+    """Fork-only: autoswitch.reserveAccounts + the consume-first-reserve-jj choice."""
+
+    def test_set_reserve_strategy_and_accounts(self, temp_home, capsys):
+        assert _run(
+            ["set", "autoswitch.strategy", "consume-first-reserve-jj"], capsys
+        )[0] == 0
+        assert _run(["set", "autoswitch.reserveAccounts", "1, 4,1"], capsys)[0] == 0
+        raw = json.loads(_settings_file(capsys).read_text())
+        assert raw["autoswitch"]["strategy"] == "consume-first-reserve-jj"
+        assert raw["autoswitch"]["reserveAccounts"] == "1,4"
+
+    @pytest.mark.parametrize("bad", ["x", "0", "1,,2", "-1", " ", "²"])
+    def test_bad_reserve_value_exits_1(self, temp_home, capsys, bad):
+        code, _, err = _run(["set", "autoswitch.reserveAccounts", bad], capsys)
+        assert code == 1
+        assert "account numbers" in err
+        assert "Traceback" not in err
+
+    def test_default_is_1_and_none_round_trips(self, temp_home, capsys):
+        code, out, _ = _run(["get", "autoswitch.reserveAccounts"], capsys)
+        assert (code, out.strip()) == (0, "1")
+        assert _run(["set", "autoswitch.reserveAccounts", "None"], capsys)[0] == 0
+        raw = json.loads(_settings_file(capsys).read_text())
+        assert raw["autoswitch"]["reserveAccounts"] == "none"
+        code, out, _ = _run(["get", "autoswitch.reserveAccounts"], capsys)
+        assert (code, out.strip()) == (0, "none")
+        # unset goes back to the default, not to "no reserve"
+        assert _run(["unset", "autoswitch.reserveAccounts"], capsys)[0] == 0
+        code, out, _ = _run(["get", "autoswitch.reserveAccounts"], capsys)
+        assert (code, out.strip()) == (0, "1")

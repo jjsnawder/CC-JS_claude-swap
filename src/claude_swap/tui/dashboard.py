@@ -47,6 +47,7 @@ class DashboardScreen(Screen):
         # Power shortcuts; the menu is the discoverable path.
         Binding("g", "app.open_auto", "Auto view", show=False),
         Binding("f", "app.refresh_full", "Refresh usage", show=False),
+        Binding("p", "app.warm_ping", "Ping/warm", show=False),
         Binding("j", "cursor_down", show=False),
         Binding("k", "cursor_up", show=False),
     ]

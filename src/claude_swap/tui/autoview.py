@@ -9,11 +9,15 @@ lock) make it safe to run alongside an external ``cswap auto``.
 The active account's full card sits on top (same widget as the dashboard's
 panel, with the threshold tick); this screen adds the engine badge, the
 ranked switch candidates, and the decision log. While it is up, the app's
-snapshot poller runs store-only: the engine is the only fetcher.
+snapshot poller runs store-only: the engine is the only fetcher. `n` asks the
+engine to switch by its strategy; `m` (manual pick) names the target and the
+engine holds it until the threshold.
 """
 
 from __future__ import annotations
 
+import re
+import time
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -24,17 +28,26 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Footer, RichLog, Static
 
-from claude_swap import oauth
+from claude_swap import oauth, warmup
 from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
+    consume_first_key,
     pct_label,
 )
+from claude_swap.autoswitch import (  # fork: consume-first-reserve-jj
+    RESERVE_STRATEGY,
+    is_consume_first,
+    reserve_accounts,
+    strategy_cycle,
+)
 from claude_swap.lines import binding_window
+from claude_swap.poll_policy import binding_pct  # fork: manual-pick rows
 from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
+from claude_swap.settings import merged_with_cli  # fork: TUI launch overrides
 from claude_swap.tui import data
-from claude_swap.tui.modals import ConfirmModal
+from claude_swap.tui.modals import AccountPickModal, ConfirmModal, PickRow
 from claude_swap.tui.theme import Palette
 from claude_swap.tui.widgets import AccountsPanel
 
@@ -47,19 +60,162 @@ _EVENT_ROLES = {
     "account-quarantined": "sev_warn",
     "all-exhausted": "sev_crit",
 }
-_QUIET_KINDS = {"poll", "no-switch", "sleep", "account-unquarantined"}
+
+
+# Since v0.29 the poll line names the binding window ("5h 93% used"); the
+# label is lifted with the number.
+_USED_RE = re.compile(r"\): ([^():|]*?\d+% used) ")
 
 
 def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Text:
-    """Log line for one engine event, styled like the CLI's human renderer."""
+    """Log line for one engine event, styled like the CLI's human renderer.
+
+    The clock stamp is always foreground so key times stand out of a scrolling
+    log; the body is muted unless the event kind carries a role colour
+    (switch, error, quarantine, exhausted). A poll line's active-account
+    ``N% used`` is lifted to foreground too — the one number worth reading.
+    """
     role = _EVENT_ROLES.get(event.kind)
-    if role is not None:
-        style = getattr(palette, role)
-    else:
-        style = palette.muted if event.kind in _QUIET_KINDS else palette.foreground
+    if event.kind == "warmup" and getattr(event, "action", "") == "failed":
+        # Warmup is background noise until it stops working: a hello that
+        # cannot run means an account's window will keep lapsing unseen.
+        role = "sev_warn"
+    style = getattr(palette, role) if role is not None else palette.muted
     text = Text()
-    text.append(f"{data.clock_stamp()}  ", style=palette.muted)
-    text.append(event.human(), style=style)
+    text.append(f"{data.clock_stamp()}  ", style=palette.foreground)
+    body = event.human()
+    note = getattr(event, "note", "")
+    if note and body.endswith(f" · {note}"):
+        # A switch's aside (e.g. "not held") reads as detail, not as the switch.
+        text.append(body[: -len(note) - 3], style=style)
+        text.append(body[-len(note) - 3 :], style=palette.muted)
+        return text
+    match = _USED_RE.search(body) if event.kind == "poll" else None
+    if match is None:
+        text.append(body, style=style)
+        return text
+    text.append(body[: match.start(1)], style=style)
+    text.append(match.group(1), style=palette.foreground)
+    text.append(body[match.end(1) :], style=style)
+    return text
+
+
+def countdown_text(seconds: float) -> str:
+    """``H:MM:SS`` from an hour up, ``MM:SS`` below it. Never negative."""
+    s = int(max(0.0, seconds))
+    hours, rem = divmod(s, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _clock_at(ts: float) -> str:
+    """Local-time ``HH:MM`` for an absolute instant."""
+    return time.strftime("%H:%M", time.localtime(ts))
+
+
+def _slot_status_text(slot: "warmup.WarmupSlot", *, now: float) -> tuple[str, str]:
+    """One slot's status phrase, plus the palette role it defaults to."""
+    if slot.upcoming:
+        if slot.at_ts is not None and slot.at_ts > now:
+            return (
+                f"next hello in {countdown_text(slot.at_ts - now)} "
+                f"({_clock_at(slot.at_ts)}) · {slot.model}",
+                "foreground",
+            )
+        # A dry-run engine previews the same decision every tick and spawns
+        # nothing — "due now" forever would read as a stuck warmup.
+        if slot.dry_run:
+            return f"would hello now (dry-run) · {slot.model}", "foreground"
+        return f"hello due now · {slot.model}", "foreground"
+    if slot.status == "in-flight":
+        return "hello in flight", "accent"
+    if slot.status == "warm":
+        if slot.reset_ts is not None:
+            return (
+                f"warm · 5h resets {_clock_at(slot.reset_ts)} "
+                f"(in {countdown_text(slot.reset_ts - now)})",
+                "muted",
+            )
+        return "warm", "muted"
+    if slot.status == "excluded":
+        return f"held: {slot.reason or 'switched to this tick'}", "muted"
+    return f"skipped: {slot.reason or 'not eligible'}", "muted"
+
+
+def warmup_panel_text(
+    schedule: dict,
+    *,
+    now: float,
+    enabled: bool,
+    palette: Palette = Palette.DARK,
+    stale_after_s: float | None = None,
+) -> Text:
+    """The warmup panel: when every managed account is next warmed.
+
+    Pure — takes the engine's :meth:`AutoSwitchEngine.warmup_schedule`
+    snapshot and a clock, returns the rendered block. The soonest upcoming
+    hello is summarized on the header line and its row is accented, so "when
+    do 1/2/3 get warmed" is answerable at a glance rather than by reading
+    back through the event log.
+
+    ``stale_after_s`` guards the one failure this panel cannot otherwise
+    show: the engine's spawn phase swallows its own exceptions, so a pass
+    that dies mid-flight leaves the PREVIOUS pass's schedule standing and
+    its countdowns run to "due now" and sit there. Past that age (the
+    caller's poll interval with room to spare) the header says so rather
+    than presenting arithmetic on a dead plan as fact.
+    """
+    text = Text()
+    text.append("WARMUP", style=f"bold {palette.accent}")
+    if not enabled:
+        text.append(
+            "  off — cswap config set autoswitch.warmupEnabled true",
+            style=palette.muted,
+        )
+        return text
+    slots = list(schedule.values())
+    if not slots:
+        text.append("\n  waiting for first tick…", style=palette.muted)
+        return text
+    # The soonest hello still ahead of us: a `due` row (this tick) outranks
+    # any scheduled one, and among scheduled rows the earliest `at_ts` wins.
+    upcoming = [s for s in slots if s.upcoming]
+    soonest = min(
+        upcoming,
+        key=lambda s: (s.at_ts if s.status == "scheduled" and s.at_ts else 0.0),
+        default=None,
+    )
+    in_flight = sum(1 for s in slots if s.status == "in-flight")
+    if soonest is not None and soonest.at_ts is not None and soonest.at_ts > now:
+        text.append(
+            f"  ·  next: Account-{soonest.number} in "
+            f"{countdown_text(soonest.at_ts - now)}",
+            style=palette.muted,
+        )
+    elif soonest is not None:
+        text.append(f"  ·  next: Account-{soonest.number} due now", style=palette.muted)
+    elif in_flight:
+        text.append(
+            f"  ·  {in_flight} hello{'s' if in_flight > 1 else ''} in flight",
+            style=palette.muted,
+        )
+    else:
+        text.append("  ·  nothing scheduled", style=palette.muted)
+    if stale_after_s is not None:
+        computed = max((s.computed_ts for s in slots), default=0.0)
+        if computed and now - computed > stale_after_s:
+            text.append(" (stale)", style=palette.muted)
+    for slot in slots:
+        text.append(f"\n  {slot.number:>2}  ", style=palette.foreground)
+        if slot.email:
+            text.append(slot.email, style=palette.foreground)
+        status, role = _slot_status_text(slot, now=now)
+        if soonest is not None and slot.number == soonest.number:
+            role = "accent"
+        text.append("  ")
+        text.append(status, style=getattr(palette, role))
     return text
 
 
@@ -67,6 +223,10 @@ class AutoScreen(Screen):
     BINDINGS = [
         Binding("l", "toggle_live", "Go live / dry-run"),
         Binding("t", "adjust_threshold", "Threshold"),
+        Binding("s", "toggle_strategy", "Strategy"),
+        Binding("n", "switch_now", "Switch now"),
+        Binding("m", "manual_pick", "Manual pick"),
+        Binding("p", "ping_warm", "Ping/warm"),
         Binding("left", "threshold_step(-1)", "-1%"),
         Binding("right", "threshold_step(1)", "+1%"),
         Binding("enter", "adjust_done", "Done"),
@@ -87,6 +247,17 @@ class AutoScreen(Screen):
         self._adjusting = False
         self._configured_threshold: float | None = None
         self._entry_threshold: float | None = None
+        # Session-only strategy toggle (s), same memory-only contract as the
+        # threshold: ``_configured_strategy`` is the mount-time file value,
+        # and the summary tags the difference so a session override can never
+        # be mistaken for the persisted one (`cswap config set` is that path).
+        self._configured_strategy: str | None = None
+        self._warm_timer = None
+        # Last warmup panel text rendered, to skip no-op repaints.
+        self._warm_rendered: str | None = None
+        # The engine pin last shown in the summary (` · holding #N`), so an
+        # engine event only repaints the summary when the pin changed.
+        self._shown_pin: str | None = None
 
     def compose(self) -> ComposeResult:
         yield AccountsPanel(show_minis=False, id="auto-active-panel")
@@ -95,6 +266,7 @@ class AutoScreen(Screen):
                 yield Static(" DRY-RUN ", id="mode-badge", classes="dry")
                 yield Static("", id="auto-summary")
             yield Static("", id="candidates")
+            yield Static("", id="warmup-panel")
         yield RichLog(id="event-log", highlight=False, markup=False, wrap=True)
         yield Footer()
 
@@ -103,11 +275,17 @@ class AutoScreen(Screen):
     def on_mount(self) -> None:
         self.app.set_store_only(True)
         self._settings = load_settings(self.app.switcher.backup_dir)
+        file_settings = self._settings  # fork: launch overrides tag "(session)"
+        self._settings = merged_with_cli(  # fork: `cswap tui --strategy/--reserve`
+            self._settings, getattr(self.app, "auto_overrides", None)
+        )
         # The bar tick everywhere reads app.threshold_pct, loaded once at app
         # startup — sync it to the fresh file value so bars and engine agree,
         # and remember that value: unmount restores it (only the session
         # adjustment reverts, not this correction).
         self._configured_threshold = self._settings.threshold
+        self._configured_strategy = file_settings.strategy
+        self._configured_reserve = file_settings.reserve_accounts  # fork
         self.app.threshold_pct = self._settings.threshold
         # The weekly line is not session-adjustable, so this is only the same
         # sync-to-the-file correction; nothing to restore on unmount.
@@ -116,8 +294,42 @@ class AutoScreen(Screen):
         self.watch(self.app, "snapshot", self._on_snapshot)
         self.watch(self.app, "theme", self._on_theme_change)
         self._start_engine(dry_run=True)
+        # Fork (engine_control): `cswap engine` channel for this screen's
+        # engine(s); outlives the `s`/`l` rebuilds, so it asks for the
+        # current one each request.
+        from claude_swap import engine_control
+
+        self._control = engine_control.start_server(
+            lambda: self._engine,
+            host="tui",
+            backup_root=self.app.switcher.backup_dir,
+            apply_strategy=lambda name: self.app.call_from_thread(
+                self._apply_engine_strategy, name
+            ),
+        )
+        if self._control is None:  # hub would fall back to a competing switch
+            self.query_one("#event-log", RichLog).write(
+                Text(
+                    "— cswap engine control unavailable: outside picks/strategy "
+                    "cannot reach this engine —",
+                    style=Palette.from_theme(self.app.current_theme).muted,
+                )
+            )
+        # A countdown has to move on its own: the engine only speaks on a
+        # tick (up to a minute apart) and the panel's whole job is telling
+        # you how long until the next hello. Screen-owned, so it stops with
+        # the screen; the render is a dict copy plus a few strings.
+        self._warm_timer = self.set_interval(1.0, self._refresh_warmup_panel)
+        self._refresh_warmup_panel()
 
     def on_unmount(self) -> None:
+        if self._warm_timer is not None:
+            self._warm_timer.stop()
+            self._warm_timer = None
+        from claude_swap import engine_control  # fork: engine_control
+
+        engine_control.stop_server(getattr(self, "_control", None))
+        self._control = None
         if self._engine is not None:
             self._engine.stop()
         # A session threshold must not outlive the engine it steered: unpin
@@ -130,6 +342,10 @@ class AutoScreen(Screen):
     def _on_theme_change(self, _theme: str) -> None:
         self._update_summary()
         self._update_badge()
+        # Same text, different colours: the repaint cache must not swallow a
+        # theme change.
+        self._warm_rendered = None
+        self._refresh_warmup_panel()
         snap = self.app.snapshot
         if snap is not None:
             self._on_snapshot(snap)
@@ -145,6 +361,11 @@ class AutoScreen(Screen):
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         if action in ("threshold_step", "adjust_done") and not self._adjusting:
             return False  # hidden and inert until adjust mode is armed
+        if (
+            action in ("toggle_strategy", "switch_now", "manual_pick", "ping_warm")
+            and self._adjusting
+        ):
+            return False  # the keys belong to the threshold while it is armed
         return True
 
     def action_adjust_threshold(self) -> None:
@@ -197,6 +418,212 @@ class AutoScreen(Screen):
         # weekly line the order and the 5h rows' "(line N%)" both move.
         self._on_snapshot(self.app.snapshot)
 
+    # -- strategy toggle ------------------------------------------------------
+
+    def action_toggle_strategy(self) -> None:
+        """Flip best <-> consume-first for this session only.
+
+        Nothing is written to settings.json (`cswap config set
+        autoswitch.strategy` stays the persistent path) -- but the engine
+        reads its settings at CONSTRUCTION, so the flip only reaches the
+        decision by rebuilding it, preserving the dry-run/live state.
+        """
+        if self._settings is None or self._adjusting:
+            return
+        # Cycle the configured choices, so a third upstream strategy needs
+        # no change here (an unknown value lands on the first choice).
+        choices = SETTING_SPECS["autoswitch.strategy"].choices
+        choices = strategy_cycle(choices, self._settings)  # fork: reserve variant
+        current = (
+            choices.index(self._settings.strategy)
+            if self._settings.strategy in choices
+            else -1
+        )
+        flipped = choices[(current + 1) % len(choices)]
+        self._settings = replace(self._settings, strategy=flipped)
+        if self._engine is not None:
+            self._restart_engine(dry_run=self._engine.dry_run)
+        self._update_summary()
+        snap = self.app.snapshot
+        if snap is not None:
+            self._on_snapshot(snap)  # "Next best" ranks by the new strategy
+        self.query_one("#event-log", RichLog).write(
+            Text(
+                f"— strategy set to {flipped} for this session —",
+                style=Palette.from_theme(self.app.current_theme).muted,
+            )
+        )
+
+    def _apply_engine_strategy(self, name: str) -> None:
+        """Fork (engine_control): `cswap engine strategy NAME`, already
+        persisted by the caller. The same rebuild as `s` (dry-run/live and
+        the held pick carried over), but the new value IS the configured
+        one now, so the summary drops its "(session)" tag."""
+        # Escape may have unmounted the screen while this call was queued:
+        # never rebuild an orphan engine. The raise makes the reply `live: false`.
+        if (
+            self._settings is None
+            or not self.is_attached
+            or getattr(self, "_control", None) is None
+        ):
+            raise RuntimeError("auto screen closed")
+        self._settings = replace(self._settings, strategy=name)
+        self._configured_strategy = name
+        if self._engine is not None:
+            self._restart_engine(dry_run=self._engine.dry_run)
+        self._update_summary()
+        snap = self.app.snapshot
+        if snap is not None:
+            self._on_snapshot(snap)
+        self.query_one("#event-log", RichLog).write(
+            Text(
+                f"— strategy set to {name} (cswap engine; saved to settings) —",
+                style=Palette.from_theme(self.app.current_theme).muted,
+            )
+        )
+
+    # -- switch now -----------------------------------------------------------
+
+    def action_switch_now(self) -> None:
+        """Ask the engine to switch on its next tick (trigger ``manual``).
+
+        The ENGINE performs it, not this screen: only the engine's tick does
+        the health checks, the token freshening, the quarantine handling and
+        the state record that a hand-rolled ``switch_to`` here would skip. It
+        ranks by the strategy shown in the summary — the session override
+        included, since `s` rebuilds the engine — without the anti-flap
+        margins, so it takes the strategy's top HEALTHY candidate: the
+        margin-based `skip` tags in "Next best" are waived, but a row
+        at/over the threshold is not (landing there re-triggers at once).
+
+        `m` (``action_manual_pick``) is the targeted sibling: the human names
+        the account instead of the strategy ranking it.
+
+        Inert in threshold-adjust mode, like `s`: the keys belong to the
+        threshold while it is armed. No confirmation — in DRY-RUN this is a
+        preview (`[dry-run] would switch ...`) and going LIVE was already
+        confirmed once, by `l`.
+        """
+        if self._settings is None or self._adjusting or self._engine is None:
+            return
+        self._engine.request_switch()
+        self.query_one("#event-log", RichLog).write(
+            Text(
+                f"— switch now requested ({self._settings.strategy}) —",
+                style=Palette.from_theme(self.app.current_theme).muted,
+            )
+        )
+
+    # -- manual pick ----------------------------------------------------------
+
+    def action_manual_pick(self) -> None:
+        """Pick the account to switch to; the engine switches to exactly it.
+
+        Same contract as `n` (the ENGINE performs it, one-shot, no confirm,
+        a preview in DRY-RUN), but the target is the human's — a disabled
+        slot included, as with ``cswap switch``: the engine refuses it only
+        if it is the active account, has no usable stored login, is
+        quarantined, busy (``target-busy``) or a landing `n` would refuse
+        (unreadable, at its limit, or at/over the threshold while the active
+        is readable and the fleet is not all over it); after a live switch
+        it holds it (``engine.pinned``, ` · holding #N` in
+        the summary) until it reaches the threshold — never an API-key
+        account, which has no quota to hold against."""
+        if self._settings is None or self._adjusting or self._engine is None:
+            return
+        snap = self.app.snapshot
+        if snap is None or not snap.accounts:
+            self.query_one("#event-log", RichLog).write(
+                Text(
+                    "— manual pick: no account data yet —",
+                    style=Palette.from_theme(self.app.current_theme).muted,
+                )
+            )
+            return
+        rows = self._pick_rows(snap)
+        self.app.push_screen(
+            AccountPickModal(rows), lambda number: self._on_manual_pick(number, rows)
+        )
+
+    def _pick_rows(self, snap: AccountsSnapshot) -> list[PickRow]:
+        """Picker rows in snapshot order, pcts on the engine's own windows."""
+        models = parse_model_names(self._settings.model)
+        threshold = self._settings.threshold
+        rows: list[PickRow] = []
+        for acc in snap.accounts:
+            pct = binding_pct(acc.usage.last_good, models)
+            label = None
+            if acc.usage.sentinel is not None:
+                label = data.sentinel_label(acc.usage.sentinel)
+            elif pct is None:
+                label = "usage unknown"
+            tags: list[str] = []
+            # Over its OWN lines (policy threshold, weekly line), the
+            # engine's landing test since v0.29 — not raw pct vs global.
+            binding = binding_window(
+                oauth.relevant_windows(acc.usage.last_good, models),
+                acc.policy.threshold
+                if acc.policy.threshold is not None
+                else threshold,
+                self._settings.weekly_threshold,
+                scale=threshold,
+            )
+            if label is None and binding is not None and binding.over:
+                tags.append("over threshold")
+            if acc.disabled:
+                tags.append("disabled")  # informational: still a valid pick
+            if not acc.switchable:
+                tags.append("not switchable")
+            rows.append(
+                PickRow(
+                    number=acc.number,
+                    email=acc.email,
+                    pct=pct,
+                    label=label,
+                    active=acc.number == snap.active_number,
+                    tags=tuple(tags),
+                )
+            )
+        return rows
+
+    def _on_manual_pick(self, number: str | None, rows: list[PickRow]) -> None:
+        if number is None or self._engine is None or not self.is_attached:
+            return
+        self._engine.request_switch(target=number)
+        email = next((r.email for r in rows if r.number == number), "")
+        who = f"Account-{number}" + (f" ({email})" if email else "")
+        self.query_one("#event-log", RichLog).write(
+            Text(
+                f"— switch to {who} requested (manual pick) —",
+                style=Palette.from_theme(self.app.current_theme).muted,
+            )
+        )
+
+    # -- ping / warm ----------------------------------------------------------
+
+    def action_ping_warm(self) -> None:
+        """Ask the engine to warm every cold account on its next tick.
+
+        Like `n`, the ENGINE does it: the hello has to go through the slot
+        preparation, the eligibility predicates and the state file, none of
+        which this screen owns. Unlike the automatic warmup, the request
+        ignores the stagger and does not require ``warmupEnabled`` — the
+        keypress is the authorization, and the point of it is to fill in the
+        reset stamps that an Anthropic-side reset left blank.
+
+        Inert in threshold-adjust mode, like `s` and `n`. In DRY-RUN the
+        engine previews (``would warm ...``) instead of spawning.
+        """
+        if self._settings is None or self._adjusting or self._engine is None:
+            return
+        self._engine.request_warm()
+        self.query_one("#event-log", RichLog).write(
+            Text(
+                "— warmup requested —",
+                style=Palette.from_theme(self.app.current_theme).muted,
+            )
+        )
+
     def _update_summary(self) -> None:
         palette = Palette.from_theme(self.app.current_theme)
         text = Text()
@@ -212,18 +639,43 @@ class AutoScreen(Screen):
                 f" · weekly {pct_label(self._settings.weekly_threshold)}%"
             )
         text.append(f" · poll every {self._settings.interval_seconds:.0f}s")
+        # The other two decision inputs, on screen: which windows the
+        # threshold is measured against, and how the target is chosen.
+        models = parse_model_names(self._settings.model)
+        text.append(
+            f" · model {', '.join(models)}" if models else " · model account-wide"
+        )
+        text.append(f" · {self._settings.strategy}")
+        if self._settings.strategy != self._configured_strategy:
+            text.append(" (session)", style=palette.muted)
+        reserves = reserve_accounts(self._settings)  # fork: consume-first-reserve-jj
+        if reserves:
+            text.append(
+                " · reserve " + ", ".join(f"#{n}" for n in sorted(reserves, key=int))
+            )
+        elif self._settings.strategy == RESERVE_STRATEGY:
+            text.append(" · reserve none")
+        if self._settings.strategy == RESERVE_STRATEGY and (
+            self._settings.reserve_accounts
+            != getattr(self, "_configured_reserve", self._settings.reserve_accounts)
+        ):  # a `--reserve` launch override, this session only
+            text.append(" (session)", style=palette.muted)
+        self._shown_pin = getattr(self._engine, "pinned", None)
+        if self._shown_pin is not None:
+            text.append(f" · holding #{self._shown_pin}", style=palette.muted)
         if self._adjusting:
             text.append("   ← → adjust · enter done", style=palette.muted)
         self.query_one("#auto-summary", Static).update(text)
 
     # -- engine -------------------------------------------------------------
 
-    def _start_engine(self, *, dry_run: bool) -> None:
+    def _start_engine(self, *, dry_run: bool, pinned: str | None = None) -> None:
         engine = AutoSwitchEngine(
             self.app.switcher,
             self._settings,
             self._emit_from_thread,
             dry_run=dry_run,
+            pinned=pinned,
         )
         self._engine = engine
         self.run_worker(
@@ -256,8 +708,13 @@ class AutoScreen(Screen):
             return
         palette = Palette.from_theme(self.app.current_theme)
         self.query_one("#event-log", RichLog).write(event_text(event, palette=palette))
+        # A `pinged`/`failed`/`would-ping` line and the panel must agree the
+        # moment it lands, not up to a second later.
+        self._refresh_warmup_panel()
         if event.kind == "switch":
             self.app.request_refresh()
+        if getattr(self._engine, "pinned", None) != self._shown_pin:
+            self._update_summary()
 
     def action_toggle_live(self) -> None:
         if self._engine is None:
@@ -281,9 +738,54 @@ class AutoScreen(Screen):
             self._restart_engine(dry_run=False)
 
     def _restart_engine(self, *, dry_run: bool) -> None:
+        # The manual-pick hold is session state: it survives the rebuild.
+        pinned = getattr(self._engine, "pinned", None)
         if self._engine is not None:
             self._engine.stop()
-        self._start_engine(dry_run=dry_run)
+        self._start_engine(dry_run=dry_run, pinned=pinned)
+        # The new engine has planned nothing yet: show that rather than the
+        # dead one's schedule.
+        self._refresh_warmup_panel()
+
+    # -- warmup panel ---------------------------------------------------------
+
+    def _refresh_warmup_panel(self) -> None:
+        """Re-render the countdown block from the engine's schedule.
+
+        Called on a 1s timer, on every engine event, and on a theme change.
+        Reads only ``warmup_schedule()`` — a copy taken under the engine's
+        own lock — so it never touches engine state from this thread.
+        """
+        if not self.is_attached:
+            return
+        engine = self._engine
+        schedule = engine.warmup_schedule() if engine is not None else {}
+        # The ENGINE's setting, not the screen's mount-time copy: `s` and `l`
+        # rebuild the engine, and that rebuild is where a changed setting
+        # takes effect. `p` (request_warm) also plans without
+        # `warmupEnabled`, so a schedule on hand outranks the setting —
+        # never hide a live plan behind an "off" line.
+        enabled = bool(schedule) or bool(
+            engine is not None and engine.warmup_enabled
+        )
+        interval = (
+            self._settings.interval_seconds if self._settings is not None else 60.0
+        )
+        text = warmup_panel_text(
+            schedule,
+            now=time.time(),
+            enabled=enabled,
+            palette=Palette.from_theme(self.app.current_theme),
+            # Two polls: one missed pass is a hiccup, two is a dead plan.
+            stale_after_s=2.0 * interval,
+        )
+        # A second-by-second countdown is the only thing that normally
+        # changes here; when even that is static (nothing scheduled, warmup
+        # off) skip the update so an idle screen does not repaint at 1 Hz.
+        if text.plain == self._warm_rendered:
+            return
+        self._warm_rendered = text.plain
+        self.query_one("#warmup-panel", Static).update(text)
 
     def _update_badge(self) -> None:
         badge = self.query_one("#mode-badge", Static)
@@ -306,8 +808,25 @@ class AutoScreen(Screen):
     def _candidates_text(
         self, snap: AccountsSnapshot, active_number: str | None
     ) -> Text:
-        """Switch targets ranked by headroom against their own switch lines
-        (best first) — the engine's own ordering."""
+        """Switch targets in the order the PROACTIVE trigger would take.
+
+        ``best`` ranks by headroom against each account's own switch lines
+        (best first) — the engine's own ordering.
+        ``consume-first`` ranks by ``autoswitch.consume_first_key`` -- the
+        engine's own key, imported rather than reimplemented -- inside a
+        health tier that mirrors the engine's landing gate, and annotates
+        each row with the weekly reset it ranks on, a ``5h hot`` marker for
+        the demoted tier, and a ``skip`` tag on any row the proactive
+        trigger would not take right now, so "why did it not move" answers
+        itself. Labels and pcts render exactly as under ``best``.
+
+        Scoped to that ONE trigger on purpose, and it is the common case
+        rather than the whole engine: an ``at-limit``/``failover`` escape
+        ranks by headroom whatever the strategy, and with every account
+        at/over the threshold the engine ranks by binding-window recovery
+        time instead. Neither is rendered here; a panel claiming to
+        predict all three would be wrong two ways.
+        """
         # Same window set AND the same lines as the engine: autoswitch.model,
         # each account's own line (its policy threshold, else the session
         # threshold — `_settings` is what `_set_threshold` replaces), the
@@ -319,8 +838,70 @@ class AutoScreen(Screen):
         models = parse_model_names(settings.model) if settings else ()
         threshold = settings.threshold if settings else 90.0
         weekly = settings.weekly_threshold if settings else None
-        ranked: list[tuple[float, str]] = []  # (sort key: -policy headroom, number)
+        consume_first = (
+            self._settings is not None
+            and is_consume_first(self._settings.strategy)
+        )
+        # Fork (consume-first-reserve-jj): reserves rank after every
+        # non-reserve and are tagged; on a reserve the sooner gate is waived.
+        reserves = reserve_accounts(self._settings)
+        on_reserve = active_number in reserves
+        now = time.time()
+        key_kwargs: dict = {}
+        active_reset_ts = float("inf")
+        active_below = False
+        active_over = False
+        idle = False
+        if consume_first:
+            # No `threshold` here: each call passes the account's OWN line,
+            # as the engine's `consume_first_key(..., thresholds[num])` does.
+            key_kwargs = dict(
+                hysteresis_pct=self._settings.hysteresis_pct,
+                now=now,
+            )
+            active = next(
+                (a for a in snap.accounts if a.number == active_number), None
+            )
+            active_usage = active.usage.last_good if active is not None else None
+            # Judged against the active's OWN lines, as the engine's trigger
+            # does (v0.29 per-window lines + per-account thresholds).
+            active_line = (
+                active.policy.threshold
+                if active is not None and active.policy.threshold is not None
+                else threshold
+            )
+            active_binding = binding_window(
+                oauth.relevant_windows(active_usage, models),
+                active_line,
+                weekly,
+                scale=threshold,
+            )
+            # Read through the same key so "sooner than the active account"
+            # inherits its past-is-unknown handling (a stale resets_at must
+            # not read as imminent).
+            active_reset_ts = consume_first_key(
+                active_usage, None, threshold=active_line, **key_kwargs
+            )[1]
+            # The reset comparison is the BELOW-threshold gate only: from
+            # at/over the threshold the engine must move and takes any healthy
+            # account, so muting on reset there would contradict it.
+            active_below = active_binding is not None and not active_binding.over
+            active_over = active_binding is not None and active_binding.over
+            # ...and below the threshold with the active reset unmeasured, the
+            # engine's gate can never pass ("reset-unknown"): nothing here is
+            # takeable until that number is reported.
+            idle = (
+                active_below and active_reset_ts == float("inf") and not on_reserve
+            )
+        # (sort key, number) with a TUPLE key, so `best`'s line headroom and
+        # consume-first's tiered key share one list. Unreadable rows keep
+        # their 998/999 buckets and sort after every keyed row.
+        ranked: list[tuple[tuple, str]] = []
         lines: dict[str, Text] = {}
+        # Over the threshold the engine takes a healthy non-reserve before
+        # any reserve, so healthy reserves are tagged `skip` once one exists.
+        held_reserves: list[Text] = []
+        usable_non_reserve = False
         for acc in snap.accounts:
             if acc.number == active_number or not acc.switchable:
                 continue
@@ -336,34 +917,107 @@ class AutoScreen(Screen):
             entry = Text()
             entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
             entry.append(acc.email, style=palette.foreground)
+            # A row the proactive trigger would not take right now gets a
+            # trailing muted `skip` tag; the label and pct render exactly as
+            # under `best`, so the panel's colours mean the same thing
+            # whichever key ordered it.
+            skip = False
+            healthy = False
             if acc.usage.sentinel is not None:
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
                 )
-                ranked.append((998.0, acc.number))
+                ranked.append(((998.0,), acc.number))
             elif binding is None:
                 entry.append("  usage unknown", style=palette.muted)
-                ranked.append((999.0, acc.number))
-            else:
-                # The raw pct of the window that binds, and — only once the
-                # lines differ, globally or for this account — the line it is
-                # judged against.
-                entry.append(
-                    f"  {binding.label} {binding.pct:3.0f}% used",
-                    style=palette.severity(binding.pct),
+                ranked.append(((999.0,), acc.number))
+            elif consume_first:
+                self._append_binding(entry, binding, acc, weekly, palette)
+                key = consume_first_key(
+                    acc.usage.last_good,
+                    # The engine's own inputs (`_rank_candidates`): headroom
+                    # against this account's own lines, and its own threshold
+                    # for the 5h-hot tier, so a per-account line tiers and
+                    # tie-breaks here exactly as it does in the decision.
+                    binding.line_headroom,
+                    threshold=line,
+                    **key_kwargs,
                 )
-                if weekly is not None or acc.policy.threshold is not None:
-                    entry.append(
-                        f" (line {pct_label(binding.line)}%)", style=palette.muted
-                    )
-                ranked.append((-binding.line_headroom, acc.number))
+                resets = data.window_reset_text(
+                    acc.usage.last_good, "seven_day", now
+                )
+                if resets is not None:
+                    entry.append(f" · {resets}", style=palette.muted)
+                if key[0]:
+                    entry.append("  5h hot", style=palette.muted)
+                # The engine's landing gate runs BEFORE its key: a candidate
+                # at/over the threshold re-triggers on the next tick, so it is
+                # never a proactive target however soon its week resets. The
+                # panel tiers on the same test rather than only greying the
+                # row — untiered, an unhealthy account still rendered first
+                # and read as the engine's next pick.
+                unhealthy = binding.over
+                healthy = not unhealthy
+                # Tagged, still RANKED: this is the order the engine would
+                # use the moment the account becomes eligible.
+                skip = unhealthy or (
+                    active_below and not on_reserve and key[1] >= active_reset_ts
+                )
+                ranked.append(((0.0, 1 if unhealthy else 0) + key, acc.number))
+            else:
+                self._append_binding(entry, binding, acc, weekly, palette)
+                ranked.append(((-binding.line_headroom,), acc.number))
+            if acc.number in reserves:
+                # Never the target of a below-threshold nudge.
+                entry.append("  reserve", style=palette.muted)
+                skip = skip or active_below
+                if healthy and active_over:
+                    held_reserves.append(entry)
+            elif healthy:
+                usable_non_reserve = True
+            if skip or idle:  # idle: nothing here is takeable
+                entry.append("  skip", style=palette.muted)
             lines[acc.number] = entry
+        if usable_non_reserve:
+            for entry in held_reserves:
+                entry.append("  skip", style=palette.muted)
 
         text = Text()
         text.append("Next best", style=palette.muted)
         if not ranked:
             text.append("\n  no other switchable accounts", style=palette.muted)
             return text
-        for _pct, number in sorted(ranked):
+        if idle:
+            text.append(
+                "\n  consume-first idle until the active account's weekly "
+                "reset is reported",
+                style=palette.muted,
+            )
+        # Key only: `ranked` is in snapshot (sequence) order and sort is
+        # stable, so a full tie falls through to sequence order exactly as the
+        # engine's does. Sorting the pairs compared the account NUMBER as a
+        # string on ties, where "10" precedes "2".
+        if reserves:
+            # Engine order (``_reserve_tier``): healthy before unhealthy, and
+            # within each, non-reserves before reserves. So a healthy reserve
+            # outranks an over-threshold non-reserve, as the escape takes it.
+            ranked = [
+                (key[:2] + (number in reserves,) + key[2:], number)
+                for key, number in ranked
+            ]
+        for _key, number in sorted(ranked, key=lambda t: t[0]):
             text.append(lines[number])
         return text
+
+    @staticmethod
+    def _append_binding(entry, binding, acc, weekly, palette) -> None:
+        """The raw pct of the window that binds, and — only once the lines
+        differ, globally or for this account — the line it is judged
+        against. One renderer for both strategies, so a row reads the same
+        whichever key ordered it."""
+        entry.append(
+            f"  {binding.label} {binding.pct:3.0f}% used",
+            style=palette.severity(binding.pct),
+        )
+        if weekly is not None or acc.policy.threshold is not None:
+            entry.append(f" (line {pct_label(binding.line)}%)", style=palette.muted)

@@ -114,6 +114,15 @@ MenuItem Static.menu-item-muted { color: $secondary; }
     height: auto;
 }
 
+#warmup-panel {
+    height: auto;
+    /* Capped: on a short terminal a long roster must not starve the event
+       log, which is the screen's primary surface. */
+    max-height: 8;
+    overflow-y: auto;
+    margin-top: 1;
+}
+
 #event-log {
     background: $background;
     border-top: solid $panel;

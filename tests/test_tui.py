@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_swap.autoswitch import NoSwitchEvent, SwitchEvent
+from claude_swap.autoswitch import NoSwitchEvent, PollEvent, SwitchEvent
 from claude_swap.json_output import USAGE_API_KEY, USAGE_TOKEN_EXPIRED
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -48,15 +48,21 @@ def make_entry(
     age_s: float = 5.0,
     scoped: list[tuple[str, float]] | None = None,
     spend: dict | None = None,
+    reset5_in: float = 7200,
+    reset7_in: float = 86400 * 3,
 ) -> UsageEntry:
-    """``pct5``/``pct7`` of None omit that window (e.g. annual plans lack 7d)."""
+    """``pct5``/``pct7`` of None omit that window (e.g. annual plans lack 7d).
+
+    ``reset5_in``/``reset7_in`` are seconds from now to that window's
+    ``resets_at`` — the consume-first ranking is entirely about their order.
+    """
     if sentinel is not None:
         return UsageEntry(sentinel=sentinel)
     last_good: dict = {}
     if pct5 is not None:
-        last_good["five_hour"] = {"pct": pct5, "resets_at": _iso_in(7200)}
+        last_good["five_hour"] = {"pct": pct5, "resets_at": _iso_in(reset5_in)}
     if pct7 is not None:
-        last_good["seven_day"] = {"pct": pct7, "resets_at": _iso_in(86400 * 3)}
+        last_good["seven_day"] = {"pct": pct7, "resets_at": _iso_in(reset7_in)}
     if scoped is not None:
         last_good["scoped"] = [
             {"name": name, "pct": pct, "resets_at": _iso_in(86400 * 2)}
@@ -1295,6 +1301,18 @@ class _FakeEngine:
         self.stopped = False
         self.applied_thresholds: list[float] = []
         self.wakes = 0
+        self.switch_requests = 0
+        # Targets of `request_switch(target=...)` (`m`), in call order; a
+        # plain `n` request appends None.
+        self.switch_targets: list[str | None] = []
+        # Manual-pick hold, as the engine exposes it (read-only there).
+        self.pinned = kwargs.get("pinned")
+        self.kwargs = kwargs
+        self.warm_requests = 0
+        # What the warmup countdown panel renders (`warmup_schedule()`),
+        # and the setting it reads for the "off" line.
+        self.schedule: dict = {}
+        self.warmup_enabled = bool(getattr(settings, "warmup_enabled", False))
         self._stop = threading.Event()
         _FakeEngine.instances.append(self)
 
@@ -1313,6 +1331,16 @@ class _FakeEngine:
 
     def wake(self) -> None:
         self.wakes += 1
+
+    def request_switch(self, target: str | None = None) -> None:
+        self.switch_requests += 1
+        self.switch_targets.append(target)
+
+    def request_warm(self) -> None:
+        self.warm_requests += 1
+
+    def warmup_schedule(self) -> dict:
+        return dict(self.schedule)
 
 
 @pytest.fixture
@@ -1629,6 +1657,1145 @@ class TestAutoScreen:
                 "user2@example.com"
             )
 
+    # -- consume-first: the panel follows the engine's strategy --------------
+
+    async def _toggle_to(self, pilot, app, target: str) -> int:
+        """Press `s` until the session strategy is ``target``; the presses.
+        v0.29 added `priority-consume-first`, so the cycle is no longer a
+        two-way flip; the tests pin the destination, not the hop count."""
+        for presses in range(1, 6):
+            await pilot.press("s")
+            await settle(pilot)
+            if app.screen._settings.strategy == target:
+                return presses
+        raise AssertionError(f"`s` never reached {target!r}")
+
+    def _consume_first_app(self, tmp_path, accounts, **autoswitch):
+        """FakeSwitcher + app with `strategy: consume-first` on disk."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            # Fork: "none" keeps `s` upstream's two-way best <-> consume-first
+            # toggle (the default reserve "1" adds consume-first-reserve-jj).
+            "autoswitch": {
+                "strategy": "consume-first", "reserveAccounts": "none", **autoswitch
+            },
+        }))
+        return make_app(FakeSwitcher(accounts, tmp_path))
+
+    def _candidates(self, app) -> str:
+        from textual.widgets import Static
+
+        return app.screen.query_one("#candidates", Static).render().plain
+
+    def _log_text(self, app) -> str:
+        """Everything written to the decision log, as one plain string."""
+        from textual.widgets import RichLog
+
+        log = app.screen.query_one("#event-log", RichLog)
+        return "\n".join(strip.text for strip in log.lines)
+
+    def _skipped_rows(self, app) -> set[str]:
+        """Emails whose row carries the trailing muted `skip` tag.
+
+        `_candidates_text` never greys a label: a row the proactive trigger
+        would not take renders exactly like any other (foreground e-mail,
+        severity pct) plus a muted `skip` tag at the end of its line.
+        """
+        from textual.widgets import Static
+
+        plain = app.screen.query_one("#candidates", Static).render().plain
+        rows: set[str] = set()
+        for line in plain.splitlines():
+            for acc in app.switcher._accounts:
+                if acc.email in line and line.rstrip().endswith("skip"):
+                    rows.add(acc.email)
+        return rows
+
+    def _label_styles(self, app, email: str) -> set[str]:
+        """Resolved foreground colours of every span covering `email`."""
+        from textual.widgets import Static
+
+        text = app.screen.query_one("#candidates", Static).render()
+        at = text.plain.index(email)
+        colours: set[str] = set()
+        for span in text.spans:
+            if span.start <= at and span.end >= at + len(email):
+                fg = getattr(span.style, "foreground", None)
+                colours.add(
+                    str(getattr(fg, "hex", fg) if fg is not None else span.style).lower()
+                )
+        return colours
+
+    async def test_candidates_ranked_by_weekly_reset_under_consume_first(
+        self, tmp_path, fake_engine
+    ):
+        """Headroom order and weekly-reset order disagree on purpose: #2 has
+        the least room and the soonest weekly reset, so `best` would rank it
+        last and consume-first must rank it FIRST — the perishable quota is
+        the one worth spending."""
+        app = self._consume_first_app(
+            tmp_path,
+            [
+                make_account(
+                    1, active=True, entry=make_entry(20.0, 20.0, reset7_in=86400 * 9)
+                ),
+                make_account(2, entry=make_entry(10.0, 40.0, reset7_in=86400)),
+                make_account(3, entry=make_entry(10.0, 10.0, reset7_in=86400 * 4)),
+            ],
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            plain = self._candidates(app)
+            assert plain.index("user2@example.com") < plain.index(
+                "user3@example.com"
+            ), "consume-first ranks the soonest weekly reset first"
+
+    async def test_candidates_hot_five_hour_ranks_last_under_consume_first(
+        self, tmp_path, fake_engine
+    ):
+        """The 5h-hot demotion, on screen: #2 still resets soonest, but its
+        5-hour window sits at the bar (threshold 90 - hysteresis 10 = 80), so
+        it ranks behind the cool #3 and says why."""
+        app = self._consume_first_app(
+            tmp_path,
+            [
+                make_account(
+                    1, active=True, entry=make_entry(20.0, 20.0, reset7_in=86400 * 9)
+                ),
+                make_account(2, entry=make_entry(80.0, 5.0, reset7_in=86400)),
+                make_account(3, entry=make_entry(10.0, 40.0, reset7_in=86400 * 4)),
+            ],
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            plain = self._candidates(app)
+            assert plain.index("user3@example.com") < plain.index(
+                "user2@example.com"
+            ), "a 5h-hot candidate ranks behind every cool one"
+            assert "5h hot" in plain
+            # Nothing else can explain that order: #2 resets sooner AND holds
+            # the emptier weekly window (5% vs 40%). Only the tier demotes it.
+            assert plain.index("5h hot") > plain.index("user3@example.com")
+
+    async def test_candidates_hot_tier_uses_the_accounts_own_threshold(
+        self, tmp_path, fake_engine
+    ):
+        """The engine tiers 5h-hot on each candidate's OWN threshold
+        (`consume_first_key(..., thresholds[num])`). #2 carries a policy
+        threshold of 80 and sits at 5h 76% with hysteresis 5: hot (76 >= 75)
+        to the engine, cool against the session's 90 (76 < 85). The engine
+        ranks the cool #3 first, so the panel must too."""
+        from claude_swap.models import AccountPolicy
+
+        app = self._consume_first_app(
+            tmp_path,
+            [
+                make_account(
+                    1, active=True, entry=make_entry(20.0, 20.0, reset7_in=86400 * 9)
+                ),
+                dataclasses.replace(
+                    make_account(2, entry=make_entry(76.0, 5.0, reset7_in=86400)),
+                    policy=AccountPolicy(threshold=80.0),
+                ),
+                make_account(3, entry=make_entry(10.0, 10.0, reset7_in=86400 * 4)),
+            ],
+            threshold=90,
+            hysteresisPct=5,
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            plain = self._candidates(app)
+            assert plain.index("user3@example.com") < plain.index(
+                "user2@example.com"
+            ), "hot on its own 80 line, #2 ranks behind the cool #3"
+            assert "5h hot" in plain
+
+    async def test_candidates_show_reset_countdown_under_consume_first(
+        self, tmp_path, fake_engine
+    ):
+        app = self._consume_first_app(
+            tmp_path,
+            [
+                make_account(
+                    1, active=True, entry=make_entry(20.0, 20.0, reset7_in=86400 * 9)
+                ),
+                make_account(2, entry=make_entry(10.0, 10.0, reset7_in=86400 + 3600)),
+            ],
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            plain = self._candidates(app)
+            # The axis the ranking is on has to be visible next to the pct.
+            assert "resets 1d" in plain, plain
+
+    async def test_summary_shows_strategy_and_model(self, tmp_path, fake_engine):
+        app = self._consume_first_app(
+            tmp_path,
+            [make_account(1, active=True), make_account(2)],
+            model="Fable",
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            summary = app.screen.query_one("#auto-summary", Static).render().plain
+            assert "model Fable" in summary
+            assert "consume-first" in summary
+            assert "(session)" not in summary  # both came from the file
+
+    async def test_summary_states_account_wide_when_no_model_configured(
+        self, tmp_path, fake_engine
+    ):
+        """An unset autoswitch.model is a decision input too (5h/7d only) —
+        rendered, so a missing token is never read as a render gap."""
+        app = self._consume_first_app(
+            tmp_path, [make_account(1, active=True), make_account(2)]
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            summary = app.screen.query_one("#auto-summary", Static).render().plain
+            assert "model account-wide" in summary
+
+    async def test_strategy_toggle_is_session_only(self, tmp_path, fake_engine):
+        """`s` flips the strategy in memory, rebuilds the engine (it reads
+        settings at construction) and re-ranks the panel — and writes
+        nothing: `cswap config set` stays the only persistent path."""
+        import json as _json
+
+        accounts = [
+            make_account(
+                1, active=True, entry=make_entry(20.0, 20.0, reset7_in=86400 * 9)
+            ),
+            make_account(2, entry=make_entry(10.0, 40.0, reset7_in=86400)),
+            make_account(3, entry=make_entry(10.0, 10.0, reset7_in=86400 * 4)),
+        ]
+        app = self._consume_first_app(tmp_path, accounts)
+        on_disk = (tmp_path / "settings.json").read_text()
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            screen = app.screen
+            plain = self._candidates(app)
+            assert plain.index("user2@example.com") < plain.index(
+                "user3@example.com"
+            )
+            presses = await self._toggle_to(pilot, app, "best")
+            assert screen._settings.strategy == "best"
+            from textual.widgets import Static
+
+            summary = screen.query_one("#auto-summary", Static).render().plain
+            assert "best (session)" in summary
+            # engine rebuilt from the flipped copy, same dry-run state
+            assert len(fake_engine.instances) == 1 + presses
+            assert fake_engine.instances[0].stopped is True
+            assert fake_engine.instances[-1].settings.strategy == "best"
+            assert fake_engine.instances[-1].dry_run is True
+            # ...and the panel re-ranked: `best` prefers the most headroom
+            plain = self._candidates(app)
+            assert plain.index("user3@example.com") < plain.index(
+                "user2@example.com"
+            )
+            assert "resets" not in plain  # best keeps today's rendering
+            # nothing persisted
+            assert (tmp_path / "settings.json").read_text() == on_disk
+            await self._toggle_to(pilot, app, "consume-first")
+            assert screen._settings.strategy == "consume-first"
+            summary = screen.query_one("#auto-summary", Static).render().plain
+            assert "(session)" not in summary  # back to the configured value
+
+    async def test_candidates_tag_the_rows_the_trigger_would_skip(
+        self, tmp_path, fake_engine
+    ):
+        """Below the threshold the proactive gate only moves to an account
+        whose weekly window resets STRICTLY sooner than the active one, so #3
+        (resets later) is tagged `skip` and #2 (sooner) is not — the panel answers
+        "why didn't it move" without the log."""
+        app = self._consume_first_app(
+            tmp_path,
+            [
+                make_account(
+                    1, active=True, entry=make_entry(20.0, 20.0, reset7_in=86400 * 4)
+                ),
+                make_account(2, entry=make_entry(10.0, 10.0, reset7_in=86400)),
+                make_account(3, entry=make_entry(10.0, 10.0, reset7_in=86400 * 9)),
+            ],
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            assert self._skipped_rows(app) == {"user3@example.com"}
+
+    async def test_consume_first_judges_rows_on_their_own_lines(
+        self, tmp_path, fake_engine
+    ):
+        """v0.29 lines: a 7d 93% candidate is under a 97 weekly line, so the
+        engine's landing gate takes it and the panel must not tag it `skip`
+        (raw 93 >= 85 used to). Its row names the window and the line."""
+        app = self._consume_first_app(
+            tmp_path,
+            [
+                make_account(
+                    1, active=True, entry=make_entry(20.0, 20.0, reset7_in=86400 * 4)
+                ),
+                make_account(2, entry=make_entry(10.0, 93.0, reset7_in=86400)),
+            ],
+            threshold=85,
+            weeklyThreshold=97,
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            assert self._skipped_rows(app) == set()
+            assert "7d  93% used (line 97%)" in self._candidates(app)
+
+    async def test_skipped_row_renders_like_best(self, tmp_path, fake_engine):
+        """A skipped row is tagged, never greyed: its label keeps the
+        foreground colour and its `NN% used` span the severity colour `best`
+        would give it, so the panel's colours read identically under both
+        strategies."""
+        from textual.widgets import Static
+
+        from claude_swap.tui.theme import Palette
+
+        app = self._consume_first_app(
+            tmp_path,
+            [
+                make_account(
+                    1, active=True, entry=make_entry(20.0, 20.0, reset7_in=86400 * 4)
+                ),
+                make_account(2, entry=make_entry(10.0, 10.0, reset7_in=86400)),
+                make_account(3, entry=make_entry(10.0, 10.0, reset7_in=86400 * 9)),
+            ],
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            assert self._skipped_rows(app) == {"user3@example.com"}
+            text = app.screen.query_one("#candidates", Static).render()
+            plain = text.plain
+            palette = Palette.from_theme(app.current_theme)
+            at = plain.index("% used", plain.index("user3@example.com"))
+            colours = set()
+            for span in text.spans:
+                if span.start <= at < span.end:
+                    fg = getattr(span.style, "foreground", None)
+                    colours.add(
+                        str(getattr(fg, "hex", fg) if fg is not None else span.style)
+                        .lower()
+                    )
+            assert palette.severity(10.0).lower() in colours
+            assert palette.muted.lower() not in colours
+            label = self._label_styles(app, "user3@example.com")
+            assert palette.muted.lower() not in label
+            assert palette.foreground.lower() in label
+
+    async def test_candidates_over_threshold_row_is_tagged_and_last(
+        self, tmp_path, fake_engine
+    ):
+        """The engine's landing gate runs before its key: an account at/over
+        the threshold re-triggers on the next tick and is never a proactive
+        target, however soon its week resets. #2 resets soonest and is at 95%
+        — it must render last AND tagged `skip`, not first."""
+        app = self._consume_first_app(
+            tmp_path,
+            [
+                make_account(
+                    1, active=True, entry=make_entry(20.0, 20.0, reset7_in=86400 * 9)
+                ),
+                # 5h cool (10%) so only the health tier is in play
+                make_account(2, entry=make_entry(10.0, 95.0, reset7_in=86400)),
+                make_account(3, entry=make_entry(10.0, 10.0, reset7_in=86400 * 4)),
+            ],
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            plain = self._candidates(app)
+            assert plain.index("user3@example.com") < plain.index(
+                "user2@example.com"
+            ), "an unhealthy landing must never rank first"
+            assert self._skipped_rows(app) == {"user2@example.com"}
+
+    async def test_candidates_idle_when_active_weekly_reset_unknown(
+        self, tmp_path, fake_engine
+    ):
+        """Below the threshold with the active account's weekly reset
+        unreported, the engine's gate can never pass (it holds with
+        "reset-unknown"). Every row is tagged `skip` and the panel says why, instead
+        of showing a ranking nothing would act on."""
+        app = self._consume_first_app(
+            tmp_path,
+            [
+                # no 7d window at all: the reset is unknown, pct is the 5h 20%
+                make_account(1, active=True, entry=make_entry(20.0, None)),
+                make_account(2, entry=make_entry(10.0, 10.0, reset7_in=86400)),
+                make_account(3, entry=make_entry(10.0, 10.0, reset7_in=86400 * 4)),
+            ],
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            assert "consume-first idle until" in self._candidates(app)
+            assert self._skipped_rows(app) == {
+                "user2@example.com",
+                "user3@example.com",
+            }
+
+    async def test_unreadable_rows_still_sort_last_under_consume_first(
+        self, tmp_path, fake_engine
+    ):
+        """Mixed key shapes in one list: a sentinel row and an unknown-usage
+        row keep their 998/999 buckets next to consume-first's tiered tuple —
+        they sort last and comparing the two shapes raises nothing."""
+        app = self._consume_first_app(
+            tmp_path,
+            [
+                make_account(
+                    1, active=True, entry=make_entry(20.0, 20.0, reset7_in=86400 * 9)
+                ),
+                make_account(2, entry=make_entry(sentinel=USAGE_TOKEN_EXPIRED)),
+                make_account(3, entry=make_entry(None, None)),
+                make_account(4, entry=make_entry(10.0, 10.0, reset7_in=86400)),
+            ],
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            plain = self._candidates(app)
+            assert plain.index("user4@example.com") < plain.index(
+                "user2@example.com"
+            )
+            assert plain.index("user4@example.com") < plain.index(
+                "user3@example.com"
+            )
+            assert "usage unknown" in plain
+
+    async def test_session_threshold_survives_the_strategy_toggle(
+        self, tmp_path, fake_engine
+    ):
+        """The two session overrides are independent: `s` rebuilds the engine
+        from `self._settings`, which still carries the adjusted threshold —
+        rebuilding from the file would silently drop it."""
+        app = self._consume_first_app(
+            tmp_path, [make_account(1, active=True), make_account(2)]
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await pilot.press("t", "right", "enter")
+            await pilot.pause()
+            screen = app.screen
+            assert screen._settings.threshold == 91.0
+            await self._toggle_to(pilot, app, "best")
+            assert screen._settings.threshold == 91.0
+            engine = fake_engine.instances[-1]
+            assert engine.settings.threshold == 91.0
+            assert engine.settings.strategy == "best"
+            from textual.widgets import Static
+
+            summary = screen.query_one("#auto-summary", Static).render().plain
+            assert "threshold 91% (session)" in summary
+            assert "best (session)" in summary
+
+    async def test_strategy_toggle_is_inert_in_threshold_adjust_mode(
+        self, tmp_path, fake_engine
+    ):
+        app = self._consume_first_app(
+            tmp_path, [make_account(1, active=True), make_account(2)]
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await pilot.press("t", "s")
+            await pilot.pause()
+            screen = app.screen
+            assert screen._settings.strategy == "consume-first"
+            assert len(fake_engine.instances) == 1  # no restart
+
+
+    async def test_switch_now_asks_the_engine_and_logs_it(
+        self, tmp_path, fake_engine
+    ):
+        """`n` never switches from the screen: it hands the request to the
+        engine, whose tick owns the health checks, freshening and state
+        record. The log line names the strategy the request will rank by, so
+        a session `s` override can never be mistaken for the file value."""
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            engine = fake_engine.instances[0]
+            assert engine.switch_requests == 0
+            assert fake.calls == []  # nothing switched before the press
+            await pilot.press("n")
+            await pilot.pause()
+            assert engine.switch_requests == 1
+            assert fake.calls == []  # ...and nothing switched by the press
+            assert "switch now requested (best)" in self._log_text(app)
+
+    async def test_switch_now_is_inert_in_threshold_adjust_mode(
+        self, tmp_path, fake_engine
+    ):
+        """Mirrors `s`: while the threshold is armed the keys belong to it,
+        so `n` must not fire a switch the user was not aiming at."""
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await pilot.press("t", "n")
+            await pilot.pause()
+            assert fake_engine.instances[0].switch_requests == 0
+            assert "switch now requested" not in self._log_text(app)
+
+    async def test_switch_now_needs_no_confirmation_in_dry_run(
+        self, tmp_path, fake_engine
+    ):
+        """In DRY-RUN the engine only PREVIEWS the move, so a confirm modal
+        would gate nothing; going LIVE was already confirmed once, by `l`."""
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            engine = fake_engine.instances[0]
+            assert engine.dry_run is True
+            await pilot.press("n")
+            await pilot.pause()
+            from claude_swap.tui.autoview import AutoScreen
+
+            assert isinstance(app.screen, AutoScreen)  # no ConfirmModal pushed
+            assert engine.switch_requests == 1
+
+    async def test_switch_now_reports_the_session_strategy(
+        self, tmp_path, fake_engine
+    ):
+        """After `s` the request ranks by the SESSION strategy (the toggle
+        rebuilt the engine), so the log line must read the session value —
+        `_settings`, not the file."""
+        app = self._consume_first_app(
+            tmp_path, [make_account(1, active=True), make_account(2)]
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await pilot.press("n")
+            await pilot.pause()
+            assert "switch now requested (consume-first)" in self._log_text(app)
+            await self._toggle_to(pilot, app, "best")
+            await pilot.press("n")
+            await pilot.pause()
+            assert "switch now requested (best)" in self._log_text(app)
+            assert fake_engine.instances[-1].switch_requests == 1
+
+
+    async def test_ping_warm_asks_the_engine_and_logs_it(
+        self, tmp_path, fake_engine
+    ):
+        """`p` never spawns from the screen: the engine's tick owns the
+        eligibility predicates, the slot preparation and the state file."""
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            engine = fake_engine.instances[0]
+            assert engine.warm_requests == 0
+            await pilot.press("p")
+            await pilot.pause()
+            assert engine.warm_requests == 1
+            assert fake.calls == []  # a warmup is not a switch
+            assert "warmup requested" in self._log_text(app)
+
+    async def test_ping_warm_is_inert_in_threshold_adjust_mode(
+        self, tmp_path, fake_engine
+    ):
+        """Mirrors `s` and `n`: while the threshold is armed the keys belong
+        to it."""
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await pilot.press("t", "p")
+            await pilot.pause()
+            assert fake_engine.instances[0].warm_requests == 0
+            assert "warmup requested" not in self._log_text(app)
+
+    # -- manual pick (`m`) ----------------------------------------------------
+
+    def _three(self, tmp_path):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2), make_account(3)],
+            tmp_path,
+        )
+        return fake, make_app(fake)
+
+    async def test_manual_pick_opens_the_picker_and_enter_takes_first_selectable(
+        self, tmp_path, fake_engine
+    ):
+        """`m` opens the picker; the active row (#1) is disabled, so the
+        highlight starts on #2 and enter asks the ENGINE for exactly that
+        account. Nothing is switched from the screen."""
+        fake, app = self._three(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            await pilot.press("m")
+            await pilot.pause()
+            from textual.widgets import OptionList
+
+            from claude_swap.tui.modals import AccountPickModal
+
+            assert isinstance(app.screen, AccountPickModal)
+            options = app.screen.query_one("#pick-list", OptionList)
+            assert options.get_option("1").disabled is True
+            assert options.get_option("2").disabled is False
+            assert options.highlighted == 1
+            await pilot.press("enter")
+            await pilot.pause()
+            from claude_swap.tui.autoview import AutoScreen
+
+            assert isinstance(app.screen, AutoScreen)
+            engine = fake_engine.instances[0]
+            assert engine.switch_targets == ["2"]
+            assert fake.calls == []
+            assert (
+                "switch to Account-2 (user2@example.com) requested (manual pick)"
+                in self._log_text(app)
+            )
+
+    async def test_manual_pick_digit_picks_that_account(
+        self, tmp_path, fake_engine
+    ):
+        """Digits are account NUMBERS, not row positions: with slots 1, 3, 5
+        a "2" (row 2 holds #3) does nothing and "5" (only three rows) picks #5."""
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(3), make_account(5)],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            await pilot.press("m", "2")
+            await pilot.pause()
+            from claude_swap.tui.modals import AccountPickModal
+
+            assert isinstance(app.screen, AccountPickModal)
+            assert fake_engine.instances[0].switch_targets == []
+            await pilot.press("5")
+            await pilot.pause()
+            assert fake_engine.instances[0].switch_targets == ["5"]
+            assert "Account-5" in self._log_text(app)
+
+    async def test_manual_pick_active_row_is_not_selectable(
+        self, tmp_path, fake_engine
+    ):
+        """The digit for the ACTIVE account does nothing: the picker stays
+        open and no request is made."""
+        _, app = self._three(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            await pilot.press("m", "1")
+            await pilot.pause()
+            from claude_swap.tui.modals import AccountPickModal
+
+            assert isinstance(app.screen, AccountPickModal)
+            assert fake_engine.instances[0].switch_targets == []
+
+    @pytest.mark.parametrize("keys", [("3",), ("down", "enter")])
+    async def test_manual_pick_disabled_row_is_selectable(
+        self, tmp_path, fake_engine, keys
+    ):
+        """A `cswap disable`d slot is a valid pick (as with `cswap switch`):
+        enabled in the list, tagged `disabled`, reachable by digit and enter."""
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True),
+                make_account(2),
+                make_account(3, disabled=True),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            rows = app.screen._pick_rows(app.snapshot)
+            assert rows[2].tags == ("disabled",)
+            await pilot.press("m")
+            await pilot.pause()
+            from textual.widgets import OptionList
+
+            from claude_swap.tui.modals import AccountPickModal
+
+            assert isinstance(app.screen, AccountPickModal)
+            options = app.screen.query_one("#pick-list", OptionList)
+            assert options.get_option("3").disabled is False
+            assert "disabled" in str(options.get_option("3").prompt)
+            await pilot.press(*keys)
+            await pilot.pause()
+            assert fake_engine.instances[0].switch_targets == ["3"]
+
+    async def test_manual_pick_escape_is_a_no_op(self, tmp_path, fake_engine):
+        _, app = self._three(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            await pilot.press("m", "escape")
+            await pilot.pause()
+            from claude_swap.tui.autoview import AutoScreen
+
+            assert isinstance(app.screen, AutoScreen)
+            assert fake_engine.instances[0].switch_targets == []
+            assert "manual pick" not in self._log_text(app)
+
+    async def test_manual_pick_is_inert_in_threshold_adjust_mode(
+        self, tmp_path, fake_engine
+    ):
+        _, app = self._three(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            await pilot.press("t", "m")
+            await pilot.pause()
+            from claude_swap.tui.autoview import AutoScreen
+
+            assert isinstance(app.screen, AutoScreen)
+            assert fake_engine.instances[0].switch_targets == []
+
+    async def test_manual_pick_rows_carry_pct_and_markers(
+        self, tmp_path, fake_engine
+    ):
+        """Plain-data rows, snapshot order: pct on the engine's windows, an
+        `over threshold` tag (still selectable), `usage unknown`, and the
+        active flag."""
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(10.0)),
+                make_account(2, entry=make_entry(95.0)),
+                make_account(3, entry=UsageEntry()),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            rows = app.screen._pick_rows(app.snapshot)
+            assert [r.number for r in rows] == ["1", "2", "3"]
+            assert rows[0].active and not rows[1].active
+            assert rows[1].pct == pytest.approx(95.0)
+            assert "over threshold" in rows[1].tags
+            assert rows[2].label == "usage unknown"
+
+    async def test_summary_shows_the_engine_pin_and_restart_carries_it(
+        self, tmp_path, fake_engine
+    ):
+        _, app = self._three(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            screen = app.screen
+            summary = screen.query_one("#auto-summary", Static)
+            assert "holding" not in summary.render().plain
+            engine = fake_engine.instances[0]
+            engine.pinned = "2"
+            screen._on_engine_event(NoSwitchEvent(reason="pinned"))
+            await pilot.pause()
+            assert "holding #2" in summary.render().plain
+            await pilot.press("s")  # strategy toggle rebuilds the engine
+            await settle(pilot)
+            assert fake_engine.instances[-1].kwargs.get("pinned") == "2"
+
+
+class TestWarmupEventRendering:
+    """`WarmupEvent` is background noise until it stops working."""
+
+    def test_a_successful_warmup_renders_muted(self):
+        from claude_swap.autoswitch import WarmupEvent
+        from claude_swap.tui.autoview import event_text
+        from claude_swap.tui.theme import Palette
+
+        text = event_text(
+            WarmupEvent(action="pinged", number="1", email="a@example.com"),
+            palette=Palette.DARK,
+        )
+        styles = {span.style for span in text.spans}
+        assert Palette.DARK.muted in styles
+        assert Palette.DARK.sev_warn not in styles
+
+    def test_a_failed_warmup_renders_as_a_warning(self):
+        from claude_swap.autoswitch import WarmupEvent
+        from claude_swap.tui.autoview import event_text
+        from claude_swap.tui.theme import Palette
+
+        text = event_text(
+            WarmupEvent(
+                action="failed", number="1", email="a@example.com",
+                detail="rc=1: boom",
+            ),
+            palette=Palette.DARK,
+        )
+        assert Palette.DARK.sev_warn in {span.style for span in text.spans}
+
+    def test_a_warmup_line_never_carries_a_config_path(self):
+        from claude_swap.autoswitch import WarmupEvent
+
+        event = WarmupEvent(
+            action="failed", number="1", email="a@example.com",
+            model="haiku", detail="rc=1: boom",
+        )
+        assert "CLAUDE_CONFIG_DIR" not in event.human()
+        assert event.to_json()["action"] == "failed"
+
+
+class TestWarmupPanel:
+    """`warmup_panel_text` — the auto screen's per-account countdown block.
+
+    Pure by construction (a schedule dict plus a clock in, a `Text` out), so
+    every format below is pinned without a running app or an engine.
+    """
+
+    @staticmethod
+    def _slot(number, status, **kw):
+        from claude_swap.warmup import WarmupSlot
+
+        return WarmupSlot(number=number, status=status, **kw)
+
+    @staticmethod
+    def _panel(schedule, now=1000.0, enabled=True):
+        from claude_swap.tui.autoview import warmup_panel_text
+        from claude_swap.tui.theme import Palette
+
+        return warmup_panel_text(
+            schedule, now=now, enabled=enabled, palette=Palette.DARK
+        )
+
+    def test_the_countdown_format_switches_at_an_hour(self):
+        from claude_swap.tui.autoview import countdown_text
+
+        assert countdown_text(3552) == "59:12"
+        assert countdown_text(3600) == "1:00:00"
+        assert countdown_text(17_040) == "4:44:00"
+        assert countdown_text(9) == "00:09"
+        assert countdown_text(-5) == "00:00"  # never a negative countdown
+
+    def test_a_scheduled_row_carries_the_countdown_the_clock_and_the_model(self):
+        now = 1000.0
+        at = now + 3552
+        text = self._panel(
+            {"3": self._slot("3", "scheduled", email="c@example.com",
+                             at_ts=at, model="haiku")},
+            now=now,
+        )
+        stamp = time.strftime("%H:%M", time.localtime(at))
+        assert f"next hello in 59:12 ({stamp}) · haiku" in text.plain
+        assert "next: Account-3 in 59:12" in text.plain
+
+    def test_a_warm_row_shows_the_reset_it_is_counting_down_to(self):
+        now = 1000.0
+        reset = now + 17_040
+        text = self._panel(
+            {"4": self._slot("4", "warm", email="d@example.com", reset_ts=reset)},
+            now=now,
+        )
+        stamp = time.strftime("%H:%M", time.localtime(reset))
+        assert f"warm · 5h resets {stamp} (in 4:44:00)" in text.plain
+        assert "nothing scheduled" in text.plain  # nothing is upcoming
+
+    def test_a_lapsed_schedule_reads_as_due_now(self):
+        text = self._panel(
+            {"2": self._slot("2", "scheduled", at_ts=900.0, model="haiku")},
+            now=1000.0,
+        )
+        assert "hello due now · haiku" in text.plain
+        assert "next: Account-2 due now" in text.plain
+
+    def test_in_flight_and_skipped_rows_say_so(self):
+        text = self._panel({
+            "1": self._slot("1", "in-flight", email="a@example.com"),
+            "2": self._slot("2", "skipped", email="b@example.com",
+                            reason="at limit"),
+        })
+        assert "hello in flight" in text.plain
+        assert "skipped: at limit" in text.plain
+
+    def test_the_soonest_row_is_accented(self):
+        from claude_swap.tui.theme import Palette
+
+        now = 1000.0
+        text = self._panel(
+            {
+                "2": self._slot("2", "scheduled", at_ts=now + 7200),
+                "3": self._slot("3", "scheduled", at_ts=now + 3552),
+            },
+            now=now,
+        )
+        accented = [
+            text.plain[span.start : span.end]
+            for span in text.spans
+            if span.style == Palette.DARK.accent
+        ]
+        assert any("59:12" in run for run in accented)
+        assert not any("2:00:00" in run for run in accented)
+
+    def test_a_dry_run_row_says_it_is_a_preview(self):
+        """A dry-run engine re-previews the same decision every tick and
+        spawns nothing: an unqualified "due now" would read as stuck."""
+        text = self._panel(
+            {"1": self._slot("1", "due", model="haiku", dry_run=True)}
+        )
+        assert "would hello now (dry-run) · haiku" in text.plain
+
+    def test_an_all_in_flight_panel_counts_the_hellos(self):
+        text = self._panel({
+            "1": self._slot("1", "in-flight"),
+            "2": self._slot("2", "in-flight"),
+        })
+        assert "2 hellos in flight" in text.plain
+        assert "nothing scheduled" not in text.plain
+
+    def test_a_schedule_older_than_the_window_is_marked_stale(self):
+        """The engine's spawn phase swallows its own exceptions, so a dead
+        pass leaves countdowns running on a plan nobody is acting on."""
+        now = 1000.0
+        slot = self._slot("3", "scheduled", at_ts=now + 60, computed_ts=now - 500)
+        assert "(stale)" not in self._panel(
+            {"3": slot}, now=now
+        ).plain  # no window given: nothing to judge against
+        from claude_swap.tui.autoview import warmup_panel_text
+        from claude_swap.tui.theme import Palette
+
+        fresh = warmup_panel_text(
+            {"3": self._slot("3", "scheduled", at_ts=now + 60, computed_ts=now - 30)},
+            now=now, enabled=True, palette=Palette.DARK, stale_after_s=120.0,
+        )
+        assert "(stale)" not in fresh.plain
+        stale = warmup_panel_text(
+            {"3": slot}, now=now, enabled=True, palette=Palette.DARK,
+            stale_after_s=120.0,
+        )
+        assert "(stale)" in stale.plain
+
+    def test_warmup_off_says_how_to_turn_it_on(self):
+        text = self._panel({}, enabled=False)
+        assert "cswap config set autoswitch.warmupEnabled true" in text.plain
+        assert "WARMUP" in text.plain
+
+    def test_an_empty_schedule_while_enabled_is_a_waiting_line(self):
+        text = self._panel({}, enabled=True)
+        assert "waiting for first tick" in text.plain
+
+
+@pytest.mark.asyncio
+class TestAutoScreenWarmupPanel:
+    async def _open(self, pilot):
+        await settle(pilot)
+        await pilot.press("g")
+        await pilot.pause()
+
+    async def test_the_panel_mounts_and_renders_the_engine_schedule(
+        self, tmp_path, fake_engine
+    ):
+        from claude_swap.warmup import WarmupSlot
+
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            from textual.widgets import Static
+
+            panel = app.screen.query_one("#warmup-panel", Static)
+            assert "WARMUP" in panel.render().plain
+            engine = fake_engine.instances[0]
+            engine.schedule = {
+                "2": WarmupSlot(
+                    number="2", email="b@example.com", status="scheduled",
+                    at_ts=time.time() + 3552, model="haiku",
+                )
+            }
+            # An engine event repaints immediately, without waiting a second.
+            app.screen._on_engine_event(NoSwitchEvent(reason="cooldown"))
+            await pilot.pause()
+            assert "next hello in 59:1" in panel.render().plain
+
+    async def test_the_off_line_follows_the_engines_setting(
+        self, tmp_path, fake_engine
+    ):
+        """Not the screen's mount-time copy: `l`/`s` rebuild the engine, and
+        that rebuild is where a changed setting takes effect."""
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            from textual.widgets import Static
+
+            panel = app.screen.query_one("#warmup-panel", Static)
+            assert "warmupEnabled" in panel.render().plain  # off by default
+            fake_engine.instances[0].warmup_enabled = True
+            app.screen._on_engine_event(NoSwitchEvent(reason="cooldown"))
+            await pilot.pause()
+            assert "waiting for first tick" in panel.render().plain
+
+
+@pytest.mark.asyncio
+class TestDashboardWarmup:
+    async def test_p_runs_warm_now_off_thread_and_refreshes(
+        self, tmp_path, monkeypatch
+    ):
+        """The UI loop never waits on a child process, and the panel must
+        show the stamps the hellos just created."""
+        from claude_swap import warmup
+
+        calls: list[dict] = []
+
+        def fake_warm_now(switcher, **kwargs):
+            calls.append(kwargs)
+            return warmup.WarmSummary(
+                rows=[warmup.WarmRow(number="1", email="a@example.com",
+                                     action="pinged")]
+            )
+
+        monkeypatch.setattr(warmup, "warm_now", fake_warm_now)
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("p")
+            await settle(pilot)
+            assert len(calls) == 1
+            assert app._warming is False
+
+    async def test_a_second_press_while_warming_is_refused(
+        self, tmp_path, monkeypatch
+    ):
+        from claude_swap import warmup
+
+        gate = threading.Event()
+        started = threading.Event()
+        runs: list[int] = []
+
+        def slow_warm_now(switcher, **kwargs):
+            runs.append(1)
+            started.set()
+            gate.wait(5)
+            return warmup.WarmSummary()
+
+        monkeypatch.setattr(warmup, "warm_now", slow_warm_now)
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        try:
+            async with app.run_test(size=(100, 40)) as pilot:
+                await settle(pilot)
+                app.action_warm_ping()
+                await pilot.pause()  # let the worker thread actually start
+                assert started.wait(5)
+                assert app._warming is True
+                app.action_warm_ping()  # refused, no second worker
+                await pilot.pause()
+                gate.set()
+                await settle(pilot)
+                assert app._warming is False
+                assert runs == [1]
+        finally:
+            gate.set()
+
+
+@pytest.mark.asyncio
+class TestSwitchRefusedWhileWarming:
+    """A switch onto a slot whose hello is still running would install the
+    pre-rotation credential as the live login and let the warmup's consume
+    gate supersede it — a spent refresh token in ``~/.claude``.
+
+    ``_perform_switch`` refuses it outright; the dashboard checks first so
+    the user gets a toast instead of a failure modal for something that
+    clears itself in seconds.
+    """
+
+    async def test_a_targeted_switch_is_refused_and_allowed_after(
+        self, tmp_path
+    ):
+        from claude_swap import warmup
+
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            with warmup.hello_in_flight("2"):
+                app.do_switch("2")
+                await settle(pilot)
+                assert fake.calls == []
+            app.do_switch("2")
+            await settle(pilot)
+            assert [c[0] for c in fake.calls] == ["switch_to"]
+
+    async def test_another_accounts_hello_does_not_block_the_switch(
+        self, tmp_path
+    ):
+        """Only the TARGET matters for a targeted switch."""
+        from claude_swap import warmup
+
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2), make_account(3)],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            with warmup.hello_in_flight("3"):
+                app.do_switch("2")
+                await settle(pilot)
+            assert [c[0] for c in fake.calls] == ["switch_to"]
+
+    async def test_best_pick_is_blocked_by_any_hello(self, tmp_path):
+        """`b` lets the switcher choose, so the target is unknown until it
+        has already landed — any hello in flight has to block it."""
+        from claude_swap import warmup
+
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            with warmup.hello_in_flight("2"):
+                app.action_switch_best()
+                await settle(pilot)
+                assert fake.calls == []
+            app.action_switch_best()
+            await settle(pilot)
+            assert [c[0] for c in fake.calls] == ["switch"]
+
 
 class TestEventText:
     def test_switch_event_styling_and_content(self):
@@ -1652,6 +2819,68 @@ class TestEventText:
         )
         text = event_text(event, palette=Palette.from_theme(CSWAP_LIGHT))
         assert any(ACCENT_LIGHT in str(s.style) for s in text.spans)
+
+    @staticmethod
+    def _styles_at(text, needle: str) -> set[str]:
+        at = text.plain.index(needle)
+        return {
+            str(s.style).lower()
+            for s in text.spans
+            if s.start <= at and s.end >= at + len(needle)
+        }
+
+    def test_poll_line_lifts_stamp_and_used_out_of_the_grey(self):
+        """Clock stamp and the active account's `N% used` are foreground;
+        everything else on a poll line is muted, so key times and the one
+        number that matters can be picked out of a scrolling log."""
+        from claude_swap.tui.autoview import event_text
+        from claude_swap.tui.theme import Palette
+
+        palette = Palette.DARK
+        event = PollEvent(
+            active={"number": 1, "email": "a@x.com"},
+            headroom={"1": 63.0, "2": 90.0},
+            threshold=95.0,
+        )
+        text = event_text(event, palette=palette)
+        fg, muted = palette.foreground.lower(), palette.muted.lower()
+        stamp = text.plain.split("  ", 1)[0]
+        assert fg in self._styles_at(text, stamp)
+        assert self._styles_at(text, "37% used") == {fg}
+        assert self._styles_at(text, "(switch at 95%)") == {muted}
+        assert self._styles_at(text, "Account-1 (a@x.com)") == {muted}
+        assert muted not in self._styles_at(text, "37% used")
+
+    def test_poll_line_lifts_the_binding_window_label_too(self):
+        """v0.29 names the binding window ("7d 93% used"); the lift still
+        lands, label included."""
+        from claude_swap.tui.autoview import event_text
+        from claude_swap.tui.theme import Palette
+
+        palette = Palette.DARK
+        event = PollEvent(
+            active={"number": 1, "email": "a@x.com"},
+            headroom={"1": 7.0},
+            threshold=85.0,
+            weekly_threshold=97.0,
+            windows={"1": {"5h": 40.0, "7d": 93.0}},
+        )
+        text = event_text(event, palette=palette)
+        assert "7d 93% used" in text.plain
+        assert self._styles_at(text, "7d 93% used") == {palette.foreground.lower()}
+
+    def test_non_poll_lines_keep_a_foreground_stamp_and_muted_body(self):
+        from claude_swap.tui.autoview import event_text
+        from claude_swap.tui.theme import Palette
+
+        palette = Palette.DARK
+        text = event_text(
+            NoSwitchEvent(reason="below-threshold", detail="37% < 95%"),
+            palette=palette,
+        )
+        stamp = text.plain.split("  ", 1)[0]
+        assert palette.foreground.lower() in self._styles_at(text, stamp)
+        assert self._styles_at(text, "below-threshold") == {palette.muted.lower()}
 
 
 # ---------------------------------------------------------------------------
@@ -1831,3 +3060,259 @@ class TestWeeklyTick:
         assert with_weekly["Fable"] == with_weekly["7d"]
         without = ticks(threshold=85.0)
         assert without["5h"] == without["7d"] == without["Fable"] == with_weekly["5h"]
+
+
+@pytest.mark.asyncio
+class TestAutoScreenReserve:
+    """Fork-only: consume-first-reserve-jj on the auto screen."""
+
+    async def _open(self, pilot):
+        await settle(pilot)
+        await pilot.press("g")
+        await pilot.pause()
+
+    def _app(self, tmp_path, accounts, **autoswitch):
+        (tmp_path / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {
+                "strategy": "consume-first-reserve-jj",
+                "reserveAccounts": "2",
+                **autoswitch,
+            },
+        }))
+        return make_app(FakeSwitcher(accounts, tmp_path))
+
+    def _static(self, app, selector: str) -> str:
+        from textual.widgets import Static
+
+        return app.screen.query_one(selector, Static).render().plain
+
+    def _line(self, plain: str, email: str) -> str:
+        return next(ln for ln in plain.splitlines() if email in ln)
+
+    async def test_panel_ranks_reserve_last_and_tags_it(self, tmp_path, fake_engine):
+        """#2 is the reserve and resets soonest (consume-first's first pick);
+        it renders after every HEALTHY non-reserve but before the
+        over-threshold #4 (the engine's ``_reserve_tier`` order), tagged
+        `reserve`."""
+        app = self._app(
+            tmp_path,
+            [
+                make_account(
+                    1, active=True, entry=make_entry(20.0, 20.0, reset7_in=86400 * 9)
+                ),
+                make_account(2, entry=make_entry(10.0, 10.0, reset7_in=86400)),
+                make_account(3, entry=make_entry(10.0, 10.0, reset7_in=86400 * 4)),
+                make_account(4, entry=make_entry(95.0, 95.0, reset7_in=86400 * 2)),
+            ],
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            plain = self._static(app, "#candidates")
+            assert plain.index("user3@example.com") < plain.index("user2@example.com")
+            assert plain.index("user2@example.com") < plain.index("user4@example.com")
+            assert "reserve" in self._line(plain, "user2@example.com")
+            assert "reserve" not in self._line(plain, "user3@example.com")
+            # below the threshold the nudge never targets a reserve
+            assert self._line(plain, "user2@example.com").rstrip().endswith("skip")
+
+    async def test_escape_order_matches_the_engine(self, tmp_path, fake_engine):
+        """Active at 92% (threshold 90): the engine escapes to the healthy
+        reserve #2 over the over-threshold non-reserve #3, so the panel must
+        list #2 first."""
+        app = self._app(
+            tmp_path,
+            [
+                make_account(
+                    1, active=True, entry=make_entry(92.0, 92.0, reset7_in=86400 * 9)
+                ),
+                make_account(2, entry=make_entry(10.0, 10.0, reset7_in=86400 * 4)),
+                make_account(3, entry=make_entry(95.0, 95.0, reset7_in=86400)),
+            ],
+            threshold=90,
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            plain = self._static(app, "#candidates")
+            assert plain.index("user2@example.com") < plain.index("user3@example.com")
+            assert not self._line(plain, "user2@example.com").rstrip().endswith("skip")
+
+    async def test_over_threshold_skips_reserve_when_a_non_reserve_is_usable(
+        self, tmp_path, fake_engine
+    ):
+        """Active at 92% (threshold 90) with the healthy non-reserve #3
+        available: the engine takes #3, never the healthy reserve #2, so #2
+        is tagged `skip`. Order is unchanged (#3 before #2)."""
+        app = self._app(
+            tmp_path,
+            [
+                make_account(
+                    1, active=True, entry=make_entry(92.0, 92.0, reset7_in=86400 * 9)
+                ),
+                make_account(2, entry=make_entry(10.0, 10.0, reset7_in=86400)),
+                make_account(3, entry=make_entry(20.0, 20.0, reset7_in=86400 * 4)),
+            ],
+            threshold=90,
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            plain = self._static(app, "#candidates")
+            assert plain.index("user3@example.com") < plain.index("user2@example.com")
+            line2 = self._line(plain, "user2@example.com").rstrip()
+            assert line2.endswith("skip") and line2.count("skip") == 1
+            assert not self._line(plain, "user3@example.com").rstrip().endswith("skip")
+
+    async def test_on_reserve_later_resets_are_not_skipped(self, tmp_path, fake_engine):
+        """Active #2 is the reserve: the strictly-sooner gate is waived, so a
+        non-reserve resetting LATER is takeable (no `skip`)."""
+        app = self._app(
+            tmp_path,
+            [
+                make_account(1, entry=make_entry(10.0, 10.0, reset7_in=86400 * 9)),
+                make_account(
+                    2, active=True, entry=make_entry(20.0, 20.0, reset7_in=86400)
+                ),
+                make_account(3, entry=make_entry(10.0, 10.0, reset7_in=86400 * 4)),
+            ],
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            plain = self._static(app, "#candidates")
+            assert not self._line(plain, "user1@example.com").rstrip().endswith("skip")
+            assert not self._line(plain, "user3@example.com").rstrip().endswith("skip")
+
+    async def test_summary_shows_strategy_and_reserve(self, tmp_path, fake_engine):
+        app = self._app(
+            tmp_path, [make_account(1, active=True), make_account(2)],
+            reserveAccounts="4,2",
+        )
+        async with app.run_test(size=(140, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            summary = self._static(app, "#auto-summary")
+            assert "consume-first-reserve-jj" in summary
+            assert "reserve #2, #4" in summary
+
+    async def test_s_cycles_every_strategy_with_a_reserve(self, tmp_path, fake_engine):
+        app = self._app(tmp_path, [make_account(1, active=True), make_account(2)])
+        async with app.run_test(size=(140, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            seen = [app.screen._settings.strategy]
+            for _ in range(4):
+                await pilot.press("s")
+                await settle(pilot)
+                seen.append(app.screen._settings.strategy)
+            assert seen == [
+                "consume-first-reserve-jj", "best", "consume-first",
+                "priority-consume-first", "consume-first-reserve-jj",
+            ]
+
+    async def test_s_cycles_three_with_the_default_reserve(self, tmp_path, fake_engine):
+        """No reserveAccounts key: the default "1" keeps the variant in."""
+        (tmp_path / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1, "autoswitch": {"strategy": "consume-first"},
+        }))
+        app = make_app(FakeSwitcher([make_account(1, active=True), make_account(2)], tmp_path))
+        async with app.run_test(size=(140, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            await pilot.press("s")  # -> priority-consume-first (v0.29)
+            await settle(pilot)
+            await pilot.press("s")
+            await settle(pilot)
+            assert app.screen._settings.strategy == "consume-first-reserve-jj"
+            summary = self._static(app, "#auto-summary")
+            assert "reserve #1" in summary
+
+    async def test_s_skips_reserve_variant_without_a_list(self, tmp_path, fake_engine):
+        app = self._app(
+            tmp_path, [make_account(1, active=True), make_account(2)],
+            strategy="consume-first", reserveAccounts="none",
+        )
+        async with app.run_test(size=(140, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            seen = []
+            for _ in range(3):
+                await pilot.press("s")
+                await settle(pilot)
+                seen.append(app.screen._settings.strategy)
+            assert seen == ["priority-consume-first", "best", "consume-first"]
+
+
+@pytest.mark.asyncio
+class TestAutoScreenLaunchOverrides:
+    """Fork-only: `cswap tui --strategy S --reserve NUMS|none` reaches the auto
+    screen as ``app.auto_overrides``; settings.json is never written."""
+
+    async def _open(self, pilot):
+        await settle(pilot)
+        await pilot.press("g")
+        await pilot.pause()
+
+    def _app(self, tmp_path, overrides, **autoswitch):
+        import argparse
+
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"schemaVersion": 1, "autoswitch": autoswitch}))
+        app = make_app(
+            FakeSwitcher([make_account(1, active=True), make_account(2)], tmp_path)
+        )
+        app.auto_overrides = argparse.Namespace(**overrides)
+        return app, path
+
+    def _summary(self, app) -> str:
+        from textual.widgets import Static
+
+        return app.screen.query_one("#auto-summary", Static).render().plain
+
+    async def test_strategy_and_reserve_override_the_file(self, tmp_path, fake_engine):
+        app, path = self._app(
+            tmp_path,
+            {"strategy": "consume-first-reserve-jj", "reserve": "4,2"},
+            strategy="best",
+        )
+        before = path.read_bytes()
+        async with app.run_test(size=(160, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            assert app.screen._settings.strategy == "consume-first-reserve-jj"
+            assert app.screen._settings.reserve_accounts == "4,2"
+            summary = self._summary(app)
+            assert "consume-first-reserve-jj (session)" in summary
+            assert "reserve #2, #4 (session)" in summary
+        assert path.read_bytes() == before
+
+    async def test_reserve_none_override(self, tmp_path, fake_engine):
+        app, _ = self._app(
+            tmp_path,
+            {"strategy": None, "reserve": "none"},
+            strategy="consume-first-reserve-jj",
+        )
+        async with app.run_test(size=(160, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            assert app.screen._settings.reserve_accounts == "none"
+            summary = self._summary(app)
+            assert "consume-first-reserve-jj ·" in summary  # not a session strategy
+            assert "reserve none (session)" in summary
+            # the variant drops out of the `s` cycle with no reserve
+            await pilot.press("s")
+            await settle(pilot)
+            await pilot.press("s")
+            await settle(pilot)
+            assert app.screen._settings.strategy == "consume-first"
+
+    async def test_no_overrides_is_the_file(self, tmp_path, fake_engine):
+        app, _ = self._app(tmp_path, {}, strategy="consume-first-reserve-jj")
+        app.auto_overrides = None
+        async with app.run_test(size=(160, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            assert app.screen._settings.reserve_accounts == "1"
+            assert "(session)" not in self._summary(app)

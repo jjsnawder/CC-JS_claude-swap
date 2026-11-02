@@ -445,3 +445,32 @@ OSError as stale (reintroduces the hub's competing-switch fallback against a
 live engine).
 **Why it matters:** "no engine" is the hub's licence to switch around the
 engine, so it must mean exactly that.
+
+## 2026-11-02 - v0.29.0 reconcile: final-state port, not a per-commit rebase
+**Chose:** rebuild `jeremy` on v0.29.0 by replaying every fork commit's
+non-code paths (docs/, .claude/, tools/, CLAUDE.md, .gitignore) with original
+authorship, then porting the fork's src/tests as a 3-way merge per file
+(base v0.26.0, current v0.29.0, ours = old `jeremy`), resolved by file-disjoint
+agents and committed per concern. The pre-port tip stays at tag
+`pre-v029-reconcile` for granular history and rollback.
+**Rejected:** `git rebase v0.29.0` (the documented method): upstream rewrote the
+autoswitch ranking (per-account lines, all-above "most room" replacing the
+recovery-time axis) that 20 fork commits build on, so the replay stopped on
+the first code commit and would re-conflict on the same region at most of the
+rest; merging v0.29.0 into `jeremy` (breaks the "based on the release tag"
+model and every later rebase).
+**Why it matters:** future reconciles replay a handful of concern commits instead
+of 20 overlapping ones. `git merge-file` must be fed all three sides from git
+objects: the CRLF working copy against LF blobs makes every file one giant conflict.
+
+## 2026-11-02 - `n` under priority-consume-first keeps upstream's outrank filter
+**Chose:** the manual `n` trigger waives cooldown and anti-flap margins under
+every strategy EXCEPT priority-consume-first's "must outrank the active
+account" filter, which it keeps; from the top-priority account `n` refuses and
+points at `m` (the held manual pick).
+**Rejected:** waiving the filter (the port's first cut): `n` sets no pin, so
+the next `priority` tick after the cooldown switches straight back, and the
+keypress buys a five-minute detour; pinning `n`'s landing under priority
+(new fork behaviour for a strategy Jeremy doesn't run, more rebase surface).
+**Why it matters:** smallest delta from upstream, and `n` can never start a
+switch the engine itself will undo.

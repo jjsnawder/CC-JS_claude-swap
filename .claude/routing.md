@@ -1,23 +1,25 @@
-# Model routing layer (FABLE 5.1 orchestrator / Opus 5 execution)
+# Model routing layer (OPUS 5.5 orchestrator / Opus 5.5 execution)
 
 > Imported by CLAUDE.md via @.claude/routing.md. Read alongside the WAT
 > instructions in the rest of CLAUDE.md. Adds only the model-cost dimension.
 >
-> **This project's main is FABLE 5.1, not Opus 5** — Jeremy's explicit choice at
-> scaffold time (2026-09-04; rationale in `docs/decisions.md`). This file is the
-> Fable-main variant of the house routing layer: three rules are inverted from
-> the Opus-5-main default. Do not "restore" them from another project's copy.
+> **This project's main is OPUS 5.5** (`.claude/settings.json`, since 2026-09-27;
+> confirmed by Jeremy 2026-11-02, decisions.md). It was scaffolded as the
+> Fable-5.1-main variant (2026-09-04). Its delegation and verification rules
+> were written for a Fable main, but they stay as project rules: the v0.29.0
+> reconcile showed what they are worth. Do not "restore" the Opus-main
+> default's opposite rules from another project's copy.
 
 WAT keeps the reasoning layer thin by offloading execution to deterministic
 tools. This file tiers that execution by model: mechanical work on a cheap model,
 judgment on an expensive one.
 
 ## Who runs on what
-- You, the WAT Agent (this main session): **FABLE 5.1** (`claude-fable-5-1`).
+- You, the WAT Agent (this main session): **OPUS 5.5** (`claude-opus-5-5`).
   Orchestrate — read the workflow, sequence tools, handle failures, ask
   clarifying questions, own git and workflow edits, run the self-improvement
   loop, report results.
-- Default execution: **OPUS 5** subagents (`tool-runner`, `review`). Editing
+- Default execution: **OPUS 5.5** subagents (`tool-runner`, `review`). Editing
   `src/claude_swap/`, running `tools/*.py`, fixing them when they break,
   reviewing a change before commit.
 - Simple mechanical work: the **SONNET 5** `chore` subagent. Running a known-good
@@ -26,21 +28,20 @@ judgment on an expensive one.
 - Discovery: the **HAIKU** `scout` subagent. Read-only lookups — which module
   owns a behaviour, which test covers it, whether a tool already exists.
 - Consequential verification: the **FABLE 5.1** `deep` subagent, isolated, at
-  `xhigh` effort. See §Verification — with a Fable main this is a
-  *fresh-context verifier*, not an escalation hop, and it stays on Fable at
-  Jeremy's standing ruling.
+  `xhigh` effort. See §Verification: a *fresh-context* verifier, and since the
+  main moved to Opus 5.5 also a *different-model* one.
 
 ## Routing (per step)
 Treat this as a **menu, not a script.** Prescriptive step-by-step scaffolding
-lowers Fable's output quality — state the goal and the constraints, then pick
-your own path.
+lowers output quality: state the goal and the constraints, then pick your own
+path.
 
 - "Which module/test owns X? Is there already a tool for Y?" → `scout` (Haiku)
 - Run a known-good tool or the test suite, capture output → `chore` (Sonnet 5)
-- Change package code, write or fix a tool, make the tests pass → `tool-runner` (Opus 5)
-- Review a change before you commit → `review` (Opus 5)
+- Change package code, write or fix a tool, make the tests pass → `tool-runner` (Opus 5.5)
+- Review a change before you commit → `review` (Opus 5.5)
 - Independent fresh-context check of consequential work → `deep` (Fable 5.1)
-- Decompose, sequence, synthesize, decide → inline, you (Fable 5.1)
+- Decompose, sequence, synthesize, decide → inline, you (Opus 5.5)
 
 ### chore vs tool-runner — the one test
 Does the step require writing or fixing code, or judging whether the output is
@@ -52,9 +53,10 @@ known good.
 
 ## Delegation discipline — delegate freely, and prefer async
 
-**Inverted from the Opus-5-main default.** That default warns against
-over-delegation because Opus 5 reaches for subagents readily. Fable is the
-opposite: its parallel subagents are dependable and it under-reaches.
+**Inverted from the Opus-main default**, which warns against over-delegation.
+This rule was written for the Fable main; it stays under Opus 5.5 because
+Jeremy's box-wide ruling (2026-09-29, §Parallelize for speed) puts speed ahead
+of the token cost of extra agents.
 
 - Delegate freely. Dispatch independent tracks in a single message so they run
   concurrently, and keep working while they run — intervene only if one goes off
@@ -69,29 +71,30 @@ opposite: its parallel subagents are dependable and it under-reaches.
 
 ## Verification — make it explicit and run it on a cadence
 
-**Inverted from the Opus-5-main default.** Opus 5 self-verifies, which is why the
-default file tells it *not* to add verification hops. Fable does not do this
-reliably on its own.
+**Inverted from the Opus-main default**, which tells the main *not* to add
+verification hops. This rule was written for the Fable main, and it stays under
+Opus 5.5: in the v0.29.0 reconcile, `review` found four real defects after a
+fully green suite.
 
 - Establish a concrete method for checking your own work against the spec, and
   run it on a cadence — not once at the end. Here the method is concrete: the
-  upstream test suite (`python -m pytest -q -n 4`, BELOW_NORMAL priority) plus a
-  scratch-store manual trial, then `cswap status` as the live smoke test.
-- **Fresh-context verifier subagents beat self-critique.** `review` (Opus 5) is
+  test suite (`python tools/run_tests_low.py -q -n 4`, BELOW_NORMAL priority) plus
+  a scratch-store trial (`tools/trial/`), then `cswap status` as the live smoke test.
+- **Fresh-context verifier subagents beat self-critique.** `review` (Opus 5.5) is
   the standing hop for any change before commit. `deep` is the hop for anything
   consequential and hard to detect by tests: anything that touches credential
   read/write paths, the account store layout, the switch/`run` launch logic, the
   `CLAUDE_CONFIG_DIR` copy step (restic and the cross-sessions skill depend on
   that layout), or an upstream rebase with conflicts in those areas.
-- **`deep` stays on FABLE (5.1, `xhigh`) — settled, do not re-litigate.** It
-  runs the same model as the main by Jeremy's **standing ruling (2026-08-17)**,
-  the house default for every Fable-main project
+- **`deep` stays on FABLE (5.1, `xhigh`).** It was pinned there under Jeremy's
+  **standing ruling (2026-08-17)** for Fable-main projects
   (`~/.claude/guides/project-scaffolding-scope.md` §Questions that ARE fair to
-  ask). The value is the *fresh, isolated context*, not a capability step-up,
-  and it costs 2× Opus 5 per token — so route to it for consequential checks,
-  not routine ones. Known failure mode to watch: `deep` echoing the main's
-  framing instead of challenging it. Brief it adversarially ("try to refute X")
-  rather than repointing it.
+  ask). With an Opus 5.5 main it is now a different model from the main as well
+  as a fresh context. Moving it is Jeremy's call; don't change it on your own.
+  It costs about 2× Opus per token, so route to it for consequential checks, not
+  routine ones. Known failure mode: `deep` echoing the main's framing instead of
+  challenging it. Brief it adversarially ("try to refute X") rather than
+  repointing it.
 
 ## The live account store is gated
 
@@ -141,7 +144,7 @@ this is the project-level summary.
   leaked token is a rotation event.
 - **Deliverables**: you commit and report; subagents leave intermediates in `.tmp/`.
 
-## Fable 5.1 operating facts (know these)
+## Fable 5.1 operating facts (for the `deep` subagent)
 - **Thinking is always on.** `thinking: {"type": "disabled"}` is a 400; depth is
   controlled by effort alone.
 - **30-day data retention is required.** Fable is not available under zero data
@@ -180,18 +183,18 @@ orchestrator-owned; the worker-side rule is in every Bash-capable agent body.
   ruling; ~/.claude/guides/claude-code-subagent-discipline.md §Parallelize for speed).
 
 ## Model wiring (desktop app)
-Main = Fable 5.1 via `.claude/settings.json` (exact ID `claude-fable-5-1` —
-house convention is exact IDs so each release is a deliberate step). Workers
+Main = Opus 5.5 via `.claude/settings.json` (exact ID `claude-opus-5-5`; the
+house convention is exact IDs, so each release is a deliberate step). Workers
 pinned per agent file (`tool-runner`/`review` = `claude-opus-5-5`, `chore` =
 `claude-sonnet-5`, `scout` = `haiku`, `deep` = `claude-fable-5-1` @ `xhigh`).
 **DO NOT set `CLAUDE_CODE_SUBAGENT_MODEL`** — it overrides frontmatter and
-collapses every worker onto one model. Confirm Fable 5.1 in the startup header;
+collapses every worker onto one model. Confirm Opus 5.5 in the startup header;
 if the model picker says otherwise it overrides for that session only.
 
 ## Usage tracking & cost recaps
 Run `tools/report_model_usage.py` at session end and on request, and include the
-cost recap when you report. Fable main-session tokens plus a Fable `deep` are the
-dominant line items here — watch both. `docs/model-usage.md` is **gitignored in
+cost recap when you report. Main-session tokens and the Fable `deep` are the
+dominant line items here; watch both. `docs/model-usage.md` is **gitignored in
 this repo** (public fork; Jeremy's spend stays local). The procedure lives in
 `~/.claude/guides/claude-code-model-usage-tracking.md` — READ it when you run the
 tracker, do not `@`-import it.

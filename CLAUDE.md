@@ -5,7 +5,7 @@
 > **STATUS (2026-11-02): LIVE FORK on upstream v0.29.0.** This repo is Jeremy's
 > **fork of [realiti4/claude-swap](https://github.com/realiti4/claude-swap)**
 > (`cswap`, the Claude Code multi-account switcher, MIT) plus the house WAT +
-> Fable-5.1-main routing frame, and it IS the `cswap` running on the dev box.
+> routing frame (Opus 5.5 main), and it IS the `cswap` running on the dev box.
 > Fork features on top of upstream: consume-first ranking refinements, the
 > `consume-first-reserve-jj` strategy, warmup stagger (`cswap warm`), the auto
 > screen's `n`/`m`/`p`/`s` keys, and engine control (`cswap engine`, used by the
@@ -41,7 +41,8 @@ That sentence is the whole kickoff. When it arrives, before proposing anything:
 2. **Take what's already decided as given** (below, and `docs/decisions.md`):
    true GitHub fork, public, personal account; `main` mirrors upstream, `jeremy`
    is the working branch based on the latest release tag; editable install into
-   system Python 3.13 (no venv — deliberate); Fable 5.1 main / Opus 5 workers.
+   system Python 3.13 (no venv — deliberate); Opus 5.5 main and workers, with
+   `deep` on Fable 5.1 (`.claude/routing.md`).
 3. **Plan with Jeremy, then write `docs/plans/<date>-<slug>.md` before any
    code.** The conversation must produce:
    - **The change itself**, and whether it is (a) generic → structured for an
@@ -131,7 +132,8 @@ unless told to.
 - Commit discipline: one concern per commit, upstream's style (`fix(scope): …`,
   `feat(scope): …`). Prefer targeted edits over file rewrites — every rewritten
   upstream file is a rebase conflict later.
-- Commit-message trailer: `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
+- Commit-message trailer: `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`
+  (the main session's model; it was Fable 5.1 until 2026-09-27).
 - **Push is pre-authorized** (Jeremy's standing instruction, all projects).
   `git push --force-with-lease origin jeremy` after a rebase is the one sanctioned
   history rewrite here; anything else that rewrites history still needs his OK.

@@ -487,3 +487,16 @@ from the `s` cycle (still reachable by config/CLI/hub).
 **Why it matters:** the strategy's hold-instead-of-land rule and its lack of the
 fork's consume-first refinements make it a trap if picked by accident; the
 2026-11-02 `n`-under-priority ruling now only matters if it is re-enabled.
+
+## 2026-11-02 - Main orchestrator is Opus 5.5 (correction of the 2026-09-04 entry)
+**Chose:** record the main as `claude-opus-5-5` (set in `.claude/settings.json`
+2026-09-27, commit dd8235d; confirmed by Jeremy 2026-11-02), with the trailer
+`Co-Authored-By: Claude Opus 5.5`. Keep routing.md's delegate-freely and
+verify-on-a-cadence rules as project rules, and `deep` on Fable 5.1 @ `xhigh`.
+**Rejected:** restoring the Opus-main default routing (it discourages verification
+hops, but in the v0.29.0 reconcile `review` caught four defects after a green
+suite, and the 2026-09-29 parallelize ruling already overrides its
+over-delegation warning); moving `deep` to Opus without Jeremy asking (his
+2026-08-17 ruling pinned it).
+**Why it matters:** the docs said Fable main for five weeks after the switch; an
+agent reading them would misattribute commits and mis-cost the session.

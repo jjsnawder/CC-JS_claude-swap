@@ -2,12 +2,16 @@
 
 # CC-JS_claude-swap — Agent Instructions
 
-> **STATUS (2026-09-04): SCAFFOLD ONLY — NO CHANGES TO THE PACKAGE YET.** This
-> repo is Jeremy's **fork of [realiti4/claude-swap](https://github.com/realiti4/claude-swap)**
+> **STATUS (2026-11-02): LIVE FORK on upstream v0.29.0.** This repo is Jeremy's
+> **fork of [realiti4/claude-swap](https://github.com/realiti4/claude-swap)**
 > (`cswap`, the Claude Code multi-account switcher, MIT) plus the house WAT +
-> Fable-5.1-main routing frame. `src/claude_swap/` is upstream v0.26.0
-> untouched. **What Jeremy wants changed is not yet stated** — §Planning session
-> below is how that conversation starts. `workflows/` is deliberately empty.
+> Fable-5.1-main routing frame, and it IS the `cswap` running on the dev box.
+> Fork features on top of upstream: consume-first ranking refinements, the
+> `consume-first-reserve-jj` strategy, warmup stagger (`cswap warm`), the auto
+> screen's `n`/`m`/`p`/`s` keys, and engine control (`cswap engine`, used by the
+> CC-JS_Claude_Remote hub). Upstream's `priority-consume-first` is suppressed
+> (`settings.SUPPRESSED_STRATEGIES`). Specs: `docs/plans/`; rulings:
+> `docs/decisions.md`; the one workflow so far: `workflows/reconcile-upstream.md`.
 
 > **This repo is PUBLIC** (GitHub requires forks of public repos to be public).
 > Nothing operator-specific goes in it: no account emails, slot rosters, usage
@@ -15,7 +19,7 @@
 > Operator notes live in the private env repo
 > (`CC-JS_Claude_Environment/machine-setup/claude-swap-cheatsheet.md`).
 
-## Planning session — how this project starts
+## Planning session — how a new change starts
 
 Jeremy opens a fresh session here and says, in effect, **"I want cswap to…"**.
 That sentence is the whole kickoff. When it arrives, before proposing anything:
@@ -47,8 +51,8 @@ That sentence is the whole kickoff. When it arrives, before proposing anything:
      slot-copy step? If yes, restic + cross-sessions are in scope and `deep`
      verifies it.
    - **Tests.** Which existing tests cover it; what new test proves it.
-   - **The reconcile workflow** (`workflows/reconcile-upstream.md`) and the
-     verify workflow, written once the first change lands.
+   - **Rebase cost.** Every fork change is replayed at each upstream release
+     (`workflows/reconcile-upstream.md`): keep it separable and its diff small.
 4. Every non-obvious call → `docs/decisions.md`.
 
 ## What this project is
@@ -67,19 +71,17 @@ line, kill by PID only).
 | `upstream` remote | `realiti4/claude-swap` | Read-only source of truth. Never push to it. |
 | `origin` remote | `jjsnawder/CC-JS_claude-swap` | Our fork. Default branch `jeremy`. |
 | `main` | Pristine mirror of `upstream/main` | **Never commit here.** Fast-forward only. |
-| `jeremy` | The working branch — every local change lives here | Based on the latest upstream **release tag** (v0.26.0 at fork time, 2026-09-04), not `upstream/main`, which carries pre-release betas. |
+| `jeremy` | The working branch — every local change lives here | Based on the latest upstream **release tag** (v0.26.0 at fork time, 2026-09-04; v0.29.0 since 2026-11-02), not `upstream/main`, which carries pre-release betas. |
 
 ## Reconciling with upstream (when a new release lands)
-```bash
-git fetch upstream --tags
-git checkout main && git merge --ff-only upstream/main && git push origin main
-git checkout jeremy && git rebase v<new-tag>        # replay our commits on the new release
-# resolve any conflicts (only where upstream touched the same lines we did), then:
-git push --force-with-lease origin jeremy           # the ONLY sanctioned history rewrite: our branch, our fork
-pip install -e .                                    # only if pyproject.toml changed (no live cswap process!)
-python -m pytest -q -n 4                            # BELOW_NORMAL priority; confirm before trusting the merge
-cswap status                                        # live smoke test
-```
+Follow **`workflows/reconcile-upstream.md`**: work in a worktree, try a rebase
+onto the release tag, and switch to a final-state port when upstream restructured
+code the fork builds on (the v0.29.0 case). Verify with the suite, a scratch-store
+trial, `review` and `deep`, and check the Remote hub contract. Then cut over with
+Jeremy's OK: he quits the TUI, you reset `jeremy`, `pip install -e .`,
+`cswap --version`/`status`, he relaunches. `git push --force-with-lease origin
+jeremy` afterwards is the ONLY sanctioned history rewrite. Never `cswap upgrade`.
+
 A generic change goes upstream as a PR from a topic branch cut from the release
 tag with only the code commits cherry-picked (never the WAT/`.claude/` frame).
 Once merged, that part of our diff disappears — the smaller the fork's delta,
@@ -92,8 +94,9 @@ directory, never from another project.
   change. Updates arrive through git only.
 - **Never test against the live account store.** `~/.claude-swap-backup/` holds
   plaintext OAuth tokens. Unit tests use the fixtures under `tests/`; manual
-  trials use a scratch `CLAUDE_CONFIG_DIR` and a scratch backup dir. The only
-  live touch is the orchestrator's `cswap status` smoke test.
+  trials go through `tools/trial/` (scratch home; real store, keyring, network
+  and subprocesses blocked). The only live touch is the orchestrator's read-only
+  smoke test (`cswap status`, `cswap list`, `cswap engine status --json`).
 - Never print, log, copy, or commit credential material, even redacted.
 - Never edit upstream's `README.md` or `.github/` — pure rebase friction. Fork
   documentation lives here and in `docs/`.
@@ -104,12 +107,12 @@ You're working inside **WAT** (Workflows, Agents, Tools): probabilistic AI
 handles the reasoning, deterministic code handles the execution.
 
 - **Layer 1 — Workflows**: markdown SOPs in `workflows/` (objective, inputs,
-  tools, outputs, edge cases). Empty until the planning session writes them; the
-  first two will be *reconcile-upstream* and *verify-change*.
+  tools, outputs, edge cases). So far: `reconcile-upstream.md` (2026-11-02).
 - **Layer 2 — Agent**: you. Read the relevant workflow, run tools in the right
   sequence, handle failures gracefully, ask clarifying questions.
-- **Layer 3 — Tools**: `tools/` holds house helpers (the usage tracker, and any
-  reconcile/test-runner scripts the plan calls for). The **product code is
+- **Layer 3 — Tools**: `tools/` holds house helpers: the usage tracker,
+  `run_tests_low.py` (pytest at BELOW_NORMAL), and the `trial/` scratch-store
+  kit. The **product code is
   upstream's `src/claude_swap/`** — edit it directly; it is not a WAT tool.
 
 How to operate: look for existing behaviour and tests first; when something
@@ -122,8 +125,9 @@ unless told to.
   `src/claude_swap/tui/` (Textual dashboard), `tests/` (pytest + pytest-asyncio +
   pytest-xdist). `uv.lock` is upstream's lockfile; on this box we use system
   Python 3.13 + pip, not uv (no venv — the editable install IS the point).
-- Test deps: `pip install pytest pytest-asyncio pytest-xdist`. Suite verified
-  green on this checkout 2026-09-04 (2092 passed, 77 skipped, ~60 s at `-n 4`).
+- Test deps: `pip install pytest pytest-asyncio pytest-xdist`. Run the suite with
+  `python tools/run_tests_low.py -q -n 4 -p no:cacheprovider`. Verified green
+  2026-11-02 on v0.29.0 + fork (3298 passed, 121 skipped, ~2–2.5 min at `-n 4`).
 - Commit discipline: one concern per commit, upstream's style (`fix(scope): …`,
   `feat(scope): …`). Prefer targeted edits over file rewrites — every rewritten
   upstream file is a rebase conflict later.

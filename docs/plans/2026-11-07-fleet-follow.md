@@ -128,3 +128,76 @@ verb), `autoswitch.py` (one tick hook + leader start/stop), `engine_control.py` 
 
 ## Not doing
 Moving logins between boxes; automating `/login`; the router; worker provisioning; an upstream PR.
+
+## Internal API (build contract between the three modules; change only via the orchestrator)
+Three modules, one owner each. Names below are binding; add private helpers freely.
+
+**`src/claude_swap/fleet_lease.py`** (worker side + the lease format)
+- `CONTRACT = "cswap-fleet/1"`; `DEFAULT_TTL_S = 180`.
+- `identity_hash(email: str, org_uuid: str | None, salt: str) -> str` (sha256 hex of
+  salt + lowercased email + org uuid; never log inputs).
+- `build_lease(switcher, *, leader_id: str, seq: int, target: dict, settings: dict,
+  ttl_s: int = DEFAULT_TTL_S) -> dict`: dev-box side. `target` = `{"mode": "follow"|"pin"|
+  "strategy", "account": "N"|None, "strategy": str|None}`. Includes `identity` (per managed
+  slot, salt = random per lease, salt carried in the lease) and `usage` = the dev box's
+  `cswap list --json` payload (same producer the CLI uses).
+- `receive_lease(switcher, payload: dict, *, now: float | None = None) -> dict`: worker side.
+  Validates (contract, shape, ttl bounds 30-900), checks identity per slot, writes
+  `<backup_root>/fleet/lease.json` atomically with `received_at` = worker wall clock, adopts
+  `usage` via the import-usage path with hold = ttl, returns the snapshot dict (below).
+  Identity mismatch on the target slot → lease stored with `follow_blocked: "identity-mismatch"`.
+- `active_lease(backup_root: Path, *, now: float | None = None) -> Lease | None`: the stored
+  lease if `received_at + ttl_s > now`, else None. `Lease` is a frozen dataclass:
+  `leader_id, seq, ttl_s, received_at, target_mode, target_account, target_strategy,
+  settings, follow_blocked`.
+- `follow_state(backup_root, engine_status: dict | None, *, now=None) -> dict`:
+  `{"state": "following"|"overridden"|"autonomous", "reason": str|None, "lease_age_s": float|None}`.
+- `build_snapshot(switcher, backup_root, *, now=None) -> dict`: `{"contract", "host_time",
+  "accounts": <list --json payload>, "engine": <engine status reply or {"result":"no-engine"}>,
+  "follow": follow_state(...), "relogin": [slot numbers], "settings_hash": str}`.
+  `relogin` = rows with `usageStatus == "relogin_required"`, engine-quarantined slots, or
+  `loginExpiresAt` within 7 days. `settings_hash` = `settings_fingerprint(...)`.
+- `settings_fingerprint(switcher) -> str`: sha256 over the persisted autoswitch settings +
+  per-account policy (threshold, disabled, priority), canonical JSON. Same function on both
+  boxes, so equal hashes = no drift.
+
+**`src/claude_swap/fleet_remote.py`** (dev box side + the `fleet` CLI)
+- `Host` frozen dataclass: `name, alias, command (default "cswap"), override (dict, the
+  target shape above, default follow)`. `load_hosts(backup_root) -> list[Host]`,
+  `save_hosts(backup_root, hosts)`: `<backup_root>/fleet/hosts.json`, atomic.
+- `run_remote(host, args: list[str], stdin_obj: dict | None, *, timeout: float = 20,
+  runner=subprocess.run) -> RemoteResult(rc, payload: dict | None, error: str | None)`.
+  argv = `["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host.alias,
+  *shlex.split(host.command), *args]` with each arg passed through `shlex.quote` for the
+  remote shell; payload only on stdin as JSON. Timeout/nonzero/bad JSON → error, never raises.
+- `export_settings(switcher) -> dict` and `apply_settings(switcher, doc) -> dict`
+  (worker side of push: identity-checked per slot, writes via the existing set_setting /
+  set_account_* functions, returns what changed). `push(switcher, hosts, *, dry_run) -> list`.
+- `fleet_status(switcher, backup_root, *, leader_snapshot: dict | None, runner=...) -> dict`:
+  the router contract. Uses the leader's last snapshots when a live leader exists (read via
+  `engine status`'s `fleet` block), else a one-shot `fleet snapshot --json` per host.
+- CLI `cswap fleet …` (dispatch hunk in `cli.py`): `hosts add|remove|list`, `status`,
+  `push [--host] [--dry-run]`, `override HOST follow|pin N|strategy S`, and the worker-side
+  verbs `receive` (lease on stdin → snapshot on stdout), `snapshot`, `apply` (settings doc on
+  stdin). All take `--json`.
+- Settings key `fleet.fallbackStrategy` (default `consume-first-reserve-jj`, choices =
+  `SELECTABLE_STRATEGIES`) in `settings.py`.
+
+**`src/claude_swap/fleet_leader.py`** + engine hooks (both roles inside the running engine)
+- `FleetLeader(switcher, engine, backup_root, *, runner=subprocess.run, interval_s)`:
+  `start()`, `stop()`, `kick()` (push now, e.g. after a switch), `snapshot() -> dict`
+  (`{"leader_id", "hosts": {name: {"reachable", "last_ok_at", "error", "snapshot"}}}`).
+  Daemon thread; per-host calls in a small bounded pool; one hung host never delays another
+  or the engine tick. Builds the target per host from `Host.override` + the engine's active
+  account; settings = the engine's live effective settings.
+- Leader runs only when hosts are configured AND the engine is live (not dry-run); starts and
+  stops with the engine (both `cswap auto` and the TUI auto screen).
+- Worker hook in `AutoSwitchEngine`: at the top of each tick, `active_lease(...)`. Valid and
+  not `follow_blocked` → the engine's decision target is the lease target (follow/pin: that
+  account, switched through the same path `request_switch(target=N)` uses, never undone by the
+  engine's own strategy while the lease holds; `strategy` override: rank with that strategy),
+  with the lease's live settings (threshold etc.) applied for the tick. No/expired lease →
+  normal behaviour, strategy = `fleet.fallbackStrategy` when a lease was ever received
+  (a box with no fleet history behaves exactly as today).
+- `engine status --json` gains additive `fleet`: `{"role": "leader"|"worker"|"none",
+  "leader": FleetLeader.snapshot() or null, "follow": follow_state(...) or null}`.

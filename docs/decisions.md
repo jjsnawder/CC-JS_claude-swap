@@ -572,3 +572,39 @@ a public upstream fork; every new alert type becomes cswap code); the env repo
 polling `fleet status` (needs a scheduled task Jeremy hasn't asked for).
 **Why it matters:** the fork stays transport-free, and the same hook carries
 any future fleet alert.
+
+## 2026-11-08 - Pin release: `cswap engine unpin` + TUI `u`, fire-and-wake (Jeremy asked; shape mine)
+**Chose:** a control op `unpin` that releases the hold and wakes the engine,
+replying at once (`released` + `was` / `not-pinned`, both exit 0) without
+waiting for the switch that may follow; the caller re-reads `status`. It
+answers `busy` (exit 1) while a pick OR a strategy change is in flight (the
+strategy change rebuilds the engine with the pin carried; releasing mid-rebuild
+could resurrect it), and also releases on a rebuilt engine if one replaced the
+old one during the call. A pick that is queued or mid-tick is not cancelled: it
+pins when it lands (latest action wins). TUI `u` calls the same `release_pin`.
+**Rejected:** waiting for the post-release tick's outcome like `pick` does
+(unpin may correctly lead to no switch, so there is no outcome to wait for);
+refusing unpin while a TUI `m` is queued (mid-tick picks are invisible to the
+server anyway; asymmetry for nothing).
+**Why it matters:** after `u`/unpin the engine runs the normal strategy
+including the anti-undo bar, which counts the manual pick as the engine's own
+last move. So releasing a hold can land on a third account rather than the one
+the pick left (deep's probe: #2 -m-> #3 -u-> #1). That is by design here; if
+Jeremy wants `leftTrigger == manual` to disarm the bar, that is a separate
+decision.
+
+## 2026-11-08 - Switch-source logging lives in the engine only
+**Chose:** fork INFO lines in `claude-swap.log` after every live engine switch
+(`auto-switch: engine moved #A -> #B (trigger T, source S)`; sources `tui-n`,
+`tui-m`, `engine-pick` = `cswap engine pick` / Claude Remote hub, `engine` =
+autonomous, `fleet-lease`) plus pin set/released lines with the reason.
+Upstream's `Switched from account X to Y` line is untouched (menubar parses it),
+and no new line can match that regex. Plain `cswap switch` and the TUI accounts
+screen get NO source line: **a switch with no source line came from outside the
+auto engine.**
+**Rejected:** source lines at the CLI / accounts-screen entry points
+(`cli.py`, `tui/app.py` are upstream code: a conflict at every reconcile);
+rewriting upstream's switch line to carry the source (same, plus breaks the
+menubar parser).
+**Why it matters:** answers "who switched me?" from the log, which on
+2026-11-08 could not tell a TUI `m` from a Remote hub pick.

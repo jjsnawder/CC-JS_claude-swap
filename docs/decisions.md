@@ -561,3 +561,14 @@ fetching usage in the leader thread (a second fetcher per box, and it can spend
 refresh grants); waking on every heartbeat (doubles worker ticks for nothing).
 **Why it matters:** these are what make "follow" stable. Loosening (1) or (3)
 reintroduces flapping or the one-fetcher-per-box break that `deep` found.
+
+## 2026-11-07 - Needs-login alerts: cswap fires a hook, the env repo sends (Jeremy)
+**Chose:** a box-local `fleet.alertCommand`; the leading engine runs it with
+`cswap-fleet-alert/1` JSON on stdin when a box's needs-login set or
+reachability changes, deduped in `fleet/alerts.json`. The env repo owns the
+sender (relay, recipients, house email format).
+**Rejected:** cswap sending mail itself (relay details and house email rules in
+a public upstream fork; every new alert type becomes cswap code); the env repo
+polling `fleet status` (needs a scheduled task Jeremy hasn't asked for).
+**Why it matters:** the fork stays transport-free, and the same hook carries
+any future fleet alert.

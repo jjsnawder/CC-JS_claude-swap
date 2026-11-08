@@ -52,3 +52,4 @@ shows `pinned: null`), with the source line visible in `claude-swap.log`.
 - 2026-11-08 · charter approved with the UI-options review added; committed + pushed
 - 2026-11-08 09:25 CT · sent charter request to the Remote session ("charter with swap") with charter path @ 56ecca7; awaiting its approval
 - 2026-11-08 09:26 CT · Remote approved its side as written (Jeremy, in its session); its log @ fd9062b. It starts the UI mockups + Unpin route vs fakes; wants a message when unpin is committed and installed
+- 2026-11-08 09:57 CT · unpin + u + source logging committed 110c324 (review: safe to commit; deep: ship; fixes applied, suite 3630 passed/121 skipped); decisions 6bb2b3c. Told Remote: installed, busy also on strategy change, running TUI pid 16928 answers bad-request until restart; live status active 4 pinned 4

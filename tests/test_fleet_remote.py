@@ -630,6 +630,35 @@ class TestFleetStatus:
                               runner=FakeRunner(default=_ok(strat)))
         assert "not on target" not in fr._status_human(doc)  # a strategy has no target
 
+    def test_local_row_on_target_is_null(self, tmp_path, lease):
+        # build_snapshot reports false on a box with an active slot and no
+        # lease; the dev box follows no one, so its row says null.
+        lease.local["follow"]["on_target"] = False
+        for leader in (None, {"leader_id": "L1", "hosts": {}}):
+            doc = fr.fleet_status(FakeSwitcher(tmp_path), tmp_path, leader_snapshot=leader)
+            assert doc["hosts"][0]["name"] == "local"
+            assert doc["hosts"][0]["on_target"] is None
+
+    def test_relogin_detail_is_carried_email_free(self, tmp_path, lease):
+        _hosts(tmp_path, "worker-a", "worker-b")
+        snap = _snap(relogin=["1"])
+        snap["relogin_detail"] = [
+            {"slot": "1", "reason": "relogin_required", "expires_at": None,
+             "email": "account-1@example.test"},
+            {"slot": "x@example.test", "reason": "expiring"},
+        ]
+        lease.local["relogin_detail"] = [{"slot": "3", "reason": "expiring",
+                                          "expires_at": "2026-11-10T00:00:00Z"}]
+        runner = FakeRunner({"worker-a": _ok(snap), "worker-b": _ok(_snap())})
+        doc = fr.fleet_status(FakeSwitcher(tmp_path), tmp_path, leader_snapshot=None, runner=runner)
+        local, a, b = doc["hosts"]
+        assert local["relogin_detail"] == [
+            {"slot": "3", "reason": "expiring", "expires_at": "2026-11-10T00:00:00Z"}]
+        assert a["relogin_detail"] == [
+            {"slot": "1", "reason": "relogin_required", "expires_at": None}]
+        assert b["relogin_detail"] == []  # an older worker: absent, not invented
+        assert "example.test" not in json.dumps(doc)
+
     def test_local_snapshot_failure_is_data(self, tmp_path, lease, monkeypatch):
         def boom(*a, **k):
             raise RuntimeError("x")

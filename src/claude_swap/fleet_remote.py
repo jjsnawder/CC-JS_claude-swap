@@ -665,6 +665,13 @@ def _active_from(snapshot: dict) -> str | None:
     return None
 
 
+def _relogin_detail(snapshot: dict) -> list[dict]:
+    """A snapshot's ``relogin_detail``, type-checked (``[]`` from an older
+    worker that sends only ``relogin``)."""
+    norm = importlib.import_module("claude_swap.fleet_alerts").normalize_detail
+    return _scrub_value(norm(snapshot.get("relogin_detail")) or [])
+
+
 def _host_entry(
     *,
     name: str,
@@ -693,6 +700,7 @@ def _host_entry(
         "engine": None,
         "accounts": [],
         "relogin": [],
+        "relogin_detail": [],
         "settings_hash": None,
         "drift": None,
         "override": override,
@@ -711,6 +719,7 @@ def _host_entry(
             engine=_engine_summary(snapshot.get("engine")),
             accounts=_account_rows(snapshot.get("accounts")),
             relogin=[str(n) for n in snapshot.get("relogin") or []],
+            relogin_detail=_relogin_detail(snapshot),
             settings_hash=settings_hash,
             drift=(
                 None if not (settings_hash and local_hash) else settings_hash != local_hash
@@ -752,6 +761,7 @@ def fleet_status(
         reachable=local_snap is not None, error=local_err, snapshot=local_snap,
         override=None, local_hash=local_hash,
     )
+    local["on_target"] = None  # the dev box follows no one
     if local_snap is not None:
         local["drift"] = False
         if leader_live:
@@ -845,7 +855,7 @@ Exit codes:
     parser.add_argument("--json", action="store_true", help="Print one JSON object")
     sub = parser.add_subparsers(
         dest="action",
-        metavar="{hosts,status,push,override,forget,receive,snapshot,apply}",
+        metavar="{hosts,status,push,override,forget,alert-test,receive,snapshot,apply}",
     )
     sub.required = True
 
@@ -878,6 +888,9 @@ Exit codes:
         "forget",
         help="(worker) drop the stored lease: back to this box's own strategy",
     )
+    p_alert = sub.add_parser(
+        "alert-test", help="Send one test event through fleet.alertCommand (dev box)"
+    )
     p_receive = sub.add_parser("receive", help="(worker) lease on stdin → snapshot")
     p_snapshot = sub.add_parser("snapshot", help="(worker) print this box's snapshot")
     p_apply = sub.add_parser("apply", help="(worker) settings document on stdin")
@@ -885,7 +898,7 @@ Exit codes:
     p_apply.add_argument("--dry-run", action="store_true", help="Report, write nothing")
 
     for p in (p_add, p_remove, p_list, p_status, p_push, p_override, p_forget,
-              p_receive, p_snapshot, p_apply):
+              p_alert, p_receive, p_snapshot, p_apply):
         p.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
                        help="Print one JSON object")
     parser.set_defaults(_strategies=SELECTABLE_STRATEGIES)
@@ -1091,6 +1104,20 @@ def run(
                 "lease dropped: this box is back on its own strategy"
                 if forgot else "no lease stored: this box already runs its own strategy"
             )
+        elif action == "alert-test":
+            r = Path(switcher.backup_dir) if backup_root is None and switcher is not None else root()
+            res = importlib.import_module("claude_swap.fleet_alerts").send_test(r, runner=runner)
+            if not res["command"]:
+                raise FleetError("no-alert-command", "fleet.alertCommand is not set")
+            if not res["valid"]:
+                raise FleetError("invalid-alert-command", res["error"])
+            if res["error"] is not None:
+                payload = _error(op, "alert-failed", f"alert command failed ({res['error']})")
+                payload["exit_code"] = res["exit_code"]
+            else:
+                payload = _payload(op, "sent", exit_code=res["exit_code"],
+                                   event=res["payload"]["events"][0])
+                human = "alert command exited 0: test event sent"
         elif action == "snapshot":
             sw = lazy_switcher()
             payload = _lease().build_snapshot(sw, Path(sw.backup_dir))

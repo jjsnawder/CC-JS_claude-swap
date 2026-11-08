@@ -454,3 +454,156 @@ class TestStatusBlock:
             lambda: FakeEngine(), host="auto", backup_root=tmp_path
         )
         assert server.handle({"op": "status"})["fleet"]["role"] == "none"
+
+
+# -- fork: fleet alerts (fleet.alertCommand) ------------------------------------
+
+
+class AlertRunner:
+    """The alert command's subprocess.run stand-in; ``block`` hangs a call."""
+
+    def __init__(self, rc=0, block=False):
+        self.rc, self.block = rc, block
+        self.calls: list[dict] = []
+        self.entered, self.release = threading.Event(), threading.Event()
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(json.loads(kwargs["input"]))
+        self.entered.set()
+        if self.block:
+            self.release.wait(10)
+        return SimpleNamespace(returncode=self.rc, stdout="", stderr="")
+
+
+def _detail_reply(*detail):
+    return {"contract": "cswap-fleet/1", "relogin": [d["slot"] for d in detail],
+            "relogin_detail": list(detail)}
+
+
+def _kinds(payload):
+    return [(e["kind"], e["host"], e.get("slot")) for e in payload["events"]]
+
+
+class TestLeaderAlerts:
+    @pytest.fixture
+    def alerting(self, h, stubs, monkeypatch):
+        from claude_swap.settings import set_setting
+
+        set_setting(h.switcher.backup_dir, "fleet.alertCommand", "sender --fleet")
+        rows = {"rows": [{"number": 3, "usageStatus": "relogin_required"}]}
+
+        def list_payload(switcher):
+            stubs.lists += 1
+            return {"schemaVersion": 1, "accounts": list(rows["rows"])}
+
+        monkeypatch.setattr(fleet_lease, "list_payload", list_payload)
+        stubs.hosts = _hosts(("w1", None), ("w2", None))
+        stubs.rows = rows
+        return stubs
+
+    def _round(self, leader):
+        leader.run_round()
+        leader.alerts.join(5)
+
+    def test_events_dedup_recovery_and_restart(self, h, alerting):
+        runner = AlertRunner()
+        leader = _leader(h, FakeSSH(), alert_runner=runner)  # never started: no ssh
+        leader._record("w1", _detail_reply(
+            {"slot": "2", "reason": "expiring", "expires_at": "2026-11-10T00:00:00Z"}), None)
+        for _ in range(3):
+            leader._record("w2", None, "timeout")
+        self._round(leader)
+        (payload,) = runner.calls
+        assert payload["contract"] == "cswap-fleet-alert/1"
+        assert _kinds(payload) == [
+            ("unreachable", "w2", None), ("relogin", "local", "3"), ("relogin", "w1", "2"),
+        ]
+        assert payload["events"][0]["since"].endswith("Z")
+        self._round(leader)
+        assert len(runner.calls) == 1  # already sent
+        # w2 back, w1 re-logged in, local's slot fixed.
+        leader._record("w2", _detail_reply(), None)
+        leader._record("w1", _detail_reply(), None)
+        alerting.rows["rows"] = []
+        self._round(leader)
+        assert _kinds(runner.calls[1]) == [
+            ("reachable", "w2", None), ("relogin-cleared", "local", "3"),
+            ("relogin-cleared", "w1", "2"),
+        ]
+        # A restarted leader with a slot flagged again: one new event, no repeats.
+        alerting.rows["rows"] = [{"number": 1, "usageStatus": "relogin_required"}]
+        fresh = _leader(h, FakeSSH(), alert_runner=runner)
+        fresh._record("w1", _detail_reply(), None)
+        self._round(fresh)
+        assert _kinds(runner.calls[2]) == [("relogin", "local", "1")]
+        self._round(_leader(h, FakeSSH(), alert_runner=runner))
+        assert len(runner.calls) == 3
+
+    def test_failed_local_list_clears_nothing(self, h, alerting, monkeypatch):
+        runner = AlertRunner()
+        leader = _leader(h, FakeSSH(), alert_runner=runner)
+        self._round(leader)
+        assert _kinds(runner.calls[0]) == [("relogin", "local", "3")]
+        monkeypatch.setattr(fleet_lease, "list_payload",
+                            lambda sw: {"accounts": [], "error": "list-failed"})
+        self._round(leader)
+        assert len(runner.calls) == 1
+
+    def test_unreachable_only_after_three_rounds(self, h, alerting):
+        alerting.rows["rows"] = []
+        runner = AlertRunner()
+        leader = _leader(h, FakeSSH(), alert_runner=runner)
+        leader._record("w2", None, "timeout")
+        leader._record("w2", None, "timeout")
+        self._round(leader)
+        assert runner.calls == []
+        leader._record("w2", None, "timeout")
+        self._round(leader)
+        assert [e["kind"] for e in runner.calls[0]["events"]] == ["unreachable"]
+        assert "fails" not in json.dumps(leader.snapshot())  # internal counter only
+
+    def test_retry_after_nonzero_exit(self, h, alerting):
+        runner = AlertRunner(rc=2)
+        leader = _leader(h, FakeSSH(), alert_runner=runner)
+        self._round(leader)
+        self._round(leader)
+        assert len(runner.calls) == 2 and runner.calls[0]["events"] == runner.calls[1]["events"]
+        runner.rc = 0
+        self._round(leader)
+        self._round(leader)
+        assert len(runner.calls) == 3
+
+    def test_hung_command_never_blocks_a_round(self, h, alerting):
+        runner = AlertRunner(block=True)
+        leader = _leader(h, FakeSSH(), alert_runner=runner)
+        try:
+            start = time.monotonic()
+            leader.run_round()
+            assert runner.entered.wait(5)
+            leader._record("w1", _detail_reply({"slot": "4", "reason": "quarantined",
+                                                "expires_at": None}), None)
+            leader.run_round()  # one command in flight: not a second one
+            assert time.monotonic() - start < 3
+            assert len(runner.calls) == 1
+        finally:
+            runner.release.set()
+            leader.alerts.join(5)
+
+    def test_off_without_command_changes_nothing(self, h, stubs):
+        stubs.hosts = _hosts(("w1", None))
+        runner = AlertRunner()
+        leader = _leader(h, FakeSSH(), alert_runner=runner)
+        assert leader.run_round() == 1
+        assert runner.calls == [] and stubs.lists == 1
+        assert not (h.switcher.backup_dir / "fleet" / "alerts.json").exists()
+
+    def test_relogin_detail_in_public_view_without_email(self, h, stubs):
+        leader = _leader(h, FakeSSH())
+        reply = _detail_reply({"slot": "2", "reason": "expiring",
+                               "expires_at": "2026-11-10T00:00:00Z"})
+        reply["accounts"] = {"accounts": [{"number": 2, "email": "zed@example.com"}]}
+        leader._record("w1", reply, None)
+        public = fleet_leader.public_leader_snapshot(leader)
+        snap = public["hosts"]["w1"]["snapshot"]
+        assert snap["relogin_detail"] == reply["relogin_detail"]
+        assert "@" not in json.dumps(public)

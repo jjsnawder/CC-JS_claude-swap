@@ -123,9 +123,12 @@ class UpdateSettings:
 class FleetSettings:
     """Fork (``cswap fleet``, ``fleet`` section): ``fallback_strategy`` is the
     strategy a worker's engine uses while it holds no valid lease from the
-    dev box (only once a lease was ever received; see docs/fleet.md)."""
+    dev box (only once a lease was ever received; see docs/fleet.md).
+    ``alert_command`` is the leader's needs-login alert hook (empty = off;
+    box-local, never pushed or fingerprinted)."""
 
     fallback_strategy: str = "consume-first-reserve-jj"
+    alert_command: str = ""
 
 
 _SECTION_DEFAULT_SOURCES = {
@@ -234,6 +237,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "fleet", "fallbackStrategy", "fallback_strategy", "choice",
             choices=SELECTABLE_STRATEGIES,
             help="Worker strategy while no dev-box lease is valid (cswap fleet)",
+        ),
+        SettingSpec(  # fork: cswap fleet alerts
+            "fleet", "alertCommand", "alert_command", "string",
+            help="Leader only: command run with fleet alert events on stdin (unset: off)",
         ),
     )
 }
@@ -442,15 +449,18 @@ def load_fleet_settings(backup_root: Path) -> FleetSettings:
     section = _read_raw(settings_path(backup_root)).get("fleet")
     default = FleetSettings()
     value = section.get("fallbackStrategy") if isinstance(section, dict) else None
+    command = section.get("alertCommand") if isinstance(section, dict) else None
+    if not isinstance(command, str):
+        command = default.alert_command
     if value is None:
-        return default
+        return dataclasses.replace(default, alert_command=command.strip())
     if value not in SETTING_SPECS["fleet.fallbackStrategy"].choices:
         _logger.warning(
             "settings.json: unsupported fleet.fallbackStrategy %r; using %r",
             value, default.fallback_strategy,
         )
-        return default
-    return FleetSettings(fallback_strategy=value)
+        return dataclasses.replace(default, alert_command=command.strip())
+    return FleetSettings(fallback_strategy=value, alert_command=command.strip())
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:

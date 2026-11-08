@@ -500,3 +500,44 @@ over-delegation warning); moving `deep` to Opus without Jeremy asking (his
 2026-08-17 ruling pinned it).
 **Why it matters:** the docs said Fable main for five weeks after the switch; an
 agent reading them would misattribute commits and mis-cost the session.
+
+## 2026-11-07 - Multi-host: build on 0.29.0, reconcile v1.0.0 later (Jeremy)
+**Chose:** build `cswap fleet` on the current `jeremy` (v0.29.0 + fork) as
+separable modules; the v0.30.0/v1.0.0 reconcile is its own later session.
+**Rejected:** reconciling first. v1.0.0 drops keyring and turns on cross-account
+chat-history sharing (slot-dir layout that restic and cross-sessions read), which
+needs its own rulings and `deep` pass; the fleet code is mostly new files.
+**Why it matters:** the next reconcile ports `fleet*.py` plus a handful of hooks;
+plan `docs/plans/2026-11-07-fleet-follow.md` lists them.
+
+## 2026-11-07 - Multi-host transport: ssh + JSON CLI, fork-only (Jeremy)
+**Chose:** the dev box runs `ssh <alias> cswap fleet … --json` per worker; ssh
+is the auth; payloads go on stdin, never into the remote command line.
+**Rejected:** the engine pipe/socket over TCP (reverses the 2026-11-01 no-port
+ruling, needs a listening port per worker, works only while an engine runs);
+an upstream-PR shape up front (more polish; PRs are gated).
+**Why it matters:** the engine channel stays box-local; nothing new listens.
+
+## 2026-11-07 - Workers follow the dev box under a lease; fallback is autonomous (Jeremy)
+**Chose:** a live dev-box engine (never dry-run) pushes a short lease (target
+account, live settings, usage readings) to each worker every tick and on every
+switch; a worker with a valid lease switches to the target through the existing
+`request_switch` path; on expiry (worker clock, ttl ~3 min) it runs `cswap auto`
+alone under `fleet.fallbackStrategy` = consume-first-reserve-jj. Workers follow
+onto the reserve account too. Overrides from the Hosts menu persist until
+cleared but apply only while the dev box leads.
+**Rejected:** spreading workers across accounts or giving them a lower threshold
+(proposed; Jeremy wants every box on his active account); overrides that survive
+fallback (would contradict "revert to consume-first when the dev box isn't running").
+**Why it matters:** all boxes share one 5-hour window, so the dev box's threshold
+governs everyone; the lease's expiry is the only "dev box is down" signal, so it
+must use the receiver's clock.
+
+## 2026-11-07 - Settings master: push on command, drift reported (Jeremy)
+**Chose:** `cswap fleet push` writes the dev box's persisted settings and
+per-account policy to workers, identity-checked per slot; drift shows in
+`fleet status`. While following, the lease's settings apply live without
+being persisted.
+**Rejected:** auto-sync every cycle (a worker-side change could never stick and
+more engine code); report-only (workers sit stale).
+**Why it matters:** fallback runs on the last PUSHED settings, not the live ones.

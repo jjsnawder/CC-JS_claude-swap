@@ -119,11 +119,21 @@ class UpdateSettings:
     check: bool = True
 
 
+@dataclass(frozen=True)
+class FleetSettings:
+    """Fork (``cswap fleet``, ``fleet`` section): ``fallback_strategy`` is the
+    strategy a worker's engine uses while it holds no valid lease from the
+    dev box (only once a lease was ever received; see docs/fleet.md)."""
+
+    fallback_strategy: str = "consume-first-reserve-jj"
+
+
 _SECTION_DEFAULT_SOURCES = {
     "autoswitch": AutoSwitchSettings,
     "ui": UiSettings,
     "run": RunSettings,
     "updates": UpdateSettings,
+    "fleet": FleetSettings,  # fork: cswap fleet
 }
 
 
@@ -219,6 +229,11 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "updates", "check", "check", "bool",
             help="Check PyPI once a day and print a hint when a newer release exists",
+        ),
+        SettingSpec(  # fork: cswap fleet
+            "fleet", "fallbackStrategy", "fallback_strategy", "choice",
+            choices=SELECTABLE_STRATEGIES,
+            help="Worker strategy while no dev-box lease is valid (cswap fleet)",
         ),
     )
 }
@@ -422,6 +437,22 @@ def load_update_settings(backup_root: Path) -> UpdateSettings:
     return UpdateSettings(check=check)
 
 
+def load_fleet_settings(backup_root: Path) -> FleetSettings:
+    """Fork: load the fleet section; missing/corrupt/unselectable → default."""
+    section = _read_raw(settings_path(backup_root)).get("fleet")
+    default = FleetSettings()
+    value = section.get("fallbackStrategy") if isinstance(section, dict) else None
+    if value is None:
+        return default
+    if value not in SETTING_SPECS["fleet.fallbackStrategy"].choices:
+        _logger.warning(
+            "settings.json: unsupported fleet.fallbackStrategy %r; using %r",
+            value, default.fallback_strategy,
+        )
+        return default
+    return FleetSettings(fallback_strategy=value)
+
+
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
     """Write the autoswitch section, preserving unknown keys and sections."""
     path = settings_path(backup_root)
@@ -609,6 +640,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
         "ui": load_ui_settings(backup_root),
         "run": load_run_settings(backup_root),
         "updates": load_update_settings(backup_root),
+        "fleet": load_fleet_settings(backup_root),  # fork: cswap fleet
     }
     rows = []
     for spec in SETTING_SPECS.values():

@@ -1425,6 +1425,11 @@ def main() -> None:
 
         engine_control.main(argv[1:])
         return
+    if argv and argv[0] == "fleet":  # fork: fleet_remote (`cswap fleet`)
+        from claude_swap import fleet_remote
+
+        fleet_remote.main(argv[1:])
+        return
     if argv and argv[0] == "map":
         _map_command(argv[1:])
         return

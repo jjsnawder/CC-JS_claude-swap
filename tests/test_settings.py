@@ -17,6 +17,7 @@ from claude_swap.settings import (
     SETTING_SPECS,
     atomic_write_json,
     AutoSwitchSettings,
+    FleetSettings,
     RunSettings,
     UiSettings,
     UpdateSettings,
@@ -215,6 +216,9 @@ class TestSettingSpecs:
         assert by_section["updates"] == {
             f.name for f in UpdateSettings.__dataclass_fields__.values()
         }
+        assert by_section["fleet"] == {  # fork: cswap fleet
+            f.name for f in FleetSettings.__dataclass_fields__.values()
+        }
 
     def test_defaults_match_dataclass(self):
         sources = {
@@ -222,6 +226,7 @@ class TestSettingSpecs:
             "ui": UiSettings(),
             "run": RunSettings(),
             "updates": UpdateSettings(),
+            "fleet": FleetSettings(),  # fork: cswap fleet
         }
         for spec in SETTING_SPECS.values():
             assert spec.default == getattr(sources[spec.section], spec.field)

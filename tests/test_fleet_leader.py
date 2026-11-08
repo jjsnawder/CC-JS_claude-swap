@@ -420,6 +420,20 @@ class TestStatusBlock:
             "consume-first-reserve-jj", "fleet-fallback")
         assert h.engine.settings.strategy == "best"  # the engine's own is untouched
 
+    def test_reserve_and_threshold_report_the_tick_in_use(self, h, monkeypatch):
+        from tests.test_fleet_follow import LeaseBox, _lease
+
+        box = LeaseBox(monkeypatch, h.switcher.backup_dir)
+        box.mark_history()
+        box.lease = _lease(mode="strategy", strategy="consume-first-reserve-jj",
+                           settings={"reserveAccounts": "2,3", "threshold": 70.0})
+        h.tick_with_usage({"1": _usage(30), "2": _usage(20), "3": _usage(20)})
+        e = self._status(h)["engine"]
+        assert (e["strategy"], e["strategy_source"], e["reserve"], e["threshold"]) == (
+            "consume-first-reserve-jj", "fleet-lease", ["2", "3"], 70.0)
+        own = h.engine.settings  # the box's own `best` has no reserve set in force
+        assert (own.strategy, own.reserve_accounts, own.threshold) == ("best", "1", 90.0)
+
     def test_no_fleet_strategy_source_unchanged(self, h):
         h.tick_with_usage({"1": _usage(30), "2": _usage(20)})
         assert self._status(h)["engine"]["strategy_source"] in ("settings", "session")

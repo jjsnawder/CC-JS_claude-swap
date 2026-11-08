@@ -257,11 +257,12 @@ def _hosts_lock(backup_root: Path):
     from claude_swap.exceptions import LockError
     from claude_swap.locking import FileLock
 
-    try:
-        with FileLock(hosts_path(backup_root).parent / ".hosts.lock"):
-            yield
-    except LockError:
-        raise FleetError("busy", "hosts.json is locked by another cswap; retry") from None
+    with contextlib.ExitStack() as stack:
+        try:  # only acquisition maps to "busy"; the body's errors pass through
+            stack.enter_context(FileLock(hosts_path(backup_root).parent / ".hosts.lock"))
+        except LockError:
+            raise FleetError("busy", "hosts.json is locked by another cswap; retry") from None
+        yield
 
 
 def find_host(hosts: list[Host], name: str) -> Host:
@@ -1068,9 +1069,12 @@ def run(
                 payload = _lease().receive_lease(sw, data)
             except (ValueError, KeyError, TypeError) as e:
                 raise FleetError("invalid-lease", str(e)) from None
-            woken = _wake_engine(Path(sw.backup_dir))
+            block = payload.get("lease") if isinstance(payload, dict) else None
+            # Wake only when the lease changes what the engine decides with
+            # (``changed`` from receive_lease); a plain heartbeat does not.
+            changed = not isinstance(block, dict) or block.get("changed", True) is not False
+            woken = _wake_engine(Path(sw.backup_dir)) if changed else False
             if isinstance(payload, dict):
-                block = payload.get("lease")
                 if not isinstance(block, dict):
                     block = payload["lease"] = {}
                 block["engine_woken"] = woken

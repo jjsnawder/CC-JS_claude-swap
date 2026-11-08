@@ -322,6 +322,29 @@ class TestPinAndStrategy:
         )
         assert thresholds == {"2": 60.0} and disabled == frozenset({"2"})
 
+    def test_identity_mismatched_slots_are_never_reserved(self):
+        from dataclasses import replace
+
+        from claude_swap.settings import AutoSwitchSettings
+
+        base = replace(AutoSwitchSettings(), reserve_accounts="3")
+        s, _, _ = fleet_leader.apply_lease_settings(
+            base, {"reserveAccounts": "1,2"}, mismatched=("1",))
+        assert s.reserve_accounts == "2"
+        # Nothing valid left: the box keeps its own reserve, not the leader's #1.
+        s, _, _ = fleet_leader.apply_lease_settings(
+            base, {"reserveAccounts": "1"}, mismatched=("1",))
+        assert s.reserve_accounts == "3"
+        s, _, _ = fleet_leader.apply_lease_settings(
+            base, {"reserveAccounts": "none"}, mismatched=("1",))
+        assert s.reserve_accounts == "none"
+
+    def test_worker_tick_reserve_skips_mismatched_slot(self, h, box):
+        box.lease = _lease(mode="strategy", strategy="best", mismatch=("1",),
+                           settings={"reserveAccounts": "1,3"})
+        h.tick_with_usage(_HEALTHY)
+        assert h.engine._fleet.tick.settings.reserve_accounts == "3"
+
     def test_worker_tick_drops_mismatched_slots(self, h, box):
         box.lease = _lease(mode="strategy", strategy="best", mismatch=("1",),
                            settings={"accounts": {"1": {"threshold": 10.0, "disabled": True},

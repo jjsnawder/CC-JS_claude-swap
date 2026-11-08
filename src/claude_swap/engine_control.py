@@ -523,10 +523,11 @@ class ControlServer:
         strategy = settings.strategy
         strategy_source = "settings" if strategy == configured else "session"
         try:  # fork: fleet -- report what a lease / fallback actually decides with
-            from claude_swap.fleet_leader import effective_strategy
+            from claude_swap.fleet_leader import effective_settings
 
-            if (fleet_strategy := effective_strategy(engine)) is not None:
-                strategy, strategy_source = fleet_strategy
+            if (fleet_eff := effective_settings(engine)) is not None:
+                settings, strategy_source = fleet_eff
+                strategy = settings.strategy
         except Exception as e:
             _logger.debug("fleet strategy lookup failed: %s", type(e).__name__)
         reply = _payload(  # fork: fleet -- named so the fleet block can read it

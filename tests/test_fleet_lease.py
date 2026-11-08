@@ -231,6 +231,7 @@ class TestReceive:
         assert reply["lease"] == {
             "accepted": True, "seq": 1, "follow_blocked": None,
             "identity_mismatch": [], "usage_adopted": ["2"], "usage_error": None,
+            "changed": True,
         }
 
         # The hold keeps bob unfetched (400s is past STALE_OK_S) and decision-grade.
@@ -332,6 +333,29 @@ class TestReceive:
         got = active_lease(s.backup_dir, now=T0 + 4)
         assert (got.leader_id, got.seq, got.target_account) == ("leader-b", 0, "1")
 
+    def test_changed_only_when_the_lease_changes_what_the_engine_uses(self, temp_home: Path):
+        s = _two_slot_switcher(temp_home)
+
+        def changed(seq, now, account="2", threshold=85.0, **kw):
+            lease = _lease(s if "identities" not in kw else None, seq=seq,
+                           account=account, ttl_s=600, **kw)
+            lease["settings"]["threshold"] = threshold
+            return receive_lease(s, lease, now=T0 + now)["lease"]["changed"]
+
+        with patch("claude_swap.oauth.try_fetch_usage_for_account", side_effect=_fake_fetch_ok):
+            assert changed(1, 0) is True  # no previous lease
+            # A heartbeat (new seq, same target/settings/blocked) is not a change.
+            assert changed(2, 30) is False
+            assert changed(3, 60, account="1") is True  # target
+            assert changed(4, 90, account="1", threshold=70.0) is True  # settings
+            assert changed(5, 120, account="1", threshold=70.0) is False
+            assert changed(6, 150, threshold=70.0) is True
+            # Same target and settings, but the leader's #2 is someone else here.
+            other = {"1": ("alice@example.com", "org-a"), "2": ("carol@example.com", "")}
+            assert changed(7, 180, threshold=70.0, identities=other) is True  # follow_blocked
+            assert changed(8, 210, threshold=70.0, identities=other) is False
+            # The stored lease expired: the engine is on its fallback, so it is a change.
+            assert changed(9, 210 + 601, threshold=70.0, identities=other) is True
 
 class TestActiveLease:
     def _store(self, s, **kw):

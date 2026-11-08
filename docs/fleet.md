@@ -55,9 +55,14 @@ remote command is split like a shell would (`shlex`) and each word must be a pla
 Every verb takes `--json`. `receive`, `snapshot` and `apply` are machine verbs: they always
 print exactly one JSON object.
 
-`receive` stores the lease and then wakes this box's running engine (best effort), so the
-worker acts on it within seconds instead of at its next tick; the reply's `lease` block says
-whether that worked (`"engine_woken": true|false`).
+`receive` stores the lease and, when it changes the target, the settings or `follow_blocked`
+(or no live lease was stored before), wakes this box's running engine (best effort), so the
+worker acts on it within seconds instead of at its next tick; a plain heartbeat does not wake
+it. The reply's `lease` block says whether it changed and whether the wake worked
+(`"changed"`, `"engine_woken": true|false`).
+
+A worker's `fleet snapshot` and `receive` are store-only: they report the usage already stored
+on the box and never fetch; the box's engine is its only usage fetcher.
 
 `forget` removes the stored lease under the lease lock and wakes the engine the same way. With
 no lease history the box is no longer a worker: no follow and no `fleet.fallbackStrategy`, just
@@ -145,6 +150,8 @@ history (never received one, or `fleet forget`). Like `fleet status`, it carries
 (the persisted `autoswitch.strategy`), `session` (changed for this run only), `fleet-lease`
 (a live lease's strategy override), or `fleet-fallback` (a worker with no valid lease, running
 `fleet.fallbackStrategy`).
+On a worker, `engine.strategy`, `engine.reserve` and `engine.threshold` are the values its
+last tick actually used (the lease's or the fallback's), not the box's own settings.
 
 ## Contract `cswap-fleet/1`: `cswap fleet status --json`
 

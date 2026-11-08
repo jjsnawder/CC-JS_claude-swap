@@ -276,6 +276,16 @@ class TestHostsLock:
             fr.set_override(tmp_path, "worker-a", {"mode": "pin", "account": "2"})
         assert e.value.code == "busy"
 
+    def test_lock_error_inside_the_body_is_not_busy(self, tmp_path):
+        from claude_swap.exceptions import LockError
+
+        # Only acquiring hosts.lock maps to "busy"; the body's own errors pass through.
+        with pytest.raises(LockError):
+            with fr._hosts_lock(tmp_path):
+                raise LockError("some other lock")
+        with fr._hosts_lock(tmp_path):  # and the lock was released
+            pass
+
     def test_concurrent_overrides_lose_nothing(self, tmp_path):
         import threading
 
@@ -747,6 +757,26 @@ class TestCli:
                        stdin=io.StringIO(json.dumps(body)))
         assert rc == 0 and json.loads(out)["lease"]["engine_woken"] is True
         assert calls == [tmp_path]
+
+    @pytest.mark.parametrize("changed, woken", [(True, True), (False, False)])
+    def test_receive_wakes_only_on_a_changed_lease(
+        self, tmp_path, capsys, lease, monkeypatch, changed, woken
+    ):
+        from claude_swap import engine_control
+
+        calls = []
+        monkeypatch.setattr(engine_control, "wake_engine",
+                            lambda root: calls.append(root) or True, raising=False)
+        monkeypatch.setattr(
+            lease, "receive_lease",
+            lambda sw, payload, now=None: {"follow": {"state": "following"},
+                                           "lease": {"accepted": True, "changed": changed}},
+        )
+        rc, out = _run(capsys, ["receive"], switcher=FakeSwitcher(tmp_path),
+                       stdin=io.StringIO("{}"))
+        block = json.loads(out)["lease"]
+        assert rc == 0 and block["engine_woken"] is woken
+        assert calls == ([tmp_path] if changed else [])
 
     def test_receive_wake_failure_is_best_effort(self, tmp_path, capsys, lease, monkeypatch):
         from claude_swap import engine_control

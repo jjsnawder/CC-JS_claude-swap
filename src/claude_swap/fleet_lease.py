@@ -147,9 +147,6 @@ def list_payload(switcher: ClaudeAccountSwitcher) -> dict:
     return payload
 
 
-_list_payload = list_payload
-
-
 def build_lease(
     switcher: ClaudeAccountSwitcher,
     *,
@@ -330,7 +327,8 @@ def receive_lease(
 
     The reply is :func:`build_snapshot` plus a ``lease`` block:
     ``{"accepted", "seq", "follow_blocked", "identity_mismatch",
-    "usage_adopted", "usage_error"}``.
+    "usage_adopted", "usage_error", "changed"}``; ``changed`` is False when a
+    live stored lease already had this target, settings and follow_blocked.
     """
     from claude_swap.exceptions import TransferError
     from claude_swap.locking import FileLock
@@ -352,6 +350,8 @@ def receive_lease(
 
     with FileLock(fleet_dir(backup_root) / ".lease.lock"):
         stored = _read_stored(backup_root)
+        changed = _lease_changed(stored, target, lease["settings"], follow_blocked,
+                                 received_at)
         if stored is not None:
             prev_leader = stored.get("leader") or {}
             prev_seq = prev_leader.get("seq")
@@ -394,8 +394,31 @@ def receive_lease(
         "identity_mismatch": mismatches,
         "usage_adopted": usage_adopted,
         "usage_error": usage_error,
+        "changed": changed,
     }
     return snapshot
+
+
+def _lease_changed(
+    stored: dict | None, target: dict, settings: dict, follow_blocked: str | None,
+    now: float,
+) -> bool:
+    """False when ``stored`` is a live lease with the same target, settings
+    and ``follow_blocked``: a heartbeat that changes nothing the engine
+    decides with (the caller then skips waking it)."""
+    prev = _lease_from_record(stored) if stored is not None else None
+    if prev is None or not _is_live(prev, now):
+        return True
+    try:
+        same_settings = json.loads(json.dumps(settings, sort_keys=True)) == prev.settings
+    except (TypeError, ValueError):
+        return True
+    return not (
+        same_settings
+        and prev.follow_blocked == follow_blocked
+        and (prev.target_mode, prev.target_account, prev.target_strategy)
+        == (target.get("mode"), target.get("account"), target.get("strategy"))
+    )
 
 
 def _lease_from_record(record: dict) -> Lease | None:

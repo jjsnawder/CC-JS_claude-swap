@@ -186,16 +186,19 @@ def apply_lease_settings(
         raw = doc["model"]
         if raw is None or (isinstance(raw, str) and raw):
             changes["model"] = raw
+    skip = {str(n) for n in mismatched or ()}
     if "reserveAccounts" in doc:
         raw = doc["reserveAccounts"]
-        if isinstance(raw, str) and (raw == "none" or parse_account_numbers(raw)):
-            changes["reserve_accounts"] = (
-                raw if raw == "none" else ",".join(parse_account_numbers(raw))
-            )
+        if raw == "none":
+            changes["reserve_accounts"] = raw
+        elif isinstance(raw, str):
+            # A mismatched slot is another account here: never reserve it.
+            kept = [n for n in parse_account_numbers(raw) if n not in skip]
+            if kept:
+                changes["reserve_accounts"] = ",".join(kept)
     thresholds: dict[str, float | None] = {}
     disabled: set[str] = set()
     accounts = doc.get("accounts")
-    skip = {str(n) for n in mismatched or ()}
     if isinstance(accounts, dict):
         for num, entry in accounts.items():
             if not (isinstance(num, str) and num.isascii() and num.isdigit()):
@@ -512,17 +515,14 @@ class EngineFleet:
 # -- engine status `fleet` block --------------------------------------------------
 
 
-def effective_strategy(engine: Any) -> tuple[str, str] | None:
-    """``(strategy, source)`` when the fleet hook decided the engine's last
-    tick (``fleet-lease`` | ``fleet-fallback``); None = the engine's own."""
+def effective_settings(engine: Any) -> tuple[Any, str] | None:
+    """``(settings, source)`` the fleet hook decided the engine's last tick
+    with (``fleet-lease`` | ``fleet-fallback``); None = the engine's own."""
     fleet = getattr(engine, "_fleet", None)
     tick = fleet.tick if isinstance(fleet, EngineFleet) else None
-    if tick is None:
+    if tick is None or not isinstance(getattr(tick.settings, "strategy", None), str):
         return None
-    strategy = getattr(tick.settings, "strategy", None)
-    if not isinstance(strategy, str):
-        return None
-    return strategy, ("fleet-fallback" if tick.mode == "fallback" else "fleet-lease")
+    return tick.settings, ("fleet-fallback" if tick.mode == "fallback" else "fleet-lease")
 
 
 def _scrub_tree(value: Any) -> Any:

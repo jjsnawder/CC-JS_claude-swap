@@ -1,5 +1,5 @@
 # Collaboration: cswap remote-host control (the dev box drives cswap on worker boxes)
-Status: active
+Status: closed 2026-11-08
 Projects: CC-JS_Claude_Environment ↔ CC-JS_claude-swap     This file: CC-JS_claude-swap's side (receiver)
 Charter: CC-JS_Claude_Environment `docs/collaborations/2026-11-07-cswap-remote-hosts.md` @ 88ffa8ae36033f4e4b3696705db9f0742d76070a
 
@@ -27,3 +27,5 @@ Remote hosts are "the dev box" (master) and "worker boxes" (the first one, then 
 - 2026-11-07 21:22 CT · Jeremy: needs-login alerts split ("Split: cswap hook, env sends"). Building `fleet.alertCommand` + `cswap-fleet-alert/1` on feat/fleet-alerts; proposed the sender to the env-repo peer as a scope addition for Jeremy to confirm there.
 - 2026-11-07 · Received from env-repo peer: alert sender built (env @ e78eaee), Jeremy approved the scope there; proposed `fleet.alertCommand` = python.exe + infrastructure/claude-worker/fleet-alert/send_alert.py (exit 0 sent/none, 1 retry). Setting it waits on the hook merge + Jeremy here.
 - 2026-11-07 21:46 CT · Jeremy: "Merge + set + test". Alert hook on jeremy (b0001ef, 471f1d2; review x2, suite 3598 passed). Dev box `fleet.alertCommand` set to the env sender; `cswap fleet alert-test` -> sent, exit 0. Real alerts start when the dashboard restarts onto this code.
+- 2026-11-08 00:41 CT · Live switch tests passed. The engine auto-switched 2 -> 4 at 00:20 and the worker followed. Test pick 4 -> 3 at 00:24:37, worker on 3 by 00:24:41. Pick back to 2 at 00:41:00, both boxes on 2 by 00:41:08. Fallback test skipped (Jeremy: "We will not do the fall back test").
+- 2026-11-08 · Closed (Jeremy: "Close this out"). Done when: plan approved (237abda); feature live on both boxes (jeremy ca61258, alerts b0001ef/471f1d2); one command shows both hosts (`cswap fleet status`); router contract cswap-fleet/1 + alert contract cswap-fleet-alert/1 in docs/fleet.md. Asked the env-repo peer to close its side.

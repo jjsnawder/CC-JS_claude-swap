@@ -948,6 +948,10 @@ class AutoSwitchEngine:
         # TUI's own `m`/`n`, which then behave exactly as without this hook.
         self._switch_on_result: Callable | None = None
         self._tick_on_result: Callable | None = None
+        # fork: pin-control -- who asked (tui-n/tui-m/engine-pick), for the
+        # switch-source log line; travels with the target like on_result.
+        self._switch_source: str | None = None
+        self._tick_source: str | None = None
         self._tick_events: list[AutoSwitchEvent] | None = None
         self.last_tick_at: float | None = None  # fork: `cswap engine status`
         # -- warmup (claude_swap/warmup.py) --------------------------------
@@ -1387,7 +1391,10 @@ class AutoSwitchEngine:
             self._switch_target = None
             on_result = self._switch_on_result if manual else None  # fork
             self._switch_on_result = None  # fork: engine_control
+            source = self._switch_source if manual else None  # fork: pin-control
+            self._switch_source = None  # fork: pin-control
         self._tick_target = target
+        self._tick_source = source  # fork: pin-control
         self._tick_on_result = on_result  # fork: engine_control
         self._tick_events = [] if on_result is not None else None  # fork
         # Same one-shot contract for `p` ("ping/warm now"): consumed by this
@@ -1427,12 +1434,8 @@ class AutoSwitchEngine:
             self._health_account = current
         # `current is not None`: an unreadable live login (transient) is not
         # evidence of a move, so it must not drop the hold for good.
-        if (
-            self._pinned is not None
-            and current is not None
-            and self._pinned != current
-        ):
-            self._pinned = None  # moved off the manual pick: hold released
+        if current is not None:  # fork: pin-control -- locked + logged
+            self._clear_pin("moved off the pick", unless=current)
         if not manual and current is not None and (  # fork: fleet
             follow := self._fleet.follow_target(current)
         ) is not None:
@@ -1604,7 +1607,7 @@ class AutoSwitchEngine:
                 # a sooner-resetting account with room actually exists.
                 trigger = "priority" if priority_mode else "consume-first"
             else:
-                self._pinned = None  # threshold reached: the hold is over
+                self._clear_pin("threshold reached")  # fork: pin-control
                 # Exhaustion is physical: at-limit reads the raw headroom.
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
                 if trigger == "proactive" and not manual and (  # fork: fleet
@@ -3822,19 +3825,21 @@ class AutoSwitchEngine:
             state["leftTrigger"] = trigger
             atomic_write_json(self.state_path, state)
 
+        source = self._log_switch_source(result, number, trigger)  # fork: pin-control
         note = ""
         if trigger == "manual" and not self._fleet.following:  # fork: fleet
             # Live manual switch: `m` pins its target (held until the
             # threshold); `n` (no target) replaces any earlier pin with none.
-            self._pinned = self._tick_target
+            pin = self._tick_target  # fork: pin-control -- set via _set_pin
             if (
-                self._pinned is not None
-                and self.switcher.account_kind_for(self._pinned) == "api_key"
+                pin is not None
+                and self.switcher.account_kind_for(pin) == "api_key"
             ):
                 # No measurable headroom: the engine fails over off it after
                 # the unhealthy ticks, so a "holding #N" would be a lie.
-                self._pinned = None
+                pin = None
                 note = "API-key account: not held (no quota to measure)"
+            self._set_pin(pin, source)  # fork: pin-control
         if fleet_note := self._fleet.after_switch(  # fork: fleet (+ leader kick)
             (result.get("from") or {}).get("number"), trigger
         ):
@@ -3996,7 +4001,11 @@ class AutoSwitchEngine:
         self._wake.set()
 
     def request_switch(
-        self, target: str | None = None, *, on_result: Callable | None = None
+        self,
+        target: str | None = None,
+        *,
+        on_result: Callable | None = None,
+        source: str | None = None,  # fork: pin-control
     ) -> None:
         """One-shot "switch now" request from the TUI, for THIS session only.
 
@@ -4019,10 +4028,14 @@ class AutoSwitchEngine:
         Fork (engine_control): ``on_result(outcome, events)`` is called on the
         engine thread at the end of THE tick that consumes this request, with
         that tick's events; a request replaced before any tick consumed it
-        gets ``on_result(None, [])``."""
+        gets ``on_result(None, [])``.
+
+        Fork (pin-control): ``source`` names the requester (``tui-n``,
+        ``tui-m``, ``engine-pick``) for the switch-source log line."""
         with self._switch_lock:
             superseded = self._switch_on_result  # fork: engine_control
             self._switch_on_result = on_result  # fork: engine_control
+            self._switch_source = source  # fork: pin-control
             self._switch_target = None if target is None else str(target)
             self._switch_now.set()
         if superseded is not None:  # fork: engine_control
@@ -4042,6 +4055,7 @@ class AutoSwitchEngine:
             self._switch_now.clear()
             self._switch_target = None
             self._switch_on_result = None
+            self._switch_source = None  # fork: pin-control
         return True
 
     def apply_strategy(self, strategy: str) -> None:
@@ -4060,6 +4074,57 @@ class AutoSwitchEngine:
         Session-only; pass it as ``pinned=`` to a rebuilt engine to carry it
         over (the TUI's `s`/`l` restarts)."""
         return self._pinned
+
+    # -- fork: pin-control --------------------------------------------------
+    # Every pin write goes through _set_pin/_clear_pin under ``_switch_lock``,
+    # so a release from another thread (TUI `u`, `cswap engine unpin`) never
+    # interleaves with the tick's own writes: whichever lands last wins. Log
+    # lines carry account NUMBERS only and must never match menubar's
+    # ``Switched from account X to Y`` history regex.
+
+    def release_pin(self, source: str = "release") -> str | None:
+        """Drop the manual-pick hold now and wake the loop, so the next tick
+        runs the normal strategy. Returns the number that was held, or None.
+
+        A pick still queued or mid-tick is not cancelled: it pins when it
+        lands (the later action wins); ``cswap engine unpin`` answers
+        ``busy`` instead while its own pick is in flight."""
+        was = self._clear_pin(source)
+        if was is not None:
+            self._wake.set()
+        return was
+
+    def _clear_pin(self, why: str, *, unless: str | None = None) -> str | None:
+        with self._switch_lock:
+            was = self._pinned
+            if was is None or was == unless:
+                return None
+            self._pinned = None
+        _logger.info("auto-switch: hold on #%s released (%s)", was, why)
+        return was
+
+    def _set_pin(self, pin: str | None, source: str) -> None:
+        with self._switch_lock:
+            was, self._pinned = self._pinned, pin
+        if pin is not None:
+            _logger.info("auto-switch: holding #%s (pin set by %s)", pin, source)
+        elif was is not None:
+            _logger.info("auto-switch: hold on #%s released (replaced by %s)", was, source)
+
+    def _log_switch_source(self, result: dict, number: str, trigger: str) -> str:
+        """One INFO line after a live engine switch: trigger and source."""
+        if self._fleet.following:
+            trigger, source = "fleet-follow", "fleet-lease"
+        elif trigger == "manual":
+            source = self._tick_source or "request"
+        else:
+            source = "engine"
+        frm = (result.get("from") or {}).get("number")
+        _logger.info(
+            "auto-switch: engine moved #%s -> #%s (trigger %s, source %s)",
+            frm if frm is not None else "?", number, trigger, source,
+        )
+        return source
 
     @property
     def fleet_leader(self) -> "FleetLeader | None":  # fork: fleet

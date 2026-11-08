@@ -1,7 +1,8 @@
 """Fork-only: outside control of a running auto-switch engine (`cswap engine`).
 
 Contract ``cswap-engine/0.1`` (docs/plans/2026-11-01-engine-control.md): three
-commands -- ``status``, ``pick N``, ``strategy NAME`` -- each printing one JSON
+commands -- ``status``, ``pick N``, ``strategy NAME`` (+ ``unpin``, additive,
+docs/plans/2026-11-08-pin-control.md) -- each printing one JSON
 object with ``--json`` and reporting through a fixed set of exit codes.
 
 Two halves, both here so the upstream files carry only call-site hooks:
@@ -469,6 +470,8 @@ class ControlServer:
                 return self._strategy(str(request.get("strategy", "")))
             if op == "wake":  # fork: fleet -- a lease just landed: tick now
                 return self._wake()
+            if op == "unpin":  # fork: pin-control
+                return self._unpin()
         except Exception as e:  # never let a request kill the host
             return _error(str(op), "engine-error", type(e).__name__)
         return _error(str(op), "bad-request", f"unknown op {op!r}")
@@ -570,6 +573,32 @@ class ControlServer:
             engine._wake.set()
         return _payload("wake", "woken")
 
+    def _unpin(self) -> dict:  # fork: pin-control
+        """Release the engine's manual-pick hold. Answers at once; the switch
+        that may follow is the next tick's (re-read ``status``)."""
+        self._reap()
+        engine = self._current()
+        if engine is None or self._stopping.is_set():
+            return _error("unpin", "engine-error", "engine not started")
+        # Held across the release: a pick cannot slip in between the busy
+        # check and the release (it would re-pin when it lands anyway).
+        with self._lock:
+            if self._inflight is not None or self._strategy_busy:
+                return _error(
+                    "unpin", "busy", "another engine request is still pending"
+                )
+            engine = self._current() or engine
+            was = engine.release_pin("engine-unpin")
+            # A TUI `s`/`l` rebuild can carry the pin into a new engine
+            # around the release: release it there too.
+            current = self._current()
+            if current is not None and current is not engine:
+                later = current.release_pin("engine-unpin")
+                was = was if was is not None else later
+        if was is None:
+            return _payload("unpin", "not-pinned")
+        return _payload("unpin", "released", was=str(was))
+
     def _pick(self, target: str, timeout: float) -> dict:
         if not target.isdigit():
             return _error("pick", "bad-request", "account must be a number")
@@ -591,7 +620,9 @@ class ControlServer:
             request = _PickRequest(self, engine, target)
             self._inflight = request
         try:
-            engine.request_switch(target=target, on_result=request)
+            engine.request_switch(
+                target=target, on_result=request, source="engine-pick"  # fork: pin-control
+            )
         except Exception as e:
             self._release(request)
             return _error("pick", "engine-error", type(e).__name__)
@@ -842,7 +873,10 @@ def wake_engine(
 
 def exit_code(payload: dict) -> int:
     result = payload.get("result")
-    if result in ("running", "switched", "would-switch", "applied", "woken"):
+    if result in (
+        "running", "switched", "would-switch", "applied", "woken",
+        "released", "not-pinned",  # fork: pin-control
+    ):
         return EXIT_OK
     if result == "no-engine":
         return EXIT_NO_ENGINE
@@ -882,6 +916,11 @@ def human_line(payload: dict) -> str:
         return str(payload.get("message", result))
     if op == "strategy":
         return f"strategy set to {payload.get('strategy')} (saved to settings, applied live)"
+    if op == "unpin":  # fork: pin-control
+        if result == "released":
+            return f"released hold on #{payload.get('was')}"
+        if result == "not-pinned":
+            return "no hold to release"
     return str(result)
 
 
@@ -913,8 +952,9 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exit codes:
-  0  done (status: running; pick: switched or dry-run preview; strategy: applied)
-  1  error (multiple-engines, transport, engine-error, ...)
+  0  done (status: running; pick: switched or dry-run preview; strategy: applied;
+     unpin: released or not-pinned)
+  1  error (multiple-engines, transport, engine-error, busy, ...)
   2  usage error
   3  no engine running: nothing was done
   4  pending: pick delivered, no outcome within --timeout (check status)
@@ -922,7 +962,7 @@ Exit codes:
         """,
     )
     parser.add_argument("--json", action="store_true", help="Print one JSON object")
-    sub = parser.add_subparsers(dest="action", metavar="{status,pick,strategy}")
+    sub = parser.add_subparsers(dest="action", metavar="{status,pick,strategy,unpin}")
     sub.required = True
     p_status = sub.add_parser("status", help="Report the running engine")
     p_pick = sub.add_parser("pick", help="Switch to account N through the engine")
@@ -940,7 +980,10 @@ Exit codes:
     p_strategy.add_argument(
         "name", choices=SETTING_SPECS["autoswitch.strategy"].choices
     )
-    for p in (p_status, p_pick, p_strategy):
+    p_unpin = sub.add_parser(  # fork: pin-control
+        "unpin", help="Release the engine's hold on a manual pick"
+    )
+    for p in (p_status, p_pick, p_strategy, p_unpin):
         p.add_argument(
             "--json",
             action="store_true",
@@ -962,6 +1005,8 @@ def run(argv: list[str], *, backup_root: Path | None = None) -> int:
     elif args.action == "pick":
         message = {"op": "pick", "target": args.account, "timeout": args.timeout}
         wait = args.timeout + 15.0
+    elif args.action == "unpin":  # fork: pin-control
+        message, wait = {"op": "unpin"}, _REQUEST_WAIT_S + 10.0
     else:
         message, wait = {"op": "strategy", "strategy": args.name}, 60.0
     payload = request(backup_root, message, reply_timeout=wait)

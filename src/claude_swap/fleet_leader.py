@@ -397,7 +397,7 @@ class EngineFleet:
         note = ""
         tick = self.tick
         if self.following:
-            self.engine._pinned = None  # a follow is not a held pick
+            self.engine._clear_pin("follow")  # a follow is not a held pick
             self.refusal = None
             note = "following the fleet leader"
         elif (

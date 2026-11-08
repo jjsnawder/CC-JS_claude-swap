@@ -121,6 +121,22 @@ class TestFollow:
         assert h.engine.pinned is None  # a follow is not a held `m` pick
         assert h.state()["leftTrigger"] == "manual"  # same record as `m`
 
+    def test_follow_logs_its_source_and_drops_a_hold(self, h, box, caplog):
+        """fork: pin-control -- the switch-source line names the lease."""
+        import logging
+
+        caplog.set_level(logging.INFO, logger="claude-swap")
+        h.engine._pinned = "1"
+        box.lease = _lease(account="3")
+        assert h.tick_with_usage(_HEALTHY) is TickOutcome.SWITCHED
+        lines = [r.getMessage() for r in caplog.records if r.name == "claude-swap"]
+        assert (
+            "auto-switch: engine moved #1 -> #3 (trigger fleet-follow, source fleet-lease)"
+            in lines
+        )
+        assert "auto-switch: hold on #1 released (follow)" in lines
+        assert h.engine.pinned is None
+
     def test_follow_ignores_cooldown(self, h, box):
         h.engine._mutate_state(lambda st: st.__setitem__("lastSwitchAt", h.clock.now))
         box.lease = _lease(account="2")

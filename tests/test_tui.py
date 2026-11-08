@@ -1305,6 +1305,8 @@ class _FakeEngine:
         # Targets of `request_switch(target=...)` (`m`), in call order; a
         # plain `n` request appends None.
         self.switch_targets: list[str | None] = []
+        self.switch_sources: list[str | None] = []  # fork: pin-control
+        self.release_sources: list[str] = []  # fork: pin-control
         # Manual-pick hold, as the engine exposes it (read-only there).
         self.pinned = kwargs.get("pinned")
         self.kwargs = kwargs
@@ -1332,9 +1334,17 @@ class _FakeEngine:
     def wake(self) -> None:
         self.wakes += 1
 
-    def request_switch(self, target: str | None = None) -> None:
+    def request_switch(
+        self, target: str | None = None, *, source: str | None = None
+    ) -> None:
         self.switch_requests += 1
         self.switch_targets.append(target)
+        self.switch_sources.append(source)  # fork: pin-control
+
+    def release_pin(self, source: str = "release") -> str | None:  # fork
+        self.release_sources.append(source)
+        was, self.pinned = self.pinned, None
+        return was
 
     def request_warm(self) -> None:
         self.warm_requests += 1
@@ -2199,6 +2209,28 @@ class TestAutoScreen:
             await pilot.pause()
             assert "switch now requested (best)" in self._log_text(app)
             assert fake_engine.instances[-1].switch_requests == 1
+
+    @pytest.mark.parametrize("pinned,line", [  # fork: pin-control
+        ("2", "released hold on #2"), (None, "no hold to release"),
+    ])
+    async def test_unpin_releases_the_hold_and_logs_it(
+        self, tmp_path, fake_engine, pinned, line
+    ):
+        """`u` makes the same call as `cswap engine unpin`, tagged `tui-u`."""
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            engine = fake_engine.instances[0]
+            engine.pinned = pinned
+            await pilot.press("u")
+            await pilot.pause()
+            assert engine.release_sources == ["tui-u"]
+            assert engine.pinned is None
+            assert line in self._log_text(app)
 
 
     async def test_ping_warm_asks_the_engine_and_logs_it(

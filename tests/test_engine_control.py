@@ -56,10 +56,13 @@ class FakeEngine:
         self.respond = respond
         self.requests: list[tuple[str | None, object]] = []
         self.applied: list[str] = []
+        self.sources: list[str | None] = []
+        self.releases: list[str] = []
         self._pending = None
         self._lock = threading.Lock()
 
-    def request_switch(self, target=None, *, on_result=None):
+    def request_switch(self, target=None, *, on_result=None, source=None):
+        self.sources.append(source)
         with self._lock:
             superseded, self._pending = self._pending, on_result
         self.requests.append((target, on_result))
@@ -77,6 +80,11 @@ class FakeEngine:
                 self.last_tick_at = time.time()
                 on_result(outcome, events)
             threading.Thread(target=tick, daemon=True).start()
+
+    def release_pin(self, source="release"):
+        self.releases.append(source)
+        was, self.pinned = self.pinned, None
+        return was
 
     def withdraw_switch(self, on_result):
         with self._lock:
@@ -711,7 +719,7 @@ class TestPick:
                 return False
 
         class LateEngine(FakeEngine):
-            def request_switch(self, target=None, *, on_result=None):
+            def request_switch(self, target=None, *, on_result=None, source=None):
                 on_result.done = NeverWaits()
                 on_result(TickOutcome.SWITCHED, _switched("4", target))
 
@@ -899,6 +907,120 @@ class TestStrategy:
 # ---------------------------------------------------------------------------
 # hosts
 # ---------------------------------------------------------------------------
+
+
+class TestUnpin:
+    """fork: pin-control -- `cswap engine unpin` (additive to 0.1)."""
+
+    def test_released_exit_0(self, root, servers, capsys):
+        engine = FakeEngine(pinned="2")
+        _serve(root, servers, engine)
+        code, payload, _ = _cli(root, "unpin", "--json", capsys=capsys)
+        assert code == 0
+        assert payload == {
+            "contract": CONTRACT, "op": "unpin", "result": "released", "was": "2",
+        }
+        assert engine.releases == ["engine-unpin"] and engine.pinned is None
+
+    def test_not_pinned_exit_0_idempotent(self, root, servers, capsys):
+        engine = FakeEngine()
+        _serve(root, servers, engine)
+        for _ in range(2):
+            code, payload, _ = _cli(root, "unpin", "--json", capsys=capsys)
+            assert code == 0
+            assert payload == {"contract": CONTRACT, "op": "unpin",
+                               "result": "not-pinned"}
+
+    def test_no_engine_exit_3_writes_nothing(self, root, capsys):
+        before = _tree(root)
+        code, payload, _ = _cli(root, "unpin", "--json", capsys=capsys)
+        assert code == 3
+        assert payload == {"contract": CONTRACT, "op": "unpin", "result": "no-engine"}
+        assert _tree(root) == before
+
+    def test_pick_in_flight_is_busy_exit_1_and_keeps_the_pin(
+        self, root, servers, capsys
+    ):
+        engine = FakeEngine(pinned="2")  # respond=None: the pick never lands
+        server = _serve(root, servers, engine)
+        assert server.handle({"op": "pick", "target": "3", "timeout": 0.1})[
+            "result"] == "pending"
+        code, payload, _ = _cli(root, "unpin", "--json", capsys=capsys)
+        assert code == 1
+        assert payload["result"] == "error" and payload["error"] == "busy"
+        assert engine.releases == [] and engine.pinned == "2"
+
+    def test_strategy_change_in_flight_is_busy_and_keeps_the_pin(self, root, servers):
+        engine = FakeEngine(pinned="2")
+        server = _serve(root, servers, engine)
+        server._strategy_busy = True
+        reply = server.handle({"op": "unpin"})
+        assert reply["result"] == "error" and reply["error"] == "busy"
+        assert reply["message"] == "another engine request is still pending"
+        assert engine.releases == [] and engine.pinned == "2"
+
+    def test_engine_not_started_is_engine_error(self, root, servers):
+        server = _serve(root, servers, lambda: None)
+        reply = server.handle({"op": "unpin"})
+        assert reply["result"] == "error" and reply["error"] == "engine-error"
+        assert reply["message"] == "engine not started"
+
+    def test_rebuild_carrying_the_pin_is_released_too(self, root, servers):
+        old, new = FakeEngine(pinned="2"), FakeEngine()
+        holder = {"engine": old}
+
+        def release_and_rebuild(source="release"):
+            # the TUI rebuild copies the pin into a new engine mid-release
+            new.pinned = old.pinned
+            holder["engine"] = new
+            return FakeEngine.release_pin(old, source)
+
+        old.release_pin = release_and_rebuild
+        server = _serve(root, servers, lambda: holder["engine"])
+        reply = server.handle({"op": "unpin"})
+        assert reply["result"] == "released" and reply["was"] == "2"
+        assert old.pinned is None and new.pinned is None
+        assert old.releases == ["engine-unpin"] and new.releases == ["engine-unpin"]
+
+    def test_old_engine_answers_bad_request_exit_1(self, root, servers, capsys):
+        server = _serve(root, servers, FakeEngine(pinned="2"))
+        real = server.handle
+
+        def pre_unpin(request):  # an engine built before the op existed
+            if request.get("op") == "unpin":
+                return engine_control._error("unpin", "bad-request", "unknown op 'unpin'")
+            return real(request)
+
+        server.handle = pre_unpin
+        code, payload, _ = _cli(root, "unpin", "--json", capsys=capsys)
+        assert code == 1 and payload["error"] == "bad-request"
+
+    @pytest.mark.parametrize("pinned,line", [
+        ("2", "released hold on #2"), (None, "no hold to release"),
+    ])
+    def test_human_line(self, root, servers, capsys, pinned, line):
+        _serve(root, servers, FakeEngine(pinned=pinned))
+        code = engine_control.run(["unpin"], backup_root=root)
+        assert code == 0
+        assert capsys.readouterr().out.strip() == line
+
+    def test_real_engine_releases_and_wakes(self, harness, root, servers, capsys):
+        harness.engine.request_switch(target="3")
+        harness.tick_with_usage(TestRealEngine._USAGE)
+        assert harness.engine.pinned == "3"
+        harness.engine._wake.clear()
+        engine = harness.engine
+        _serve(root, servers, lambda: engine)
+        code, payload, _ = _cli(root, "unpin", "--json", capsys=capsys)
+        assert code == 0 and payload["was"] == "3"
+        assert engine.pinned is None and engine._wake.is_set()
+
+    def test_pick_passes_its_source(self, root, servers, capsys):
+        engine = FakeEngine(respond=lambda t: (TickOutcome.SWITCHED,
+                                               _switched("4", t), t))
+        _serve(root, servers, engine)
+        code, _, _ = _cli(root, "pick", "2", "--json", capsys=capsys)
+        assert code == 0 and engine.sources == ["engine-pick"]
 
 
 class TestAutoHost:
@@ -1106,6 +1228,61 @@ class TestTuiHost:
             await settle(pilot)
             app.screen._on_manual_pick("2", [])
             assert _FakeEngine.instances[0].switch_targets == ["2"]
+            assert _FakeEngine.instances[0].switch_sources == ["tui-m"]  # fork
+
+    async def test_n_key_passes_its_source(self, tmp_path, monkeypatch):  # fork
+        from tests.test_tui import (
+            FakeSwitcher, _FakeEngine, make_account, make_app, settle,
+        )
+
+        _FakeEngine.instances = []
+        monkeypatch.setattr("claude_swap.tui.autoview.AutoSwitchEngine", _FakeEngine)
+        app = make_app(FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        ))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("g")
+            await pilot.pause()
+            await settle(pilot)
+            await pilot.press("n")
+            await pilot.pause()
+            assert _FakeEngine.instances[0].switch_sources == ["tui-n"]
+
+    async def test_u_key_releases_the_hold(self, tmp_path, monkeypatch):  # fork
+        from textual.widgets import RichLog, Static
+
+        from tests.test_tui import (
+            FakeSwitcher, _FakeEngine, make_account, make_app, settle,
+        )
+
+        _FakeEngine.instances = []
+        monkeypatch.setattr("claude_swap.tui.autoview.AutoSwitchEngine", _FakeEngine)
+        app = make_app(FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        ))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("g")
+            await pilot.pause()
+            await settle(pilot)
+            engine = _FakeEngine.instances[0]
+            engine.pinned = "2"
+            app.screen._update_summary()
+            summary = app.screen.query_one("#auto-summary", Static)
+            assert "holding #2" in summary.render().plain
+            await pilot.press("u")
+            await pilot.pause()
+            assert engine.release_sources == ["tui-u"]
+            assert engine.pinned is None
+            assert "holding #2" not in summary.render().plain
+            await pilot.press("u")
+            await pilot.pause()
+            assert engine.release_sources == ["tui-u", "tui-u"]
+            log = app.screen.query_one("#event-log", RichLog)
+            text = "\n".join(strip.text for strip in log.lines)
+            assert "released hold on #2" in text
+            assert "no hold to release" in text
 
 
 # ---------------------------------------------------------------------------

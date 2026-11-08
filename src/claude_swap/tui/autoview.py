@@ -11,7 +11,7 @@ panel, with the threshold tick); this screen adds the engine badge, the
 ranked switch candidates, and the decision log. While it is up, the app's
 snapshot poller runs store-only: the engine is the only fetcher. `n` asks the
 engine to switch by its strategy; `m` (manual pick) names the target and the
-engine holds it until the threshold.
+engine holds it until the threshold; `u` releases that hold.
 """
 
 from __future__ import annotations
@@ -226,6 +226,7 @@ class AutoScreen(Screen):
         Binding("s", "toggle_strategy", "Strategy"),
         Binding("n", "switch_now", "Switch now"),
         Binding("m", "manual_pick", "Manual pick"),
+        Binding("u", "release_pin", "Unpin"),  # fork: pin-control
         Binding("p", "ping_warm", "Ping/warm"),
         Binding("left", "threshold_step(-1)", "-1%"),
         Binding("right", "threshold_step(1)", "+1%"),
@@ -506,7 +507,7 @@ class AutoScreen(Screen):
         """
         if self._settings is None or self._adjusting or self._engine is None:
             return
-        self._engine.request_switch()
+        self._engine.request_switch(source="tui-n")  # fork: pin-control
         self.query_one("#event-log", RichLog).write(
             Text(
                 f"— switch now requested ({self._settings.strategy}) —",
@@ -589,7 +590,7 @@ class AutoScreen(Screen):
     def _on_manual_pick(self, number: str | None, rows: list[PickRow]) -> None:
         if number is None or self._engine is None or not self.is_attached:
             return
-        self._engine.request_switch(target=number)
+        self._engine.request_switch(target=number, source="tui-m")  # fork: pin-control
         email = next((r.email for r in rows if r.number == number), "")
         who = f"Account-{number}" + (f" ({email})" if email else "")
         self.query_one("#event-log", RichLog).write(
@@ -598,6 +599,20 @@ class AutoScreen(Screen):
                 style=Palette.from_theme(self.app.current_theme).muted,
             )
         )
+
+    def action_release_pin(self) -> None:  # fork: pin-control
+        """Release the engine's hold on a manual pick (`u`); the next tick
+        runs the normal strategy. Same call as `cswap engine unpin`."""
+        if self._settings is None or self._adjusting or self._engine is None:
+            return
+        was = self._engine.release_pin("tui-u")
+        self.query_one("#event-log", RichLog).write(
+            Text(
+                f"— released hold on #{was} —" if was else "— no hold to release —",
+                style=Palette.from_theme(self.app.current_theme).muted,
+            )
+        )
+        self._update_summary()
 
     # -- ping / warm ----------------------------------------------------------
 

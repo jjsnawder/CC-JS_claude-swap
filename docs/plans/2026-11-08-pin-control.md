@@ -1,6 +1,6 @@
 # Plan: pin visibility, unpin, and switch-source logging
 
-Date: 2026-11-08 · Branch: `jeremy` · Status: **planned**
+Date: 2026-11-08 · Branch: `jeremy` · Status: **shipped + verified live** (110c324, 6467935; 2026-11-08). Adds beyond the original plan: a released m/engine pick skips the anti-undo bar and the cooldown (`lastSwitchPick`, decisions 2026-11-08)
 Collaboration: `docs/collaborations/2026-11-08-cswap-pin-control.md` (Claude Remote shows the pin and calls unpin).
 Shape: fork-only. Additions to `engine_control.py` (fork module), a small engine
 method in `autoswitch.py`, one TUI key, and fork-marked log lines. No upstream PR.

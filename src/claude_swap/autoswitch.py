@@ -20,7 +20,8 @@ makes the macOS ~30s Keychain cache latency harmless). Candidates must sit
 below every one of their lines and beat the active account by
 ``hysteresis_pct`` points so two accounts hovering at a line never
 ping-pong, and a ``cooldown_seconds`` floor bounds the switch rate (bypassed
-only when the active account is hard at its limit). Physical questions —
+only when the active account is hard at its limit, or -- fork -- after a
+released manual targeted pick). Physical questions —
 exhausted, at its limit, when does quota return — read the raw percentages. Before
 activation the target's token is *freshened* (refreshed if it expires within
 10 minutes — twice Claude Code's refresh buffer, so a running Claude Code's
@@ -2322,7 +2323,9 @@ class AutoSwitchEngine:
         cannot prove the engine moved away, so it KEEPS the bar — the same
         conservative reading this module gives every other missing field, and
         the only one that does not silently drop the anti-flap bound for an
-        upgrade cycle.
+        upgrade cycle. (Fork, pin-control: the bar is also off when the switch
+        that put us here was a manual targeted pick, `lastSwitchPick`, since
+        the bar exists to stop the engine undoing its own moves; `n` keeps it.)
 
         RELEASED when the account we left now beats us by the margin the
         all-above ranking uses (`_all_above_margin_met`): that is not the flip
@@ -2368,6 +2371,8 @@ class AutoSwitchEngine:
             thresholds = ThresholdMap({}, settings.threshold)
         came_from = state.get("lastSwitchFrom")
         if trigger not in ("proactive", "consume-first") or came_from is None:
+            return None
+        if state.get("lastSwitchPick"):  # fork: pin-control -- not our move
             return None
         # Only while we are still standing where that switch put us. A manual
         # switch away already undid the move, so there is nothing left to
@@ -3823,6 +3828,18 @@ class AutoSwitchEngine:
             # nulls then runs the wrong legs. Record it directly so the
             # reader never has to guess.
             state["leftTrigger"] = trigger
+            # fork: pin-control -- a human's targeted pick (`m`, engine pick),
+            # not this engine's move: `_no_return_account` does not guard it.
+            # `n` and fleet-follow stay False (the bar is `n`'s only guard).
+            # A pick onto an API-key account writes True without pinning it;
+            # harmless, the bar only applies to proactive/consume-first.
+            # `str` both sides: derive it from the switch that happened.
+            state["lastSwitchPick"] = (
+                trigger == "manual"
+                and self._tick_target is not None
+                and str(number) == str(self._tick_target)
+                and not self._fleet.following
+            )
             atomic_write_json(self.state_path, state)
 
         source = self._log_switch_source(result, number, trigger)  # fork: pin-control
@@ -3882,6 +3899,11 @@ class AutoSwitchEngine:
         )
 
     def _in_cooldown(self, state: dict) -> bool:
+        # fork: pin-control -- the cooldown spaces the engine's OWN moves; a
+        # human's targeted pick does not start one, so a released pick's
+        # return is immediate. The engine's next switch writes False.
+        if state.get("lastSwitchPick"):
+            return False
         last = state.get("lastSwitchAt")
         if not isinstance(last, (int, float)):
             return False

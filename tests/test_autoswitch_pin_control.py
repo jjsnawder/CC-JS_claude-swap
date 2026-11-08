@@ -221,3 +221,143 @@ class TestSwitchSourceLog:
         assert any(
             _SWITCH_LOG_RE.search(r.getMessage()) for r in logs.records
         )
+
+
+# Live 2026-11-08: engine on #2 (resets soonest), `m` -> #3, release; #1
+# resets last so a barred #2 leaves nothing better and the engine stays put.
+_BAR_USAGE = {
+    "1": _usage7(20, 20, "2024-01-12T00:00:00Z"),
+    "2": _usage7(10, 10, _R_SOON),
+    "3": _usage7(10, 10, _R_LATEST),
+}
+
+
+def _on_2(temp_home: Path) -> EngineHarness:
+    h = _cf(temp_home)
+    h.make_live("b@example.com", 2)
+    return h
+
+
+def _switch_then_wait(h: EngineHarness, **request) -> None:
+    h.engine.request_switch(**request)
+    assert h.tick_with_usage(_BAR_USAGE) is TickOutcome.SWITCHED
+    assert h.active_number() == 3
+    h.clock.advance(h.settings.cooldown_seconds + 1)
+    h.events.clear()
+
+
+class TestNoReturnBarAfterAPick:
+    """The anti-undo bar guards the engine's OWN moves, not a human's pick."""
+
+    def test_release_after_a_pick_returns_to_the_account_it_left(
+        self, temp_home, logs
+    ):
+        h = _on_2(temp_home)
+        _switch_then_wait(h, target="3", source="tui-m")
+        assert h.state()["lastSwitchPick"] is True
+        assert h.engine.release_pin("tui-u") == "3"
+
+        assert h.tick_with_usage(_BAR_USAGE) is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "consume-first"
+        assert h.active_number() == 2
+        assert (
+            "auto-switch: engine moved #3 -> #2 (trigger consume-first, source engine)"
+            in _fork_lines(logs)
+        )
+        # The engine's own move re-arms the bar.
+        assert h.state()["lastSwitchPick"] is False
+
+    def test_engine_pick_disarms_too(self, temp_home):
+        h = _on_2(temp_home)
+        _switch_then_wait(h, target="3", on_result=lambda o, e: None,
+                          source="engine-pick")
+        h.engine.release_pin("engine-unpin")
+        assert h.tick_with_usage(_BAR_USAGE) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_n_keeps_the_bar_so_the_engine_does_not_undo_it(self, temp_home):
+        """`n` sets no pin: the bar is the only thing stopping the next
+        consume-first tick from reverting the human's "not this one"."""
+        h = _on_2(temp_home)
+        _switch_then_wait(h, source="tui-n")
+        assert h.state()["lastSwitchPick"] is False
+        assert h.tick_with_usage(_BAR_USAGE) is TickOutcome.NO_ACTION
+        assert h.active_number() == 3
+
+    def test_pre_upgrade_state_without_the_key_keeps_the_bar(self, temp_home):
+        from claude_swap.settings import atomic_write_json
+
+        h = _on_2(temp_home)
+        _switch_then_wait(h, target="3", source="tui-m")
+        state = h.state()
+        state.pop("lastSwitchPick", None)
+        atomic_write_json(h.switcher.backup_dir / "autoswitch_state.json", state)
+        h.engine.release_pin("tui-u")
+        assert h.tick_with_usage(_BAR_USAGE) is TickOutcome.NO_ACTION
+        assert h.active_number() == 3
+
+    @pytest.mark.parametrize(
+        "pick, barred", [(True, None), (False, "2"), ("missing", "2")]
+    )
+    def test_bar_helper_reads_the_key(self, temp_home, pick, barred):
+        """An engine-made consume-first switch (pick False) still arms it."""
+        h = _cf(temp_home)
+        state = {"lastSwitchFrom": 2, "lastSwitchTo": "3",
+                 "leftTrigger": "consume-first"}
+        if pick != "missing":
+            state["lastSwitchPick"] = pick
+        got = h.engine._no_return_account(
+            "consume-first", state, {"2": 90.0, "3": 90.0}, 90.0,
+            False, h.settings, "3", usage={},
+        )
+        assert got == barred
+
+    def test_threshold_release_returns_to_the_account_the_pick_left(
+        self, temp_home, logs
+    ):
+        """Pinned #3 crosses its line: the hold drops and the proactive move
+        may go back to #2. #2's weekly room (11 pts) is inside the release
+        margin over #3's 9 (min(2x, +3) = 12), so with the bar armed the
+        engine takes #1 instead (checked by stripping the key)."""
+        h = _on_2(temp_home)
+        _switch_then_wait(h, target="3", source="tui-m")
+        over = dict(
+            _BAR_USAGE,
+            **{"2": _usage7(10, 89, _R_SOON), "3": _usage7(91, 91, _R_LATEST)},
+        )
+
+        assert h.tick_with_usage(over) is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
+        assert h.active_number() == 2
+        assert h.engine.pinned is None
+        lines = _fork_lines(logs)
+        assert "auto-switch: hold on #3 released (threshold reached)" in lines
+        assert h.state()["lastSwitchPick"] is False
+
+    def test_release_inside_the_cooldown_returns_at_once(self, temp_home):
+        """A pick starts no cooldown: the woken tick returns right away, and
+        that engine move (pick False) re-arms the cooldown, so no flap."""
+        h = _on_2(temp_home)
+        h.engine.request_switch(target="3", source="tui-m")
+        assert h.tick_with_usage(_BAR_USAGE) is TickOutcome.SWITCHED
+        h.events.clear()
+        h.engine.release_pin("tui-u")
+
+        assert h.tick_with_usage(_BAR_USAGE) is TickOutcome.SWITCHED
+        assert "cooldown" not in _reasons(h)
+        assert h.active_number() == 2
+        state = h.state()
+        assert state["lastSwitchPick"] is False
+        assert h.engine._in_cooldown(state)
+
+    def test_n_still_gets_the_cooldown(self, temp_home):
+        h = _on_2(temp_home)
+        h.engine.request_switch(source="tui-n")
+        assert h.tick_with_usage(_BAR_USAGE) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        h.events.clear()
+
+        assert h.tick_with_usage(_BAR_USAGE) is TickOutcome.NO_ACTION
+        assert _reasons(h) == ["cooldown"]

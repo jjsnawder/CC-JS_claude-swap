@@ -120,6 +120,8 @@ class TestFollow:
         assert sw.trigger == "fleet" and "fleet leader" in sw.note
         assert h.engine.pinned is None  # a follow is not a held `m` pick
         assert h.state()["leftTrigger"] == "manual"  # same record as `m`
+        # fork: pin-control -- but not a pick: the anti-undo bar stays armed.
+        assert h.state()["lastSwitchPick"] is False
 
     def test_follow_logs_its_source_and_drops_a_hold(self, h, box, caplog):
         """fork: pin-control -- the switch-source line names the lease."""

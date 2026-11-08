@@ -1,5 +1,5 @@
 # Collaboration: cswap pin control (show the hold, release it, from Claude Remote)
-Status: active
+Status: closed 2026-11-08
 Projects: CC-JS_claude-swap ↔ CC-JS_Claude_Remote     This file: CC-JS_claude-swap's side (initiator)
 Charter: below
 
@@ -56,3 +56,4 @@ shows `pinned: null`), with the source line visible in `claude-swap.log`.
 - 2026-11-08 10:03 CT · Remote shipped: hub route POST /api/cswap/unpin (e9b4522), pin marker + tap-to-Unpin UI (6551c97), hub restarted 10:03 CT; read-only shows pinned 4. Waiting on Jeremy: TUI restart, then his dashboard Unpin; I check the source line in claude-swap.log after
 - 2026-11-08 10:35 CT · live test (Jeremy): TUI restarted (pid 49000, restart drops the pin); m #4->#3 then dashboard Unpin. Log: "engine moved #4 -> #3 (trigger manual, source tui-m)", "holding #3 (pin set by tui-m)", "hold on #3 released (engine-unpin)"; status pinned null. Stayed on #3: anti-undo bar barred #4. Jeremy: "The behavior I want is for it to go to 4." Follow-up in progress: bar disarmed after a manual switch
 - 2026-11-08 11:00 CT · follow-up shipped 6467935 (+ decisions f0be65b): a released m/engine pick skips the anti-undo bar AND the cooldown (Jeremy: "I want it to move right away"); review x2 + deep: ship; suite 3640 passed/121 skipped. Re-test pending TUI restart
+- 2026-11-08 11:58 CT · live re-test (Jeremy, TUI pid 49264): m #4->#3 11:57:26, dashboard Unpin 11:57:42, engine moved #3 -> #4 (consume-first, source engine) 0.14 s later. Done when met. Closed; told Remote

@@ -28,7 +28,8 @@ from tests.test_autoswitch import (  # noqa: F401
 )
 
 
-def _lease(mode="follow", account=None, strategy=None, settings=None, blocked=None):
+def _lease(mode="follow", account=None, strategy=None, settings=None, blocked=None,
+           mismatch=()):
     return Lease(
         leader_id="leader-test",
         seq=1,
@@ -39,6 +40,7 @@ def _lease(mode="follow", account=None, strategy=None, settings=None, blocked=No
         target_strategy=strategy,
         settings=settings or {},
         follow_blocked=blocked,
+        identity_mismatch=tuple(mismatch),
     )
 
 
@@ -214,6 +216,49 @@ class TestFollow:
         assert _switches(h)[-1].trigger == "fleet"
         assert h.active_number() == 1
 
+    def test_target_busy_retries_next_tick(self, h, box):
+        """A hello in flight on the target clears in seconds: the follow is
+        retried on the very next tick, not parked for FOLLOW_RETRY_S."""
+        box.lease = _lease(account="3")
+        with h.engine._warm_lock:
+            h.engine._warm_inflight.add("3")
+        assert h.tick_with_usage(_HEALTHY) is TickOutcome.NO_ACTION
+        assert _reasons(h) == ["target-busy"]
+        assert h.engine._fleet.refusal_public()["reason"] == "target-busy"
+        with h.engine._warm_lock:
+            h.engine._warm_inflight.discard("3")
+        h.events.clear()
+        h.clock.advance(60)
+        assert h.tick_with_usage(_HEALTHY) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        assert h.engine._fleet.refusal_public() is None
+
+    def test_usage_unknown_retries_next_tick(self, h, box):
+        box.lease = _lease(account="3")
+        usage = {"1": _HEALTHY["1"], "2": _HEALTHY["2"], "3": None}
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert "target-usage-unknown" in _reasons(h)
+        h.events.clear()
+        h.clock.advance(60)
+        assert h.tick_with_usage(_HEALTHY) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    @pytest.mark.parametrize("reason,outcome,held", [
+        ("target-busy", TickOutcome.NO_ACTION, False),
+        ("target-usage-unknown", TickOutcome.NO_ACTION, False),
+        ("no-comparison", TickOutcome.BLOCKED, False),
+        ("something", TickOutcome.BLOCKED, False),
+        ("target-over-threshold", TickOutcome.NO_ACTION, True),
+    ])
+    def test_refusal_retry_window(self, h, reason, outcome, held):
+        fleet = h.engine._fleet
+        fleet.following, fleet._attempt = True, "3"
+        h.engine._tick_events = [NoSwitchEvent(reason=reason, detail="")]
+        fleet.end_tick(outcome)
+        now = h.clock()
+        expect = now + fleet_leader.FOLLOW_RETRY_S if held else now
+        assert fleet.refusal["retry_at"] == expect
+
     def test_blocked_lease_does_not_follow(self, h, box):
         box.lease = _lease(account="3", blocked="identity-mismatch")
         h.tick_with_usage(_HEALTHY)
@@ -267,6 +312,26 @@ class TestPinAndStrategy:
         )
         assert s == base and thresholds == {} and disabled == frozenset({"2"})
 
+    def test_identity_mismatched_slots_skip_leader_policy(self):
+        from claude_swap.settings import AutoSwitchSettings
+
+        doc = {"accounts": {"1": {"threshold": 50.0, "disabled": True},
+                            "2": {"threshold": 60.0, "disabled": True}}}
+        _, thresholds, disabled = fleet_leader.apply_lease_settings(
+            AutoSwitchSettings(), doc, mismatched=("1",)
+        )
+        assert thresholds == {"2": 60.0} and disabled == frozenset({"2"})
+
+    def test_worker_tick_drops_mismatched_slots(self, h, box):
+        box.lease = _lease(mode="strategy", strategy="best", mismatch=("1",),
+                           settings={"accounts": {"1": {"threshold": 10.0, "disabled": True},
+                                                  "3": {"disabled": True}}})
+        usage = {"1": _usage(75), "2": _usage(10), "3": _usage(10)}
+        # The leader's #1 line (10%) is another account here: #1 stays put.
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        tick = h.engine._fleet.tick
+        assert tick.thresholds == {} and tick.disabled == frozenset({"3"})
+
 
 class TestFallback:
     def test_expired_lease_uses_the_fallback_strategy_then_rejoins(self, h, box):
@@ -292,6 +357,32 @@ class TestFallback:
         assert h.engine._fleet.tick.settings.strategy == "consume-first"
 
 
+class TestSleepBackstop:
+    def _blocked_long(self, h):
+        h.engine._sleep_until_ts = h.clock() + 3600
+        h.engine._warm_deadline_ts = None
+
+    def test_valid_lease_caps_sleep_at_interval(self, h, box):
+        box.lease = _lease(account="1")
+        h.tick_with_usage(_HEALTHY)
+        self._blocked_long(h)
+        assert h.engine._next_delay(TickOutcome.BLOCKED) <= h.engine.settings.interval_seconds
+
+    def test_fallback_and_no_fleet_do_not_cap(self, h, box):
+        box.lease = None
+        h.tick_with_usage(_HEALTHY)
+        self._blocked_long(h)
+        assert h.engine._next_delay(TickOutcome.BLOCKED) > h.engine.settings.interval_seconds
+        h.engine._fleet.tick = None
+        assert h.engine._next_delay(TickOutcome.BLOCKED) > h.engine.settings.interval_seconds
+
+    def test_blocked_lease_does_not_cap(self, h, box):
+        box.lease = _lease(account="3", blocked="identity-mismatch")
+        h.tick_with_usage(_HEALTHY)
+        self._blocked_long(h)
+        assert h.engine._next_delay(TickOutcome.BLOCKED) > h.engine.settings.interval_seconds
+
+
 class TestNoFleetBox:
     def test_no_fleet_files_is_a_pass_through(self, temp_home, monkeypatch):
         """Same events and the same clock reads as an engine whose fleet
@@ -311,6 +402,7 @@ class TestNoFleetBox:
             def event_trigger(self, t): return t
             def after_switch(self, f): return ""
             def end_tick(self, o): pass
+            def cap_delay(self, d, i): return d
             def ensure_leader(self): pass
             def stop_leader(self): pass
 

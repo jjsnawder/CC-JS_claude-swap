@@ -41,8 +41,10 @@ DEFAULT_TTL_S = 180
 MIN_TTL_S = 30
 MAX_TTL_S = 900
 
+# The one home of the fleet file names (fleet_leader / fleet_remote import them).
 FLEET_DIRNAME = "fleet"
 LEASE_FILENAME = "lease.json"
+HOSTS_FILENAME = "hosts.json"
 TARGET_MODES = ("follow", "pin", "strategy")
 RELOGIN_WINDOW_S = 7 * 86400
 # A lease stamped more than this far in the worker's future means the
@@ -72,6 +74,9 @@ class Lease:
     target_strategy: str | None
     settings: dict
     follow_blocked: str | None
+    # Slots whose leader-side identity differs from this box's: the leader's
+    # per-slot policy must not land on a different local account.
+    identity_mismatch: tuple[str, ...] = ()
 
 
 # -- paths --------------------------------------------------------------------
@@ -118,12 +123,17 @@ def _slot_identities(switcher: ClaudeAccountSwitcher) -> dict[str, tuple[str, st
 # -- dev-box side -------------------------------------------------------------
 
 
-def _list_payload(switcher: ClaudeAccountSwitcher) -> dict:
-    """The ``cswap list --json`` payload from the CLI's own producer."""
+def list_payload(switcher: ClaudeAccountSwitcher) -> dict:
+    """The ``cswap list --json`` payload from the CLI's own producer, STORE-ONLY.
+
+    ``fetch=set()`` (as the TUI and menubar do while an engine runs): this
+    runs on the leader's thread beside a live engine, and a fetching list
+    would claim stale slots and could spend refresh grants. Usage is
+    whatever the store already holds."""
     from claude_swap.json_output import SCHEMA_VERSION
 
     try:
-        payload = switcher.list_accounts(json_output=True)
+        payload = switcher.list_accounts(json_output=True, fetch=set())
     except Exception as exc:  # a failing list must not take the lease/snapshot down
         _logger.warning("fleet: list payload failed (%s)", type(exc).__name__)
         payload = None
@@ -137,6 +147,9 @@ def _list_payload(switcher: ClaudeAccountSwitcher) -> dict:
     return payload
 
 
+_list_payload = list_payload
+
+
 def build_lease(
     switcher: ClaudeAccountSwitcher,
     *,
@@ -145,12 +158,15 @@ def build_lease(
     target: dict,
     settings: dict,
     ttl_s: int = DEFAULT_TTL_S,
+    usage: dict | None = None,
 ) -> dict:
     """The lease for one worker (dev-box side).
 
     ``target`` = ``{"mode": "follow"|"pin"|"strategy", "account": "N"|None,
-    "strategy": str|None}``. The result passes :func:`validate_lease`; a bad
-    argument raises :class:`LeaseError` here rather than on the worker.
+    "strategy": str|None}``. ``usage``: a :func:`list_payload` the caller
+    built once for a whole round (None = build one here). The result passes
+    :func:`validate_lease`; a bad argument raises :class:`LeaseError` here
+    rather than on the worker.
     """
     salt = secrets.token_hex(16)
     lease = {
@@ -169,7 +185,7 @@ def build_lease(
             },
         },
         "settings": dict(settings),
-        "usage": _list_payload(switcher),
+        "usage": list_payload(switcher) if usage is None else usage,
     }
     validate_lease(lease)
     return lease
@@ -410,6 +426,11 @@ def _lease_from_record(record: dict) -> Lease | None:
         ):
             return None
         blocked = record.get("follow_blocked")
+        mismatch = record.get("identity_mismatch")
+        mismatch = tuple(
+            str(n) for n in (mismatch if isinstance(mismatch, list) else ())
+            if isinstance(n, str) and n.isascii() and n.isdigit()
+        )
         return Lease(
             leader_id=leader["id"],
             seq=seq,
@@ -420,6 +441,7 @@ def _lease_from_record(record: dict) -> Lease | None:
             target_strategy=strategy,
             settings=settings,
             follow_blocked=blocked if isinstance(blocked, str) else None,
+            identity_mismatch=mismatch,
         )
     except (KeyError, TypeError, ValueError):
         return None
@@ -446,10 +468,36 @@ def active_lease(backup_root: Path, *, now: float | None = None) -> Lease | None
     return lease
 
 
+def forget_lease(backup_root: Path) -> bool:
+    """Remove the stored lease (under the lease lock): this box leaves the
+    fleet and its engine goes back to its own strategy (no lease history =
+    no fallback either). True if a lease was removed."""
+    from claude_swap.locking import FileLock
+
+    path = lease_path(backup_root)
+    if not path.exists():
+        return False
+    with FileLock(fleet_dir(backup_root) / ".lease.lock"):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return False
+    return True
+
+
 def follow_state(
-    backup_root: Path, engine_status: dict | None, *, now: float | None = None
+    backup_root: Path,
+    engine_status: dict | None,
+    *,
+    now: float | None = None,
+    active: str | int | None = None,
 ) -> dict:
-    """``{"state": "following"|"overridden"|"autonomous", "reason", "lease_age_s"}``.
+    """``{"state": "following"|"overridden"|"autonomous", "reason",
+    "lease_age_s", "on_target"}``.
+
+    ``on_target``: whether ``active`` (this box's active account; the caller
+    passes it) is the live, unblocked lease's follow/pin target. ``null``
+    when the caller passed no active account.
 
     ``engine_status`` is an ``engine status`` reply (or None = unknown, not
     judged). With no engine, or a dry-run one, nothing acts on a lease, so
@@ -462,9 +510,20 @@ def follow_state(
     record = _read_stored(backup_root)
     stored = _lease_from_record(record) if record is not None else None
     lease_age_s = round(now - stored.received_at, 1) if stored is not None else None
+    on_target: bool | None = None
+    if active is not None:
+        on_target = bool(
+            stored is not None
+            and _is_live(stored, now)
+            and not stored.follow_blocked
+            and stored.target_mode in ("follow", "pin")
+            and stored.target_account is not None
+            and str(stored.target_account) == str(active)
+        )
 
     def out(state: str, reason: str | None) -> dict:
-        return {"state": state, "reason": reason, "lease_age_s": lease_age_s}
+        return {"state": state, "reason": reason, "lease_age_s": lease_age_s,
+                "on_target": on_target}
 
     if isinstance(engine_status, dict):
         if engine_status.get("result") == "no-engine":
@@ -558,14 +617,15 @@ def build_snapshot(
     """
     now = time.time() if now is None else now
     backup_root = Path(backup_root)
-    accounts = _list_payload(switcher)
+    accounts = list_payload(switcher)
     engine = _engine_status(backup_root)
+    active = accounts.get("activeAccountNumber")
     return {
         "contract": CONTRACT,
         "host_time": now,
         "accounts": accounts,
         "engine": engine,
-        "follow": follow_state(backup_root, engine, now=now),
+        "follow": follow_state(backup_root, engine, now=now, active=active),
         "relogin": relogin_slots(accounts, backup_root, now=now),
         "settings_hash": settings_fingerprint(switcher),
     }

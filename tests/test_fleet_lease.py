@@ -285,7 +285,9 @@ class TestReceive:
         assert got is not None and got.follow_blocked == "identity-mismatch"
         assert follow_state(s.backup_dir, None, now=T0 + 1) == {
             "state": "autonomous", "reason": "identity-mismatch", "lease_age_s": 1.0,
+            "on_target": None,
         }
+        assert got.identity_mismatch == ("2",)
 
     def test_mismatch_off_target_does_not_block(self, temp_home: Path):
         s = _two_slot_switcher(temp_home)
@@ -394,6 +396,7 @@ class TestFollowState:
     def test_no_lease(self, temp_home: Path):
         assert follow_state(temp_home / "root", self.RUNNING, now=T0) == {
             "state": "autonomous", "reason": "no-lease", "lease_age_s": None,
+            "on_target": None,
         }
 
     def test_following(self, temp_home: Path):
@@ -401,6 +404,7 @@ class TestFollowState:
         self._store(s)
         assert follow_state(s.backup_dir, self.RUNNING, now=T0 + 12.34) == {
             "state": "following", "reason": None, "lease_age_s": 12.3,
+            "on_target": None,
         }
 
     def test_overridden_pin_and_strategy(self, temp_home: Path):
@@ -418,6 +422,7 @@ class TestFollowState:
         self._store(s, ttl_s=30)
         assert follow_state(s.backup_dir, self.RUNNING, now=T0 + 31) == {
             "state": "autonomous", "reason": "lease-expired", "lease_age_s": 31.0,
+            "on_target": None,
         }
 
     def test_no_engine_and_dry_run(self, temp_home: Path):
@@ -429,6 +434,66 @@ class TestFollowState:
         # A transport error is not judged: the lease decides.
         err = {"result": "error", "error": "transport"}
         assert follow_state(s.backup_dir, err, now=T0)["state"] == "following"
+
+    def test_on_target(self, temp_home: Path):
+        s = _two_slot_switcher(temp_home)
+        self._store(s, account="2")
+        on = follow_state(s.backup_dir, self.RUNNING, now=T0, active="2")
+        assert on["state"] == "following" and on["on_target"] is True
+        off = follow_state(s.backup_dir, self.RUNNING, now=T0, active=1)
+        assert off["state"] == "following" and off["on_target"] is False
+        assert follow_state(s.backup_dir, self.RUNNING, now=T0)["on_target"] is None
+        # An expired lease has no target to be on.
+        assert follow_state(s.backup_dir, self.RUNNING, now=T0 + 10**4,
+                            active="2")["on_target"] is False
+
+    def test_on_target_strategy_lease_is_false(self, temp_home: Path):
+        s = _two_slot_switcher(temp_home)
+        self._store(s, mode="strategy", account=None, strategy="best")
+        assert follow_state(s.backup_dir, None, now=T0, active="2")["on_target"] is False
+
+
+class TestForgetLease:
+    def test_forget_removes_the_lease(self, temp_home: Path):
+        s = _two_slot_switcher(temp_home)
+        with patch("claude_swap.oauth.try_fetch_usage_for_account", side_effect=_fake_fetch_ok):
+            receive_lease(s, _lease(s), now=T0)
+        assert fleet_lease.forget_lease(s.backup_dir) is True
+        assert not lease_path(s.backup_dir).exists()
+        assert active_lease(s.backup_dir, now=T0 + 1) is None
+        assert follow_state(s.backup_dir, None, now=T0)["reason"] == "no-lease"
+        assert fleet_lease.forget_lease(s.backup_dir) is False
+
+    def test_forget_with_no_fleet_dir_creates_nothing(self, temp_home: Path):
+        root = temp_home / "root"
+        root.mkdir()
+        assert fleet_lease.forget_lease(root) is False
+        assert not (root / "fleet").exists()
+
+
+class TestListPayload:
+    def test_store_only(self, temp_home: Path):
+        s = _two_slot_switcher(temp_home)
+        payload = {"schemaVersion": 1, "accounts": []}
+        with patch.object(s, "list_accounts", return_value=payload) as la:
+            assert fleet_lease.list_payload(s) is payload
+        la.assert_called_once_with(json_output=True, fetch=set())
+
+    def test_build_lease_uses_a_given_usage(self, temp_home: Path):
+        s = _two_slot_switcher(temp_home)
+        usage = {"schemaVersion": 1, "accounts": []}
+        with patch.object(s, "list_accounts", side_effect=AssertionError("listed")):
+            lease = build_lease(s, leader_id="L", seq=1,
+                                target={"mode": "follow", "account": "1"},
+                                settings={}, usage=usage)
+        assert lease["usage"] is usage
+
+    def test_constants_have_one_home(self):
+        from claude_swap import fleet_leader
+
+        assert fleet_leader.FLEET_DIRNAME is fleet_lease.FLEET_DIRNAME
+        assert fleet_leader.LEASE_FILENAME is fleet_lease.LEASE_FILENAME
+        assert fleet_leader.HOSTS_FILENAME is fleet_lease.HOSTS_FILENAME
 
 
 # ---------------------------------------------------------------------------
@@ -481,7 +546,8 @@ class TestSnapshot:
         assert snap["accounts"]["schemaVersion"] == 1
         assert [a["number"] for a in snap["accounts"]["accounts"]] == [1, 2]
         assert snap["engine"]["result"] == "no-engine"
-        assert snap["follow"] == {"state": "autonomous", "reason": "no-engine", "lease_age_s": None}
+        assert snap["follow"] == {"state": "autonomous", "reason": "no-engine", "lease_age_s": None,
+                                  "on_target": None}
         assert snap["relogin"] == ["1"]
         assert snap["settings_hash"] == settings_fingerprint(s)
         json.dumps(snap)  # serializable

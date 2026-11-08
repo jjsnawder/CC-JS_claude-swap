@@ -69,6 +69,8 @@ _BACKLOG = 16
 _DECISIVE_KINDS = ("switch", "no-switch", "error", "all-exhausted")
 # Stale-file sweep: how long a live-pid file's address gets to answer.
 _PROBE_S = 0.5
+# fork: fleet -- `fleet receive` nudges a local engine; must never hold it up.
+WAKE_TIMEOUT_S = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -465,6 +467,8 @@ class ControlServer:
                 )
             if op == "strategy":
                 return self._strategy(str(request.get("strategy", "")))
+            if op == "wake":  # fork: fleet -- a lease just landed: tick now
+                return self._wake()
         except Exception as e:  # never let a request kill the host
             return _error(str(op), "engine-error", type(e).__name__)
         return _error(str(op), "bad-request", f"unknown op {op!r}")
@@ -516,6 +520,15 @@ class ControlServer:
         pinned = getattr(engine, "pinned", None)
         with self._lock:
             pick_pending = self._inflight is not None
+        strategy = settings.strategy
+        strategy_source = "settings" if strategy == configured else "session"
+        try:  # fork: fleet -- report what a lease / fallback actually decides with
+            from claude_swap.fleet_leader import effective_strategy
+
+            if (fleet_strategy := effective_strategy(engine)) is not None:
+                strategy, strategy_source = fleet_strategy
+        except Exception as e:
+            _logger.debug("fleet strategy lookup failed: %s", type(e).__name__)
         reply = _payload(  # fork: fleet -- named so the fleet block can read it
             "status",
             "running",
@@ -523,10 +536,8 @@ class ControlServer:
                 "pid": os.getpid(),
                 "host": self.host,
                 "mode": "dry-run" if engine.dry_run else "live",
-                "strategy": settings.strategy,
-                "strategy_source": (
-                    "settings" if settings.strategy == configured else "session"
-                ),
+                "strategy": strategy,
+                "strategy_source": strategy_source,
                 "reserve": sorted(reserve_accounts(settings), key=int),
                 "threshold": float(settings.threshold),
                 "active": None if active is None else str(active),
@@ -546,6 +557,17 @@ class ControlServer:
             reply["fleet"] = {"role": "none", "leader": None, "follow": None,
                               "refusal": None}
         return reply
+
+    def _wake(self) -> dict:  # fork: fleet
+        engine = self._current()
+        if engine is None or self._stopping.is_set():
+            return _error("wake", "engine-error", "engine not started")
+        wake = getattr(engine, "wake", None)
+        if callable(wake):
+            wake()
+        else:
+            engine._wake.set()
+        return _payload("wake", "woken")
 
     def _pick(self, target: str, timeout: float) -> dict:
         if not target.isdigit():
@@ -798,9 +820,28 @@ def request(backup_root: Path, message: dict, *, reply_timeout: float) -> dict:
                 pass
 
 
+def wake_engine(
+    backup_root: Path | None = None, *, timeout: float = WAKE_TIMEOUT_S
+) -> bool:
+    """Fork (fleet): cut the running engine's sleep short so it reads a
+    lease that just landed. True iff an engine on this box acknowledged; no
+    engine, an older engine without ``wake``, or any failure is False.
+    Never raises."""
+    try:
+        if backup_root is None:
+            from claude_swap.paths import get_backup_root
+
+            backup_root = get_backup_root()
+        reply = request(Path(backup_root), {"op": "wake"}, reply_timeout=timeout)
+    except Exception as e:
+        _logger.debug("engine wake failed: %s", type(e).__name__)
+        return False
+    return isinstance(reply, dict) and reply.get("result") == "woken"
+
+
 def exit_code(payload: dict) -> int:
     result = payload.get("result")
-    if result in ("running", "switched", "would-switch", "applied"):
+    if result in ("running", "switched", "would-switch", "applied", "woken"):
         return EXIT_OK
     if result == "no-engine":
         return EXIT_NO_ENGINE

@@ -10,9 +10,10 @@
   fallback strategy once the lease is gone.
 
 ``autoswitch.py`` only calls in through :class:`EngineFleet` (``# fork:
-fleet`` hunks). A box with no ``<backup_root>/fleet/`` files never imports
-``fleet_lease``/``fleet_remote`` and its engine behaves exactly as upstream:
-every hook is a pass-through.
+fleet`` hunks). A box with no ``<backup_root>/fleet/`` files never calls
+into ``fleet_lease``/``fleet_remote`` (only the file-name constants are
+imported) and its engine behaves exactly as upstream: every hook is a
+pass-through.
 
 Follow semantics (see ``docs/plans/2026-11-07-fleet-follow.md``):
 
@@ -47,11 +48,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from claude_swap.fleet_lease import FLEET_DIRNAME, HOSTS_FILENAME, LEASE_FILENAME
+
 _logger = logging.getLogger("claude-swap")
 
-FLEET_DIRNAME = "fleet"
-LEASE_FILENAME = "lease.json"
-HOSTS_FILENAME = "hosts.json"
 DEFAULT_FALLBACK_STRATEGY = "consume-first-reserve-jj"
 MAX_WORKERS = 4
 REMOTE_TIMEOUT_S = 20.0
@@ -60,6 +60,10 @@ RECEIVE_ARGS = ("fleet", "receive", "--json")
 # next attempt, unless the lease names a different target first.
 FOLLOW_RETRY_S = 300.0
 FOLLOW_MODES = ("follow", "pin")
+# Refusals that clear on their own within a tick or two (a hello in flight,
+# an unreadable usage row, nothing to compare against): retried next tick,
+# never parked for FOLLOW_RETRY_S.
+TRANSIENT_REFUSALS = frozenset({"target-busy", "target-usage-unknown", "no-comparison"})
 
 
 def _lease_mod():
@@ -147,12 +151,16 @@ def _bounded(value: Any, lo: float, hi: float) -> float | None:
     return float(min(max(value, lo), hi))
 
 
-def apply_lease_settings(base: Any, doc: Any) -> tuple[Any, dict, frozenset]:
+def apply_lease_settings(
+    base: Any, doc: Any, *, mismatched: Any = ()
+) -> tuple[Any, dict, frozenset]:
     """``base`` with the lease's live settings applied (never persisted).
 
     Returns ``(settings, per-account thresholds, leader-disabled slots)``.
     Every field is validated on its own; a bad or missing one keeps the
-    box's value, so a malformed lease degrades to local settings."""
+    box's value, so a malformed lease degrades to local settings.
+    ``mismatched``: slots whose leader-side account is a different one here
+    (``Lease.identity_mismatch``); the leader's per-slot policy skips them."""
     from claude_swap.settings import (
         AUTOSWITCH_STRATEGIES,
         SETTING_SPECS,
@@ -187,9 +195,12 @@ def apply_lease_settings(base: Any, doc: Any) -> tuple[Any, dict, frozenset]:
     thresholds: dict[str, float | None] = {}
     disabled: set[str] = set()
     accounts = doc.get("accounts")
+    skip = {str(n) for n in mismatched or ()}
     if isinstance(accounts, dict):
         for num, entry in accounts.items():
             if not (isinstance(num, str) and num.isascii() and num.isdigit()):
+                continue
+            if num in skip:
                 continue
             if not isinstance(entry, dict):
                 continue
@@ -244,7 +255,9 @@ def worker_tick(backup_root: Path, base: Any, *, now: float) -> WorkerTick | Non
             frozenset(),
             lease,
         )
-    settings, thresholds, disabled = apply_lease_settings(base, lease.settings)
+    settings, thresholds, disabled = apply_lease_settings(
+        base, lease.settings, mismatched=getattr(lease, "identity_mismatch", ())
+    )
     target = None
     mode = lease.target_mode
     if mode in FOLLOW_MODES:
@@ -271,6 +284,7 @@ class EngineFleet:
         self.leader: FleetLeader | None = None
         self._leader_lock = threading.Lock()
         self.in_loop = False
+        self._leader_failed_logged = False
 
     # -- worker hooks (engine thread) ----------------------------------------
 
@@ -354,6 +368,15 @@ class EngineFleet:
             + (f" ({r.get('reason')})" if r.get("reason") else "")
         )
 
+    def cap_delay(self, delay: float, interval: float) -> float:
+        """Backstop for a missed wake: while a valid, unblocked lease holds,
+        the engine never sleeps past ``intervalSeconds`` (a BLOCKED or idle
+        crawl would otherwise sit out a leader's move for many minutes)."""
+        tick = self.tick
+        if tick is None or tick.mode == "fallback":
+            return delay
+        return min(delay, max(float(interval), 1.0))
+
     def warmup_suppressed(self) -> bool:
         """Following: the leader's engine warms the shared accounts."""
         tick = self.tick
@@ -407,18 +430,22 @@ class EngineFleet:
                 else:
                     reason = "error"
                     detail = getattr(last, "message", "") if last is not None else ""
+                transient = (
+                    outcome in (TickOutcome.ERROR, TickOutcome.BLOCKED)
+                    or reason in TRANSIENT_REFUSALS
+                )
                 self.refusal = {
                     "target": self._attempt,
                     "reason": reason,
                     "detail": detail,
                     "at": now,
-                    # A transient error retries next tick; a refusal waits.
-                    "retry_at": now if outcome is TickOutcome.ERROR else now + FOLLOW_RETRY_S,
+                    # A transient refusal retries next tick; a real one waits.
+                    "retry_at": now if transient else now + FOLLOW_RETRY_S,
                 }
         self.following = False
         self._attempt = None
         if self.in_loop:
-            self.ensure_leader()
+            self.ensure_leader()  # never raises
 
     def refusal_public(self) -> dict | None:
         r = self.refusal
@@ -434,7 +461,16 @@ class EngineFleet:
     # -- leader lifecycle ----------------------------------------------------
 
     def ensure_leader(self) -> None:
-        """Start the leader if this engine is live and hosts are configured."""
+        """Start the leader if this engine is live and hosts are configured.
+        Never raises: a leader that cannot start must not cost a tick."""
+        try:
+            self._ensure_leader()
+        except Exception as e:
+            log = _logger.debug if self._leader_failed_logged else _logger.warning
+            self._leader_failed_logged = True
+            log("fleet: leader start failed: %s", type(e).__name__)
+
+    def _ensure_leader(self) -> None:
         engine = self.engine
         if engine.dry_run or engine._stop.is_set() or self.leader is not None:
             return
@@ -476,17 +512,74 @@ class EngineFleet:
 # -- engine status `fleet` block --------------------------------------------------
 
 
+def effective_strategy(engine: Any) -> tuple[str, str] | None:
+    """``(strategy, source)`` when the fleet hook decided the engine's last
+    tick (``fleet-lease`` | ``fleet-fallback``); None = the engine's own."""
+    fleet = getattr(engine, "_fleet", None)
+    tick = fleet.tick if isinstance(fleet, EngineFleet) else None
+    if tick is None:
+        return None
+    strategy = getattr(tick.settings, "strategy", None)
+    if not isinstance(strategy, str):
+        return None
+    return strategy, ("fleet-fallback" if tick.mode == "fallback" else "fleet-lease")
+
+
+def _scrub_tree(value: Any) -> Any:
+    from claude_swap.engine_control import _scrub
+
+    if isinstance(value, str):
+        return _scrub(value)
+    if isinstance(value, list):
+        return [_scrub_tree(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _scrub_tree(v) for k, v in value.items()}
+    return value
+
+
+def _public_host_snapshot(snap: Any) -> dict | None:
+    """A worker's reply, fit for ``engine status``: its ``list --json`` rows
+    go through ``fleet_remote._account_rows`` (no email), every other string
+    through the email scrub. Same shape, so ``fleet_status`` reads it as is."""
+    if not isinstance(snap, dict):
+        return None
+    accounts = snap.get("accounts")
+    accounts_out: dict = {"accounts": _remote_mod()._account_rows(accounts)}
+    if isinstance(accounts, dict):
+        for key in ("schemaVersion", "activeAccountNumber", "error"):
+            if key in accounts:
+                accounts_out[key] = accounts[key]
+    out = {k: snap[k] for k in (
+        "contract", "host_time", "engine", "follow", "relogin", "settings_hash", "lease",
+    ) if k in snap}
+    out["accounts"] = accounts_out
+    return _scrub_tree(out)
+
+
+def public_leader_snapshot(leader: Any) -> dict:
+    """``leader.snapshot()`` with each host's reply made email-free."""
+    snap = leader.snapshot()
+    hosts = {
+        name: {**entry, "snapshot": _public_host_snapshot(entry.get("snapshot"))}
+        for name, entry in (snap.get("hosts") or {}).items()
+    }
+    return _scrub_tree({**snap, "hosts": hosts})
+
+
 def status_block(engine: Any, backup_root: Path, reply: dict | None) -> dict:
-    """``{"role", "leader", "follow", "refusal"}`` for ``engine status``."""
+    """``{"role", "leader", "follow", "refusal"}`` for ``engine status``.
+    Never carries an email: worker replies are scrubbed here."""
     fleet = getattr(engine, "_fleet", None)
     leader = getattr(fleet, "leader", None)
     refusal = fleet.refusal_public() if isinstance(fleet, EngineFleet) else None
     if leader is not None and leader.running:
-        return {"role": "leader", "leader": leader.snapshot(), "follow": None,
-                "refusal": None}
+        return {"role": "leader", "leader": public_leader_snapshot(leader),
+                "follow": None, "refusal": None}
     if has_lease_history(backup_root):
+        eng = reply.get("engine") if isinstance(reply, dict) else None
+        active = eng.get("active") if isinstance(eng, dict) else None
         try:
-            follow = _lease_mod().follow_state(Path(backup_root), reply)
+            follow = _lease_mod().follow_state(Path(backup_root), reply, active=active)
         except Exception as e:
             _logger.debug("fleet: follow_state failed: %r", e)
             follow = None
@@ -603,6 +696,7 @@ class FleetLeader:
         lease_mod = _lease_mod()
         self._seq += 1
         queued = 0
+        usage: dict | None = None  # one store-only list per round, built lazily
         names = {h.name for h in hosts}
         with self._lock:
             for gone in set(self._hosts) - names:
@@ -612,6 +706,8 @@ class FleetLeader:
                 if host.name in self._inflight:
                     continue  # still waiting on the last one: never pile up
             try:
+                if usage is None:
+                    usage = lease_mod.list_payload(self.switcher)
                 lease = lease_mod.build_lease(
                     self.switcher,
                     leader_id=self.leader_id,
@@ -619,6 +715,7 @@ class FleetLeader:
                     target=host_target(host, active),
                     settings=settings_doc,
                     ttl_s=lease_mod.DEFAULT_TTL_S,
+                    usage=usage,
                 )
             except Exception as e:
                 self._record(host.name, None, f"could not build lease ({type(e).__name__})")

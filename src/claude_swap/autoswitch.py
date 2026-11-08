@@ -1220,7 +1220,10 @@ class AutoSwitchEngine:
                 ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
             )
             outcome = TickOutcome.ERROR
-        self._fleet.end_tick(outcome)  # fork: fleet
+        try:  # fork: fleet -- never cost the tick its request callback
+            self._fleet.end_tick(outcome)
+        except Exception as e:
+            _logger.warning("fleet end-of-tick hook failed: %s", type(e).__name__)
         self._finish_switch_request(outcome)  # fork: engine_control
         # Warmup hellos spawn HERE, never inside the decision. A hello runs
         # the full ``setup_session`` preparation, whose consume gate rotates
@@ -1473,7 +1476,7 @@ class AutoSwitchEngine:
         # Every gate below reads `thresholds[...]`; the map is total, so an
         # account absent from it (never sequenced, just removed) reads the
         # global rather than raising mid-tick.
-        policies = self._fleet.policies(self.switcher.account_policies())  # fork
+        policies = self._fleet.policies(self.switcher.account_policies())  # fork: fleet
         thresholds = self._resolve_thresholds(settings, policies=policies)
         # Cadence follows the same snapshot, and does so BEFORE collection is
         # planned below — see `_refresh_poll_policy_inputs`.
@@ -4096,7 +4099,9 @@ class AutoSwitchEngine:
         and the BLOCKED/idle branches below can sleep for tens of minutes.
         The clamp only ever SHORTENS, and never below a second (a zero sleep
         would spin the loop)."""
-        delay = self._cadence_delay(outcome)
+        delay = self._fleet.cap_delay(  # fork: fleet -- backstop for a missed wake
+            self._cadence_delay(outcome), self.settings.interval_seconds
+        )
         if self._warm_deadline_ts is None:
             return delay
         return min(delay, max(self._warm_deadline_ts - self.clock(), 1.0))

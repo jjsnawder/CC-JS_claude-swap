@@ -1106,3 +1106,58 @@ class TestTuiHost:
             await settle(pilot)
             app.screen._on_manual_pick("2", [])
             assert _FakeEngine.instances[0].switch_targets == ["2"]
+
+
+# ---------------------------------------------------------------------------
+# wake (fork: fleet) -- `fleet receive` nudges the local engine
+# ---------------------------------------------------------------------------
+
+
+class _WakeableEngine(FakeEngine):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.woken = threading.Event()
+
+    def wake(self):
+        self.woken.set()
+
+
+class TestWake:
+    def test_wake_engine_reaches_a_running_engine(self, root, servers):
+        engine = _WakeableEngine()
+        _serve(root, servers, engine)
+        assert engine_control.wake_engine(root) is True
+        assert engine.woken.is_set()
+
+    def test_falls_back_to_the_wake_event(self, root, servers):
+        engine = FakeEngine()
+        engine._wake = threading.Event()
+        _serve(root, servers, engine)
+        assert engine_control.wake_engine(root) is True
+        assert engine._wake.is_set()
+
+    def test_no_engine_is_false(self, root):
+        assert engine_control.wake_engine(root) is False
+
+    def test_engine_without_wake_is_false(self, root, servers):
+        _serve(root, servers, FakeEngine())  # no wake(), no _wake: engine-error
+        assert engine_control.wake_engine(root) is False
+
+    def test_never_raises(self, root, monkeypatch):
+        def boom(*a, **k):
+            raise OSError("pipe")
+
+        monkeypatch.setattr(engine_control, "request", boom)
+        assert engine_control.wake_engine(root) is False
+
+    def test_default_timeout_is_short(self, root, monkeypatch):
+        seen = {}
+
+        def fake_request(backup_root, message, *, reply_timeout):
+            seen.update(message=message, timeout=reply_timeout)
+            return {"result": "woken"}
+
+        monkeypatch.setattr(engine_control, "request", fake_request)
+        assert engine_control.wake_engine(root) is True
+        assert seen == {"message": {"op": "wake"}, "timeout": engine_control.WAKE_TIMEOUT_S}
+        assert engine_control.WAKE_TIMEOUT_S <= 2.0

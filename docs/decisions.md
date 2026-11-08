@@ -608,3 +608,33 @@ rewriting upstream's switch line to carry the source (same, plus breaks the
 menubar parser).
 **Why it matters:** answers "who switched me?" from the log, which on
 2026-11-08 could not tell a TUI `m` from a Remote hub pick.
+
+## 2026-11-08 - A released manual pick does not arm the anti-undo bar (Jeremy)
+**Chose:** fork state key `lastSwitchPick`, written by `_perform` on every engine
+switch: True only for a targeted manual pick (TUI `m`, `cswap engine pick`) that
+is not a fleet-follow. While it is True, `_no_return_account` bars nothing, so
+once the hold is released (unpin, `u`, threshold, or a restart losing the
+session-only pin) consume-first may return to the account the pick left. The
+engine's own next switch writes False and re-arms the bar. Missing key (old
+state) = upstream behaviour.
+Jeremy, after the live test (#4 -m-> #3, unpin, stayed on #3): "The behavior I
+want is for it to go to 4."
+**Rejected:** reusing `leftTrigger` (reads "manual" for `n`, `m`, engine pick
+AND fleet-follow alike); disarming for `n` too (no pin protects an `n`, so the
+first consume-first tick after the cooldown would undo it every time);
+persisting the pin (state layout, the rebuilt-engine `pinned=` contract and the
+TUI, for a case only a second engine on the same store would hit); popping
+`lastSwitchFrom` on a pick (erases what `_left_account_recovered` reads).
+**Why it matters:** the bar now means "the engine won't undo its own move", not
+"never return to where the last switch came from". Accepted side effects: (1) a
+restart while holding a pick counts as a release; (2) a hand switch away and
+back onto the picked account no longer re-arms the bar; (3) a second engine on
+the same store (none today) would not respect the pick. The 300 s switch
+cooldown also does not apply while `lastSwitchPick` is True, so the release
+moves at once (Jeremy: "I want it to move right away"); the engine's own next
+switch restores the cooldown with the bar. Also accepted: a pick followed
+within 300 s by a switch outside the engine (`cswap switch`, accounts screen)
+leaves the engine free to move off that account at once (upstream's cooldown
+would have held for the rest of the 300 s), and the same for a full quit
+and relaunch of the engine within 300 s of a pick (TUI `s`/`l` rebuilds carry
+the pin, so they are unaffected).

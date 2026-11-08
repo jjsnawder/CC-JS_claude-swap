@@ -6,6 +6,9 @@ or a settings document) only ever travels on stdin as JSON, never through the
 remote shell. The worker-side verbs (``receive``, ``snapshot``, ``apply``)
 read stdin and print exactly one JSON object.
 
+``forget`` (worker, human or ``--json``) drops the stored lease so a box that
+left the fleet runs its own persisted strategy again.
+
 The lease format and the worker snapshot live in ``fleet_lease``; the leader
 thread lives in ``fleet_leader``. This module never moves credentials between
 boxes and never prints an email (accounts are slot numbers). See docs/fleet.md.
@@ -30,9 +33,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from claude_swap.fleet_lease import (  # noqa: F401 (LEASE_FILENAME re-exported)
+    FLEET_DIRNAME,
+    HOSTS_FILENAME,
+    LEASE_FILENAME,
+)
+
 CONTRACT = "cswap-fleet/1"
-HOSTS_FILENAME = "hosts.json"
-FLEET_DIRNAME = "fleet"
 DEFAULT_TIMEOUT = 20.0
 LOCAL_HOST_NAME = "local"
 MAX_WORKERS = 4
@@ -243,6 +250,20 @@ def save_hosts(backup_root: Path, hosts: list[Host]) -> None:
     )
 
 
+@contextlib.contextmanager
+def _hosts_lock(backup_root: Path):
+    """Serialize hosts.json read-modify-write (TUI and CLI may race); the
+    same FileLock helper ``fleet_lease.receive_lease`` uses."""
+    from claude_swap.exceptions import LockError
+    from claude_swap.locking import FileLock
+
+    try:
+        with FileLock(hosts_path(backup_root).parent / ".hosts.lock"):
+            yield
+    except LockError:
+        raise FleetError("busy", "hosts.json is locked by another cswap; retry") from None
+
+
 def find_host(hosts: list[Host], name: str) -> Host:
     for host in hosts:
         if host.name == name:
@@ -261,27 +282,30 @@ def add_host(
         alias=validate_alias(alias),
         command=validate_command(command),
     )
-    hosts = load_hosts(backup_root, strict=True)
-    if any(h.name == host.name for h in hosts):
-        raise FleetError("duplicate-host", f"a fleet host named {host.name!r} already exists")
-    save_hosts(backup_root, [*hosts, host])
+    with _hosts_lock(backup_root):
+        hosts = load_hosts(backup_root, strict=True)
+        if any(h.name == host.name for h in hosts):
+            raise FleetError("duplicate-host", f"a fleet host named {host.name!r} already exists")
+        save_hosts(backup_root, [*hosts, host])
     return host
 
 
 def remove_host(backup_root: Path, name: str) -> Host:
-    hosts = load_hosts(backup_root, strict=True)
-    host = find_host(hosts, name)
-    save_hosts(backup_root, [h for h in hosts if h is not host])
+    with _hosts_lock(backup_root):
+        hosts = load_hosts(backup_root, strict=True)
+        host = find_host(hosts, name)
+        save_hosts(backup_root, [h for h in hosts if h is not host])
     return host
 
 
 def set_override(backup_root: Path, name: str, override: dict) -> Host:
     """Persist one worker's override (``follow`` | ``pin`` | ``strategy``)."""
     normalized = normalize_override(override)
-    hosts = load_hosts(backup_root, strict=True)
-    host = find_host(hosts, name)
-    updated = Host(host.name, host.alias, host.command, normalized)
-    save_hosts(backup_root, [updated if h is host else h for h in hosts])
+    with _hosts_lock(backup_root):
+        hosts = load_hosts(backup_root, strict=True)
+        host = find_host(hosts, name)
+        updated = Host(host.name, host.alias, host.command, normalized)
+        save_hosts(backup_root, [updated if h is host else h for h in hosts])
     return updated
 
 
@@ -662,6 +686,7 @@ def _host_entry(
         "error": _scrub(error) if error else None,
         "state": "unknown",
         "reason": None,
+        "on_target": None,
         "lease_age_s": None,
         "active": None,
         "engine": None,
@@ -675,7 +700,9 @@ def _host_entry(
     if isinstance(snapshot, dict):
         follow = snapshot.get("follow") if isinstance(snapshot.get("follow"), dict) else {}
         settings_hash = snapshot.get("settings_hash")
+        on_target = follow.get("on_target")
         entry.update(
+            on_target=on_target if isinstance(on_target, bool) else None,
             state=follow.get("state") or "unknown",
             reason=_scrub(follow.get("reason")) if follow.get("reason") else None,
             lease_age_s=follow.get("lease_age_s"),
@@ -817,7 +844,7 @@ Exit codes:
     parser.add_argument("--json", action="store_true", help="Print one JSON object")
     sub = parser.add_subparsers(
         dest="action",
-        metavar="{hosts,status,push,override,receive,snapshot,apply}",
+        metavar="{hosts,status,push,override,forget,receive,snapshot,apply}",
     )
     sub.required = True
 
@@ -846,13 +873,18 @@ Exit codes:
     p_override.add_argument("mode", choices=OVERRIDE_MODES)
     p_override.add_argument("value", nargs="?", metavar="N|S")
 
+    p_forget = sub.add_parser(
+        "forget",
+        help="(worker) drop the stored lease: back to this box's own strategy",
+    )
     p_receive = sub.add_parser("receive", help="(worker) lease on stdin → snapshot")
     p_snapshot = sub.add_parser("snapshot", help="(worker) print this box's snapshot")
     p_apply = sub.add_parser("apply", help="(worker) settings document on stdin")
     p_apply.add_argument("source", nargs="?", default="-", choices=["-"], help="stdin")
     p_apply.add_argument("--dry-run", action="store_true", help="Report, write nothing")
 
-    for p in (p_add, p_remove, p_list, p_status, p_push, p_override, p_receive, p_snapshot, p_apply):
+    for p in (p_add, p_remove, p_list, p_status, p_push, p_override, p_forget,
+              p_receive, p_snapshot, p_apply):
         p.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
                        help="Print one JSON object")
     parser.set_defaults(_strategies=SELECTABLE_STRATEGIES)
@@ -870,6 +902,18 @@ def _read_stdin_json(stream) -> dict:
     if not isinstance(value, dict):
         raise FleetError("invalid-input", "stdin must hold a JSON object")
     return value
+
+
+def _wake_engine(backup_root: Path) -> bool:
+    """Best effort: nudge this box's running engine to tick now (a new or
+    dropped lease then takes effect within seconds). Never raises."""
+    try:
+        from claude_swap import engine_control
+
+        wake = getattr(engine_control, "wake_engine", None)
+        return bool(wake(Path(backup_root))) if callable(wake) else False
+    except Exception:
+        return False
 
 
 def _make_switcher():
@@ -890,6 +934,12 @@ def _status_human(doc: dict) -> str:
         parts.append(f"active #{h['active']}" if h.get("active") else "no active account")
         engine = h.get("engine") or {}
         parts.append("engine running" if engine.get("running") else "no engine")
+        if (
+            h.get("on_target") is False
+            and h.get("state") in ("following", "overridden")
+            and not str(h.get("reason") or "").startswith("strategy ")
+        ):
+            parts.append("not on target yet")
         if h.get("lease_age_s") is not None:
             parts.append(f"lease {h['lease_age_s']:.0f}s old")
         if h.get("relogin"):
@@ -1018,6 +1068,25 @@ def run(
                 payload = _lease().receive_lease(sw, data)
             except (ValueError, KeyError, TypeError) as e:
                 raise FleetError("invalid-lease", str(e)) from None
+            woken = _wake_engine(Path(sw.backup_dir))
+            if isinstance(payload, dict):
+                block = payload.get("lease")
+                if not isinstance(block, dict):
+                    block = payload["lease"] = {}
+                block["engine_woken"] = woken
+        elif action == "forget":
+            forget = getattr(_lease(), "forget_lease", None)
+            if not callable(forget):
+                raise FleetError("unsupported", "this cswap cannot forget a lease")
+            r = Path(switcher.backup_dir) if backup_root is None and switcher is not None else root()
+            forgot = bool(forget(r))
+            woken = _wake_engine(r) if forgot else False
+            payload = _payload(op, "forgotten" if forgot else "no-lease",
+                               forgot=forgot, engine_woken=woken)
+            human = (
+                "lease dropped: this box is back on its own strategy"
+                if forgot else "no lease stored: this box already runs its own strategy"
+            )
         elif action == "snapshot":
             sw = lazy_switcher()
             payload = _lease().build_snapshot(sw, Path(sw.backup_dir))

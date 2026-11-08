@@ -87,6 +87,8 @@ class StubLease:
         self.fingerprint = "fp-local"
         self.received = []
         self.receive_error = None
+        self.lease_stored = False
+        self.forgot = []
 
     @staticmethod
     def identity_hash(email, org_uuid, salt):
@@ -108,6 +110,11 @@ class StubLease:
             raise self.receive_error
         self.received.append(payload)
         return {"contract": fr.CONTRACT, "follow": {"state": "following"}}
+
+    def forget_lease(self, backup_root):
+        self.forgot.append(backup_root)
+        had, self.lease_stored = self.lease_stored, False
+        return had
 
 
 @pytest.fixture
@@ -221,6 +228,78 @@ class TestHosts:
             {"alias": "worker-a"}, {"alias": "bad alias"}, {"alias": "worker-a"},
         ]}))
         assert [h.name for h in fr.load_hosts(tmp_path)] == ["worker-a"]
+
+
+class TestHostsLock:
+    def test_constants_come_from_fleet_lease(self):
+        assert fr.FLEET_DIRNAME == real_lease.FLEET_DIRNAME
+        assert fr.LEASE_FILENAME == real_lease.LEASE_FILENAME
+        assert fr.HOSTS_FILENAME == real_lease.HOSTS_FILENAME
+        assert fr.hosts_path(Path("r")) == Path("r") / real_lease.FLEET_DIRNAME / fr.HOSTS_FILENAME
+
+    def test_every_mutator_takes_the_lock(self, tmp_path, monkeypatch):
+        import claude_swap.locking as locking
+
+        real = locking.FileLock
+        entered = []
+
+        class Recording(real):
+            def __enter__(self):
+                entered.append(Path(self.lock_path))
+                return super().__enter__()
+
+        monkeypatch.setattr(locking, "FileLock", Recording)
+        fr.add_host(tmp_path, "worker-a")
+        fr.set_override(tmp_path, "worker-a", {"mode": "pin", "account": "2"})
+        fr.remove_host(tmp_path, "worker-a")
+        lock = tmp_path / real_lease.FLEET_DIRNAME / ".hosts.lock"
+        assert entered == [lock, lock, lock]
+
+    def test_locked_hosts_file_is_busy(self, tmp_path, monkeypatch):
+        import claude_swap.locking as locking
+        from claude_swap.exceptions import LockError
+
+        fr.add_host(tmp_path, "worker-a")
+
+        class Held:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                raise LockError("held")
+
+            def __exit__(self, *a):
+                return None
+
+        monkeypatch.setattr(locking, "FileLock", Held)
+        with pytest.raises(fr.FleetError) as e:
+            fr.set_override(tmp_path, "worker-a", {"mode": "pin", "account": "2"})
+        assert e.value.code == "busy"
+
+    def test_concurrent_overrides_lose_nothing(self, tmp_path):
+        import threading
+
+        names = [f"worker-{i}" for i in range(6)]
+        for n in names:
+            fr.add_host(tmp_path, n)
+        barrier = threading.Barrier(len(names))
+        errors = []
+
+        def one(i, n):
+            try:
+                barrier.wait(timeout=5)
+                fr.set_override(tmp_path, n, {"mode": "pin", "account": str(i + 1)})
+            except Exception as e:  # pragma: no cover - surfaced below
+                errors.append(e)
+
+        threads = [threading.Thread(target=one, args=(i, n)) for i, n in enumerate(names)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        assert not errors
+        got = {h.name: h.override.get("account") for h in fr.load_hosts(tmp_path, strict=True)}
+        assert got == {n: str(i + 1) for i, n in enumerate(names)}
 
 
 class TestOverride:
@@ -518,6 +597,29 @@ class TestFleetStatus:
         assert new["source"] == "pull" and new["reachable"]
         assert [c[0][5] for c in runner.calls] == ["worker-new"]
 
+    def test_on_target_from_follow_block(self, tmp_path, lease):
+        _hosts(tmp_path, "worker-a", "worker-b", "worker-c")
+        off = _snap(active=4)
+        off["follow"]["on_target"] = False
+        on = _snap(active=2)
+        on["follow"]["on_target"] = True
+        runner = FakeRunner({
+            "worker-a": _ok(off), "worker-b": _ok(on), "worker-c": _ok(_snap()),
+        })
+        doc = fr.fleet_status(FakeSwitcher(tmp_path), tmp_path, leader_snapshot=None, runner=runner)
+        local, a, b, c = doc["hosts"]
+        assert a["on_target"] is False and b["on_target"] is True
+        assert c["on_target"] is None  # an older worker: unknown, not judged
+        assert local["on_target"] is None
+        lines = fr._status_human(doc).splitlines()
+        assert lines[1].startswith("worker-a: following") and "not on target yet" in lines[1]
+        assert "not on target" not in lines[2]
+        strat = _snap(active=4, state="overridden")
+        strat["follow"].update(reason="strategy best", on_target=False)
+        doc = fr.fleet_status(FakeSwitcher(tmp_path), tmp_path, leader_snapshot=None,
+                              runner=FakeRunner(default=_ok(strat)))
+        assert "not on target" not in fr._status_human(doc)  # a strategy has no target
+
     def test_local_snapshot_failure_is_data(self, tmp_path, lease, monkeypatch):
         def boom(*a, **k):
             raise RuntimeError("x")
@@ -633,6 +735,69 @@ class TestCli:
                        stdin=io.StringIO(json.dumps(body)))
         assert rc == 0 and json.loads(out)["follow"]["state"] == "following"
         assert lease.received == [body]
+
+    def test_receive_wakes_engine(self, tmp_path, capsys, lease, monkeypatch):
+        from claude_swap import engine_control
+
+        calls = []
+        monkeypatch.setattr(engine_control, "wake_engine",
+                            lambda root: calls.append(root) or True, raising=False)
+        body = {"contract": fr.CONTRACT, "leader": {"id": "L"}}
+        rc, out = _run(capsys, ["receive"], switcher=FakeSwitcher(tmp_path),
+                       stdin=io.StringIO(json.dumps(body)))
+        assert rc == 0 and json.loads(out)["lease"]["engine_woken"] is True
+        assert calls == [tmp_path]
+
+    def test_receive_wake_failure_is_best_effort(self, tmp_path, capsys, lease, monkeypatch):
+        from claude_swap import engine_control
+
+        def boom(root):
+            raise OSError("pipe gone")
+
+        monkeypatch.setattr(engine_control, "wake_engine", boom, raising=False)
+        monkeypatch.setattr(
+            lease, "receive_lease",
+            lambda sw, payload, now=None: {"follow": {"state": "following"},
+                                           "lease": {"accepted": True, "seq": 3}},
+        )
+        rc, out = _run(capsys, ["receive"], switcher=FakeSwitcher(tmp_path),
+                       stdin=io.StringIO("{}"))
+        block = json.loads(out)["lease"]
+        assert rc == 0 and block == {"accepted": True, "seq": 3, "engine_woken": False}
+
+    def test_receive_invalid_does_not_wake(self, tmp_path, capsys, lease, monkeypatch):
+        from claude_swap import engine_control
+
+        calls = []
+        monkeypatch.setattr(engine_control, "wake_engine",
+                            lambda root: calls.append(root) or True, raising=False)
+        lease.receive_error = ValueError("bad")
+        rc, _ = _run(capsys, ["receive"], switcher=FakeSwitcher(tmp_path),
+                     stdin=io.StringIO("{}"))
+        assert rc == 1 and calls == []
+
+    def test_forget(self, tmp_path, capsys, lease, monkeypatch):
+        from claude_swap import engine_control
+
+        calls = []
+        monkeypatch.setattr(engine_control, "wake_engine",
+                            lambda root: calls.append(root) or True, raising=False)
+        lease.lease_stored = True
+        rc, out = _run(capsys, ["forget", "--json"], backup_root=tmp_path)
+        doc = json.loads(out)
+        assert rc == 0 and doc["op"] == "forget" and doc["result"] == "forgotten"
+        assert doc["forgot"] is True and doc["engine_woken"] is True
+        assert lease.forgot == [tmp_path] and calls == [tmp_path]
+        rc, out = _run(capsys, ["forget", "--json"], backup_root=tmp_path)
+        doc = json.loads(out)
+        assert rc == 0 and doc["result"] == "no-lease" and doc["forgot"] is False
+        assert doc["engine_woken"] is False and calls == [tmp_path]
+        rc, out = _run(capsys, ["forget"], backup_root=tmp_path)
+        assert rc == 0 and "no lease stored" in out
+        lease.lease_stored = True
+        rc, out = _run(capsys, ["forget"], switcher=FakeSwitcher(tmp_path))
+        assert rc == 0 and "back on its own strategy" in out
+        assert lease.forgot[-1] == tmp_path
 
     def test_receive_invalid(self, tmp_path, capsys, lease):
         lease.receive_error = ValueError("ttl out of range for a@example.test")

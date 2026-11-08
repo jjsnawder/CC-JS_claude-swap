@@ -144,6 +144,30 @@ class TestHelpers:
             == "strategy best"
         )
 
+    def test_target_slot(self):
+        follow = _entry(active="4")
+        assert fleetview.target_slot(follow, "2") == "2"
+        assert fleetview.target_slot(follow, None) is None
+        pinned = _entry(state="overridden", reason="pin 3",
+                        override={"mode": "pin", "account": "5", "strategy": None})
+        assert fleetview.target_slot(pinned, "2") == "3"  # the worker's own lease wins
+        saved = _entry(state="overridden", reason=None,
+                       override={"mode": "pin", "account": "5", "strategy": None})
+        assert fleetview.target_slot(saved, "2") == "5"
+        strat = _entry(state="overridden", reason="strategy best",
+                       override={"mode": "strategy", "account": None, "strategy": "best"})
+        assert fleetview.target_slot(strat, "2") is None
+        assert fleetview.target_slot(_entry(state="autonomous"), "2") is None
+
+    def test_off_target(self):
+        assert fleetview._off_target(_entry(active="4", on_target=False), "2")
+        assert not fleetview._off_target(_entry(active="4", on_target=True), "2")
+        # an older worker without on_target: judged by the active slot
+        assert fleetview._off_target(_entry(active="4"), "2")
+        assert not fleetview._off_target(_entry(active="2"), "2")
+        assert not fleetview._off_target(_entry(state="autonomous", on_target=False), "2")
+        assert not fleetview._off_target(_entry(on_target=False), None)
+
     def test_format_push_result(self):
         body = fleetview.format_push_result(Stubs().push_result)
         assert "autoswitch.threshold: 90.0 -> 85.0" in body
@@ -225,6 +249,20 @@ class TestHostsScreen:
             w1, w2 = _rows(app)
             assert "unreachable" in w1 and "timeout after 20s" in w1
             assert "overridden: pin 3" in w2
+
+    async def test_off_target_row_shows_target(self, tmp_path, stubs):
+        doc = _doc(
+            _entry(active="4", on_target=False),
+            _entry("w2", active="2", on_target=True),
+        )
+        doc["hosts"][0]["active"] = "2"
+        stubs.doc = doc
+        app = make_app(_fake(tmp_path))
+        async with app.run_test(size=(140, 36)) as pilot:
+            await _open(pilot)
+            w1, w2 = _rows(app)
+            assert "active 4 → 2" in w1
+            assert "active 2" in w2 and "→" not in w2
 
     async def test_leading_uses_leader_snapshot_without_ssh(self, tmp_path, stubs):
         stubs.leader_snap = {"leader_id": "abc", "hosts": {}}

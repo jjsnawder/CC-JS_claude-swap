@@ -11,7 +11,10 @@ box stops leading, the lease expires and each worker runs its own engine with
 
 Nothing moves credentials between boxes. Each box keeps its own logins; slot numbers are
 expected to mean the same account on every box, and that is **checked** with salted identity
-hashes (no emails on the wire), never trusted.
+hashes, never trusted. Emails **do** travel inside the ssh payloads between your own boxes
+(the lease carries the dev box's `list --json` rows, because importing usage matches accounts
+on them; the worker's snapshot reply carries its rows back). They are stripped from everything
+printed for a consumer: `fleet status` and `engine status` output carry slot numbers only.
 
 ## Setup
 
@@ -19,7 +22,9 @@ On every worker: the fork installed, every account logged in under the same slot
 `cswap auto` running permanently (see the example unit below).
 
 On the dev box, one ssh alias per worker in `~/.ssh/config` with key auth (cswap always runs
-ssh with `BatchMode=yes`, so a password prompt is a failure, never a hang). Then:
+ssh with `BatchMode=yes`, so a password prompt is a failure, never a hang). `hosts add`,
+`hosts remove` and `override` (CLI or the TUI Hosts screen) rewrite `hosts.json` under a file
+lock, so two of them at once never lose each other's change. Then:
 
 ```
 cswap fleet hosts add worker-a                       # name defaults to the alias
@@ -42,12 +47,24 @@ remote command is split like a shell would (`shlex`) and each word must be a pla
 | `cswap fleet status [--json]` | dev box | every host in one view (the contract below) |
 | `cswap fleet push [--host NAME] [--dry-run] [--json]` | dev box | write the dev box's settings + per-account policy to workers |
 | `cswap fleet override HOST follow\|pin N\|strategy S` | dev box | per-worker override, kept until changed |
+| `cswap fleet forget [--json]` | worker | drop the stored lease: a box that left the fleet goes back to its own persisted strategy |
 | `cswap fleet receive` | worker | lease on stdin → snapshot on stdout (the leader calls this) |
 | `cswap fleet snapshot` | worker | print this box's snapshot |
 | `cswap fleet apply [-] [--dry-run]` | worker | settings document on stdin → what changed |
 
 Every verb takes `--json`. `receive`, `snapshot` and `apply` are machine verbs: they always
 print exactly one JSON object.
+
+`receive` stores the lease and then wakes this box's running engine (best effort), so the
+worker acts on it within seconds instead of at its next tick; the reply's `lease` block says
+whether that worked (`"engine_woken": true|false`).
+
+`forget` removes the stored lease under the lease lock and wakes the engine the same way. With
+no lease history the box is no longer a worker: no follow and no `fleet.fallbackStrategy`, just
+its own persisted `autoswitch.strategy`. It exits 0 either way; `--json` prints
+`{"op": "forget", "result": "forgotten"|"no-lease", "forgot": bool, "engine_woken": bool}`.
+If the dev box still lists the host and leads, its next heartbeat makes it a worker again:
+remove it there too (`fleet hosts remove`).
 
 ### Transport
 
@@ -56,6 +73,21 @@ shell-quoted for the remote shell. A payload (lease, settings document) travels 
 stdin** as JSON; nothing from it is ever put on a command line. Timeouts, ssh failures (exit
 255), a nonzero remote exit and a reply that is not one JSON object are all reported as errors
 for that host; they never stop the other hosts.
+
+### Timing
+
+- **Heartbeat:** the leading dev box sends every worker a fresh lease every
+  `min(autoswitch.intervalSeconds, ttl / 3)` seconds (60 s with the defaults), and
+  immediately after every switch on the dev box.
+- **Lease lifetime:** `ttl_s` is 180 s by default (a worker accepts 30-900 s), counted on the
+  **worker's** clock from when it received the lease, so clock skew between boxes does not
+  matter.
+- **Fallback:** a worker falls back to `fleet.fallbackStrategy` about `ttl_s` after the last
+  heartbeat it received (dev box stopped leading, went to sleep, or lost the network).
+- **Follow latency:** `fleet receive` wakes the worker's engine, so it follows within seconds
+  rather than at its own next tick.
+- **ssh:** `ConnectTimeout=5`, and 20 s per call overall. Hosts are contacted in parallel; a
+  hung host is skipped for that round and never delays the others.
 
 ### Overrides
 
@@ -90,6 +122,30 @@ never silently overwritten: pushing is always on command.
 |---|---|---|
 | `fleet.fallbackStrategy` | `consume-first-reserve-jj` | worker strategy while no lease is valid (only once a lease was ever received; a box with no fleet history behaves exactly as without this feature) |
 
+`cswap config` lists `fleet.fallbackStrategy` on **every** box, fleet or not; it has no effect
+until the box has received a lease.
+
+## `cswap engine status`: the `fleet` block
+
+`engine status` (contract `cswap-engine/0.1`, unchanged) always carries an additive top-level
+`fleet` block, also on a box with no fleet:
+
+```json
+"fleet": {"role": "none" | "leader" | "worker", "leader": {...} | null,
+          "follow": {...} | null, "refusal": {...} | null}
+```
+
+`role: leader` while this box's engine leads; `leader` then carries its per-host snapshots
+(what `fleet status` reads). `role: worker` once the box has a stored lease (live or expired);
+`follow` is then its follow state (as in a snapshot, including `on_target`) and `refusal` the
+target it last refused to follow, if any. `role: none` otherwise: no hosts led and no lease
+history (never received one, or `fleet forget`). Like `fleet status`, it carries no emails.
+
+`engine.strategy_source` says where the engine's current strategy came from: `settings`
+(the persisted `autoswitch.strategy`), `session` (changed for this run only), `fleet-lease`
+(a live lease's strategy override), or `fleet-fallback` (a worker with no valid lease, running
+`fleet.fallbackStrategy`).
+
 ## Contract `cswap-fleet/1`: `cswap fleet status --json`
 
 ```json
@@ -101,7 +157,7 @@ never silently overwritten: pushing is always on command.
     {
       "name": "local", "alias": null, "local": true, "source": "local",
       "reachable": true, "error": null,
-      "state": "leading", "reason": null, "lease_age_s": null,
+      "state": "leading", "reason": null, "on_target": null, "lease_age_s": null,
       "active": "2",
       "engine": {"running": true, "result": "running", "...": "engine status fields"},
       "accounts": [{"number": "1", "active": false, "usageStatus": "ok", "usage": {}}],
@@ -124,6 +180,7 @@ Field list (per host; the dev box is always first, named `local`):
 | `error` | str\|null | why not reachable (timeout, ssh error, remote exit) |
 | `state` | `leading`\|`following`\|`overridden`\|`autonomous`\|`unknown` | `leading` only for `local` with a live leader; `unknown` when unreachable |
 | `reason` | str\|null | why autonomous / blocked (e.g. `identity-mismatch`, `lease-expired`) |
+| `on_target` | bool\|null | the worker's active slot is its live lease's follow/pin target (from its snapshot's `follow` block). `false` while it has not switched yet, and always under a strategy override (no target); null when unknown (unreachable, `local`, or an older worker build) |
 | `lease_age_s` | number\|null | seconds since the worker received its lease (worker clock) |
 | `active` | str\|null | active slot number |
 | `engine` | object\|null | `running`, `result`, plus the host's `engine status` fields |
@@ -156,11 +213,22 @@ Same table as `cswap-engine/0.1` where they apply:
 Errors with `--json` print `{"contract": "cswap-fleet/1", "op", "result": "error", "error":
 <code>, "message"}`. Codes: `invalid-host`, `duplicate-host`, `unknown-host`, `invalid-hosts`,
 `invalid-override`, `invalid-input`, `invalid-lease`, `invalid-document`, `no-hosts`,
-`push-failed` (with per-host results in `hosts`), `internal`.
+`busy` (`hosts.json` locked by another cswap for over 10 s),
+`push-failed` (with per-host results in `hosts`), `unsupported`, `internal`.
+
+## TUI: the Hosts screen
+
+`h` on the dashboard (only when hosts are configured) opens one row per worker: follow state,
+active slot, lease age, re-login slots, drift, and keys for `f` follow / `p` pin / `s` strategy
+/ `u` push / `r` refresh over ssh. A worker following (or pinned) but not yet on its target
+shows the target next to its active slot, e.g. `active 4 → 2`.
 
 ## Running a worker's engine permanently (example)
 
-An example systemd **user** unit; installing and enabling it is a deliberate step per worker.
+A worker only follows while its own engine runs, so on a worker `cswap auto` runs
+permanently. Below is an **example** systemd user unit; the paths are generic (adjust
+`ExecStart` to where cswap is installed on that box). Installing it is the operator's
+provisioning step per worker: cswap never installs or enables a unit itself.
 
 ```ini
 # ~/.config/systemd/user/cswap-auto.service
@@ -176,5 +244,9 @@ RestartSec=30
 WantedBy=default.target
 ```
 
-`systemctl --user daemon-reload && systemctl --user enable --now cswap-auto`, plus
-`loginctl enable-linger <user>` so it runs without a login session.
+`systemctl --user daemon-reload && systemctl --user enable --now cswap-auto`. A user unit
+only runs while that user has a session unless lingering is on: it **needs**
+`loginctl enable-linger <user>` (once, as root) to start at boot and survive logout.
+
+Leaving the fleet: `fleet hosts remove NAME` on the dev box, then `cswap fleet forget` on the
+worker (otherwise it runs `fleet.fallbackStrategy` until forgotten).

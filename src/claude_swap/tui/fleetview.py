@@ -166,8 +166,43 @@ def _state_label(entry: dict) -> tuple[str, str]:
     return (f"{state} ({reason})" if reason else state), "muted"
 
 
-def host_row_text(entry: dict, *, leading: bool, palette: Palette) -> Text:
-    """Two lines per worker: state at a glance, then override/health detail."""
+def target_slot(entry: dict, local_active: str | None) -> str | None:
+    """The slot this worker is meant to be on, or None (strategy / unknown).
+
+    A pin override names it (the worker's ``pin N`` reason when it reports
+    one, else the saved override); ``following`` means the dev box's active."""
+    state = entry.get("state")
+    if state == "overridden":
+        reason = str(entry.get("reason") or "")
+        if reason.startswith("pin "):
+            return reason[4:].strip() or None
+        override = entry.get("override") or {}
+        if override.get("mode") == "pin" and override.get("account") is not None:
+            return str(override["account"])
+        return None
+    if state == "following" and local_active is not None:
+        return str(local_active)
+    return None
+
+
+def _off_target(entry: dict, target: str | None) -> bool:
+    if target is None or entry.get("state") not in ("following", "overridden"):
+        return False
+    on_target = entry.get("on_target")
+    if isinstance(on_target, bool):
+        return not on_target
+    # An older worker reports no on_target: judge by the active slot.
+    active = entry.get("active")
+    return active is not None and str(active) != target
+
+
+def host_row_text(
+    entry: dict, *, leading: bool, palette: Palette, local_active: str | None = None
+) -> Text:
+    """Two lines per worker: state at a glance, then override/health detail.
+
+    A worker following (or pinned) but not yet on its target shows
+    ``active 4 → 2`` (current → target)."""
     text = Text()
     text.append(f"{entry.get('name') or '?':<16}", style=f"bold {palette.foreground}")
     if not entry.get("reachable"):
@@ -180,6 +215,9 @@ def host_row_text(entry: dict, *, leading: bool, palette: Palette) -> Text:
         text.append(f"{label:<28}", style=getattr(palette, role))
         active = entry.get("active")
         text.append(f"  active {active if active is not None else '?'}", style=palette.foreground)
+        target = target_slot(entry, local_active)
+        if _off_target(entry, target):
+            text.append(f" → {target}", style=palette.sev_warn)
         age = entry.get("lease_age_s")
         if isinstance(age, (int, float)):
             text.append(f"  lease {format_duration(max(0.0, age))}", style=palette.muted)
@@ -466,9 +504,20 @@ class HostsScreen(Screen):
                 )
             )
             return
+        local = next(
+            (h for h in (self._doc or {}).get("hosts") or [] if isinstance(h, dict) and h.get("local")),
+            {},
+        )
+        local_active = local.get("active")
         options.add_options(
             [
-                Option(host_row_text(e, leading=self._leading, palette=palette), id=e["name"])
+                Option(
+                    host_row_text(
+                        e, leading=self._leading, palette=palette,
+                        local_active=str(local_active) if local_active is not None else None,
+                    ),
+                    id=e["name"],
+                )
                 for e in self._entries
             ]
         )

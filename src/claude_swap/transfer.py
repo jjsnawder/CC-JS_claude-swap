@@ -677,6 +677,23 @@ def import_usage(
         text = in_path.read_text(encoding="utf-8")
 
     document = _parse_payload(text, "usage document")
+    import_usage_document(switcher, document, hold_s=hold_s)
+
+
+def import_usage_document(
+    switcher: ClaudeAccountSwitcher,
+    document: dict,
+    hold_s: float | None = None,
+    *,
+    quiet: bool = False,
+) -> set[str]:
+    """:func:`import_usage` on an already-parsed document; returns adopted slots.
+
+    ``quiet`` drops the per-account stderr lines (they name emails), for
+    callers whose stderr travels off the box (``cswap fleet receive``).
+    Raises TransferError as :func:`import_usage` does, before writing anything.
+    """
+    _say = (lambda _msg: None) if quiet else _eprint
     version = document.get("schemaVersion")
     if version != JSON_SCHEMA_VERSION:
         raise TransferError(
@@ -732,9 +749,9 @@ def import_usage(
     adopted = switcher._usage_store.adopt(readings, identities, hold_s=hold_s)
     for num, (email, _org_uuid) in identities.items():
         if num in adopted:
-            _eprint(f"Adopted usage for {email} → slot {num}")
+            _say(f"Adopted usage for {email} → slot {num}")
         else:
-            _eprint(f"Kept slot {num}'s own reading for {email}: it is newer")
+            _say(f"Kept slot {num}'s own reading for {email}: it is newer")
     summary = (
         f"Done: {len(adopted)} adopted, {len(readings) - len(adopted)} kept, "
         f"{skipped} skipped"
@@ -743,4 +760,5 @@ def import_usage(
         summary += (
             f"; fetching held for up to {hold_s:.0f}s" if hold_s > 0 else "; holds lifted"
         )
-    _eprint(summary)
+    _say(summary)
+    return adopted

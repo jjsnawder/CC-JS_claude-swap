@@ -516,7 +516,7 @@ class ControlServer:
         pinned = getattr(engine, "pinned", None)
         with self._lock:
             pick_pending = self._inflight is not None
-        return _payload(
+        reply = _payload(  # fork: fleet -- named so the fleet block can read it
             "status",
             "running",
             engine={
@@ -536,6 +536,16 @@ class ControlServer:
                 "last_tick_at": _iso(getattr(engine, "last_tick_at", None)),
             },
         )
+        # fork: fleet -- additive; the contract string stays cswap-engine/0.1.
+        try:
+            from claude_swap.fleet_leader import status_block
+
+            reply["fleet"] = status_block(engine, self.backup_root, reply)
+        except Exception as e:
+            _logger.debug("fleet status block failed: %s", type(e).__name__)
+            reply["fleet"] = {"role": "none", "leader": None, "follow": None,
+                              "refusal": None}
+        return reply
 
     def _pick(self, target: str, timeout: float) -> dict:
         if not target.isdigit():

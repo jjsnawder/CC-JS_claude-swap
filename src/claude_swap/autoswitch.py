@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import ClassVar
 
 from claude_swap import oauth, poll_policy, warmup
+from claude_swap.fleet_leader import EngineFleet, FleetLeader  # fork: fleet
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.lines import BindingWindow, binding_window, window_line
@@ -996,6 +997,8 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        # fork: fleet -- worker follow + dev-box leader (fleet_leader.py)
+        self._fleet = EngineFleet(self)
 
     # -- state file ---------------------------------------------------------
 
@@ -1217,6 +1220,7 @@ class AutoSwitchEngine:
                 ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
             )
             outcome = TickOutcome.ERROR
+        self._fleet.end_tick(outcome)  # fork: fleet
         self._finish_switch_request(outcome)  # fork: engine_control
         # Warmup hellos spawn HERE, never inside the decision. A hello runs
         # the full ``setup_session`` preparation, whose consume gate rotates
@@ -1398,7 +1402,7 @@ class AutoSwitchEngine:
         self._warm_off = False
         self._blocked_wait_long = False
         self._idle_hold_slow = False
-        settings = self.settings
+        settings = self._fleet.begin_tick(self.settings)  # fork: fleet
         priority_mode = settings.strategy == "priority-consume-first"
         state = self._read_state()
         if not self.dry_run:
@@ -1426,6 +1430,12 @@ class AutoSwitchEngine:
             and self._pinned != current
         ):
             self._pinned = None  # moved off the manual pick: hold released
+        if not manual and current is not None and (  # fork: fleet
+            follow := self._fleet.follow_target(current)
+        ) is not None:
+            # A valid lease's follow/pin target rides the `m` path below.
+            manual, target = True, follow
+            self._tick_target = target
         if current is None:
             self._emit(
                 PollEvent(
@@ -1463,7 +1473,7 @@ class AutoSwitchEngine:
         # Every gate below reads `thresholds[...]`; the map is total, so an
         # account absent from it (never sequenced, just removed) reads the
         # global rather than raising mid-tick.
-        policies = self.switcher.account_policies()
+        policies = self._fleet.policies(self.switcher.account_policies())  # fork
         thresholds = self._resolve_thresholds(settings, policies=policies)
         # Cadence follows the same snapshot, and does so BEFORE collection is
         # planned below — see `_refresh_poll_policy_inputs`.
@@ -1563,6 +1573,11 @@ class AutoSwitchEngine:
                         )
                     )
                     return TickOutcome.NO_ACTION
+                if not manual and (  # fork: fleet -- the leader moves this box
+                    held := self._fleet.hold_detail(current, over=False)
+                ):
+                    self._emit(NoSwitchEvent(reason="fleet-follow", detail=held))
+                    return TickOutcome.NO_ACTION
                 if self._pinned == current and not manual:
                     # Manual pick (`m`): hold it until the threshold instead
                     # of the consume-first nudge below. Escapes never get here.
@@ -1589,6 +1604,11 @@ class AutoSwitchEngine:
                 self._pinned = None  # threshold reached: the hold is over
                 # Exhaustion is physical: at-limit reads the raw headroom.
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
+                if trigger == "proactive" and not manual and (  # fork: fleet
+                    held := self._fleet.hold_detail(current, over=True)
+                ):
+                    self._emit(NoSwitchEvent(reason="fleet-follow", detail=held))
+                    return TickOutcome.NO_ACTION
         elif manual:
             # The user asked to move NOW, so neither piece of unknown-usage
             # bookkeeping applies: no idle-hold nap (its whole point is that
@@ -1668,7 +1688,9 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         # -- candidate selection ------------------------------------------
-        switchable = self.switcher.switchable_account_numbers()
+        switchable = self._fleet.switchable(  # fork: fleet
+            self.switcher.switchable_account_numbers()
+        )
         candidates = [
             num
             for num in switchable
@@ -3235,7 +3257,10 @@ class AutoSwitchEngine:
                 # meanwhile-still-cold row from being re-pinged every tick.
                 refetch.add(number)
 
-        enabled = bool(self.settings.warmup_enabled) or warm_request
+        enabled = (
+            bool(self.settings.warmup_enabled)
+            and not self._fleet.warmup_suppressed()  # fork: fleet
+        ) or warm_request
         # Switched off is a STANDING state the panel should show as "off";
         # a session-shell refusal is a condition of this process, not a
         # statement that nothing is planned — recorded before that check so
@@ -3738,7 +3763,7 @@ class AutoSwitchEngine:
             current_email = self.switcher.account_email(current) if current else ""
             self._emit(
                 SwitchEvent(
-                    trigger=trigger,
+                    trigger=self._fleet.event_trigger(trigger),  # fork: fleet
                     from_ref=_ref(current, current_email) if current else None,
                     to_ref=_ref(number, email),
                     dry_run=True,
@@ -3795,7 +3820,7 @@ class AutoSwitchEngine:
             atomic_write_json(self.state_path, state)
 
         note = ""
-        if trigger == "manual":
+        if trigger == "manual" and not self._fleet.following:  # fork: fleet
             # Live manual switch: `m` pins its target (held until the
             # threshold); `n` (no target) replaces any earlier pin with none.
             self._pinned = self._tick_target
@@ -3807,6 +3832,10 @@ class AutoSwitchEngine:
                 # the unhealthy ticks, so a "holding #N" would be a lie.
                 self._pinned = None
                 note = "API-key account: not held (no quota to measure)"
+        if fleet_note := self._fleet.after_switch(  # fork: fleet (+ leader kick)
+            (result.get("from") or {}).get("number"), trigger
+        ):
+            trigger, note = "fleet", fleet_note
         departure = _reserve_departure_note(
             (result.get("from") or {}).get("number"), reserve_accounts(self.settings)
         )
@@ -3957,6 +3986,7 @@ class AutoSwitchEngine:
         exits immediately (engines are single-use)."""
         self._stop.set()
         self._wake.set()
+        self._fleet.stop_leader()  # fork: fleet
 
     def wake(self) -> None:
         """Cut the current inter-tick sleep short and tick now."""
@@ -4027,6 +4057,11 @@ class AutoSwitchEngine:
         Session-only; pass it as ``pinned=`` to a rebuilt engine to carry it
         over (the TUI's `s`/`l` restarts)."""
         return self._pinned
+
+    @property
+    def fleet_leader(self) -> "FleetLeader | None":  # fork: fleet
+        """The running leader (kick/snapshot), or None when not leading."""
+        return self._fleet.leader
 
     def request_warm(self) -> None:
         """One-shot "ping/warm now" request from the TUI's `p`.
@@ -4119,12 +4154,15 @@ class AutoSwitchEngine:
 
     def run_loop(self) -> int:
         """Tick forever (until :meth:`stop`); a failing tick never kills it."""
+        self._fleet.in_loop = True  # fork: fleet -- a live loop may lead
+        self._fleet.ensure_leader()  # fork: fleet
         while True:
             # Clear at the top, not after the wait: a wake() racing a wait
             # timeout is then never lost — the tick right after this clear
             # already sees whatever settings that wake announced.
             self._wake.clear()
             if self._stop.is_set():
+                self._fleet.stop_leader()  # fork: fleet
                 return 0
             try:
                 outcome = self.tick()

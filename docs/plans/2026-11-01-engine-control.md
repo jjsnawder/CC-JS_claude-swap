@@ -85,6 +85,19 @@ pending is answered `refused` / `reason: "busy"`. Two engines running at once
   answering `engine-error` with no switch event. On any exit 1 or 4 after a
   pick, read `status` before acting.
 
+**Fleet additions (2026-11-07, `docs/plans/2026-11-07-fleet-follow.md`; contract string unchanged)**
+- `status` replies carry an additive top-level `fleet` block (`role`: `leader` |
+  `worker` | `none`), always present; no emails in it. Keys under `engine` are unchanged.
+- On a fleet worker, `strategy_source` can also be `fleet-lease` or
+  `fleet-fallback`, and `strategy`/`reserve`/`threshold` report what the tick
+  actually uses. A dev box (leader or no fleet) still reports only
+  `settings` | `session`. The Claude Remote hub's `cswapctl` maps an unknown
+  value to null (`_oneof`), so it tolerates these (checked 2026-11-07; it runs
+  against the dev box, which is never a worker).
+- New op `wake` (internal: `fleet receive`/`forget` call it through
+  `engine_control.wake_engine()`): `{"result": "woken"}`, exit 0; not a
+  `cswap engine` subcommand. Engines built before it answer `bad-request`.
+
 ## Transport (this side's choice; invisible to the hub)
 Box-local only. Working choice: `multiprocessing.connection` Listener — a named
 pipe on Windows, a Unix socket elsewhere — with a random authkey. The engine

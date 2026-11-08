@@ -37,7 +37,10 @@ class CswapApp(App):
     # No command palette: actions live in the dashboard's nested menu, in
     # their own context — not in a global searchable list.
     ENABLE_COMMAND_PALETTE = False
-    BINDINGS = [Binding("ctrl+t", "toggle_theme", "Theme")]
+    BINDINGS = [
+        Binding("ctrl+t", "toggle_theme", "Theme"),
+        Binding("h", "open_hosts", "Hosts"),  # fork: fleet (tui/fleetview.py)
+    ]
 
     POLL_INTERVAL_S = 3.0  # matches the old watch view's recapture cadence
     # Snapshot age stays hidden while polling is healthy (age never exceeds
@@ -488,6 +491,20 @@ class CswapApp(App):
         if isinstance(self.screen, WatchScreen):
             return
         self.push_screen(WatchScreen())
+
+    # fork: fleet. `h` exists only with hosts configured (fleet_remote.load_hosts
+    # non-empty), on the dashboard and the auto screen: no fleet, no change.
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        if action == "open_hosts":
+            from claude_swap.tui.fleetview import hosts_route_enabled
+
+            return hosts_route_enabled(self)
+        return True
+
+    def action_open_hosts(self) -> None:
+        from claude_swap.tui.fleetview import open_hosts
+
+        open_hosts(self)
 
     # -- theme --------------------------------------------------------------
 

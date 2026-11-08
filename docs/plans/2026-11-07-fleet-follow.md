@@ -1,6 +1,6 @@
 # Plan — `cswap fleet`: worker boxes follow the dev box
 
-Date: 2026-11-07 · Base: `jeremy` @ v0.29.0 + fork · Branch: `feat/fleet` (worktree) · Status: **APPROVED 2026-11-07 (Jeremy: "Approve, start building"); building**
+Date: 2026-11-07 · Base: `jeremy` @ v0.29.0 + fork · Branch: `feat/fleet` (worktree) · Status: **BUILT + VERIFIED on feat/fleet (suite, 2× review, deep, scratch trial); merge to `jeremy` gated on Jeremy**
 Collaboration: `docs/collaborations/2026-11-07-cswap-remote-hosts.md` (charter in the env repo @ 88ffa8a).
 Shape: fork-only, separable modules + small hooks; ssh + JSON CLI. Contract `cswap-fleet/1`.
 

@@ -21,3 +21,4 @@ Remote hosts are "the dev box" (master) and "worker boxes" (the first one, then 
   planning session with Jeremy, `docs/plans/<date>-<slug>.md` before any code.
 - 2026-11-07 19:02 CT · Sent the approval and this log's sha (0caa359) to the env-repo peer; no reply requested.
 - 2026-11-07 19:40 CT · Planning settled with Jeremy (sequencing, transport, follow-the-dev-box coordination, settings master); plan `docs/plans/2026-11-07-fleet-follow.md` approved ("Approve, start building"); router contract will be `cswap fleet status --json`, `cswap-fleet/1`. Building on a feature worktree; merge and worker deploy stay gated.
+- 2026-11-07 21:20 CT · Built on `feat/fleet` (pushed): suite 3549 passed / 121 skipped; review x2, deep (ship after fixes, fixed), scratch two-store trial 8/8. Awaiting Jeremy: merge to `jeremy`, worker deploy.

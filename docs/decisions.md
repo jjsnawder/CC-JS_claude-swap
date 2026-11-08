@@ -541,3 +541,23 @@ being persisted.
 **Rejected:** auto-sync every cycle (a worker-side change could never stick and
 more engine code); report-only (workers sit stale).
 **Why it matters:** fallback runs on the last PUSHED settings, not the live ones.
+
+## 2026-11-07 - Fleet follow: build-time calls
+**Chose:** (1) a following worker switches through the `m` path (refusals
+apply, cooldown waived, nothing pinned) and, once on target, holds below AND
+over its threshold; only at-limit/failover escapes, then it waits 5 min before
+following back. Transient refusals (`target-busy`, `target-usage-unknown`,
+BLOCKED) retry next tick. (2) A worker skips its own warmup pings while
+following. (3) The leader thread and every `fleet receive`/`snapshot` read
+usage store-only: each box's engine stays its only fetcher. (4) `fleet
+receive` wakes the worker's engine through a new `wake` engine-control op,
+only when the lease changed; a valid lease also caps the worker's sleep at
+`intervalSeconds`. (5) Identity-mismatched slots are skipped for every
+per-slot field a lease carries, reserve included. (6) Lease ttl is a constant
+180 s (accepted range 30-900), not a setting.
+**Rejected:** escaping on a worker's own threshold while following (every box
+shares the account; the leader moves them all, a lone escape just splits them);
+fetching usage in the leader thread (a second fetcher per box, and it can spend
+refresh grants); waking on every heartbeat (doubles worker ticks for nothing).
+**Why it matters:** these are what make "follow" stable. Loosening (1) or (3)
+reintroduces flapping or the one-fetcher-per-box break that `deep` found.

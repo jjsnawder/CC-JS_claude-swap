@@ -201,3 +201,24 @@ Three modules, one owner each. Names below are binding; add private helpers free
   (a box with no fleet history behaves exactly as today).
 - `engine status --json` gains additive `fleet`: `{"role": "leader"|"worker"|"none",
   "leader": FleetLeader.snapshot() or null, "follow": follow_state(...) or null}`.
+
+## Addendum 2026-11-07: needs-login alerts through a hook (Jeremy: "Split: cswap hook, env sends")
+Branch `feat/fleet-alerts`. Ask: Jeremy hears about a slot needing `/login` on any box without
+looking. The email itself is the env repo's (relay, recipients, house format); cswap only fires a hook.
+
+- **Setting** `fleet.alertCommand` (string, empty = off). Box-local: not pushed, not fingerprinted.
+- **Where it runs:** the leader (live dev-box engine), at the end of each round, in its own
+  thread with a 30 s timeout; it never blocks a round or the engine tick.
+- **Events** (v1): `relogin` (a slot newly in a host's needs-login set: `reason` =
+  `expiring` | `relogin_required` | `quarantined`, `expires_at` when known), `relogin-cleared`,
+  `unreachable` (a host failing 3 rounds in a row), `reachable` (recovered). Hosts are config
+  names; the dev box itself is `local`. Slot numbers only, no emails.
+- **Dedup:** `<backup_root>/fleet/alerts.json` records what was sent (per host+slot+reason+
+  expires_at), so restarts don't re-alert. An event is marked sent only after the command exits 0;
+  a failure is retried next round and logged.
+- **Payload on stdin:** `{"contract": "cswap-fleet-alert/1", "generated_at", "events": [...]}`.
+  Documented in `docs/fleet.md`.
+- **Test verb:** `cswap fleet alert-test` sends one synthetic event, so the env repo can check
+  its sender end to end.
+- **Snapshot:** additive `relogin_detail: [{slot, reason, expires_at}]` beside `relogin`.
+- Also: the leader's own row reports `on_target: null` (was false).

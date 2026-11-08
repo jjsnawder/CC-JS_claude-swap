@@ -19,3 +19,4 @@ Remote hosts are "the dev box" (master) and "worker boxes" (the first one, then 
   Read the charter at that sha; the only later change (ca3bbef) is a log line on its side.
 - 2026-11-07 19:01 CT · Jeremy approved as written in this session; this log created. Next:
   planning session with Jeremy, `docs/plans/<date>-<slug>.md` before any code.
+- 2026-11-07 19:02 CT · Sent the approval and this log's sha (0caa359) to the env-repo peer; no reply requested.

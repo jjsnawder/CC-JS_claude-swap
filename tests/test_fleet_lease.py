@@ -579,6 +579,16 @@ class TestSnapshot:
         assert snap["settings_hash"] == settings_fingerprint(s)
         json.dumps(snap)  # serializable
 
+    def test_unreadable_state_file_sends_null_detail(self, temp_home: Path):
+        s = _two_slot_switcher(temp_home)
+        (Path(s.backup_dir) / "autoswitch_state.json").write_text(
+            '{"quarantine": {"1": ', encoding="utf-8")  # mid-write
+        with patch.object(s, "list_accounts", return_value={"schemaVersion": 1, "accounts": []}):
+            snap = build_snapshot(s, s.backup_dir, now=T0)
+        assert snap["relogin_detail"] is None  # unknown, not "nothing to log in"
+        assert snap["relogin"] == []
+        json.dumps(snap)
+
     def test_engine_reply_is_carried(self, temp_home: Path, monkeypatch):
         s = _two_slot_switcher(temp_home)
         reply = {"contract": "cswap-engine/0.1", "op": "status", "result": "running",

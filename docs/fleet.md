@@ -156,18 +156,24 @@ double quotes on the way to a native command, so there write each one as `\"`.
   fingerprint. Unset (the default) = no alerts, and nothing is written.
 - **Where it runs:** only in the dev box's leader (its live engine with fleet hosts configured),
   at the end of each round. The command runs on its own thread with a **30 s** timeout; at most
-  one runs at a time, and it never delays a round or the engine tick. Its stdout and stderr are
-  discarded.
+  one runs at a time, and it never delays a round or the engine tick. The payload goes on its
+  stdin only; its stdout and stderr go to the null device. On a timeout cswap kills the
+  command's whole process tree by PID (Windows `taskkill /T /F`; elsewhere its own process
+  group) and waits at most a few seconds more, so a hung sender never stops later alerts.
 - **What is watched:** each worker's last reply (`relogin_detail`) and the dev box itself as
   host `local` (built from its own store, no usage fetch). Worker replies arrive
   asynchronously, so a change on a worker is reported one round (about a minute) after the
-  worker reports it.
+  worker reports it. If a box cannot read its engine state file (`autoswitch_state.json`
+  present but unreadable or malformed, e.g. caught mid-write), its re-login set is unknown
+  for that round: a worker sends `relogin_detail: null`, and that host gets no `relogin` and
+  no `relogin-cleared` events until a later round reads it. A missing file means nothing
+  is quarantined.
 
 ### Events
 
 | `kind` | When | Fields |
 |---|---|---|
-| `relogin` | a slot is newly in a host's re-login set, or its `reason` or `expires_at` changed | `host`, `slot`, `reason` (`relogin_required` \| `quarantined` \| `expiring`), `expires_at` (ISO UTC or null) |
+| `relogin` | a slot is newly in a host's re-login set, or its `reason` or `expires_at` changed | `host`, `slot`, `reason` (`relogin_required` \| `quarantined` \| `expiring`; a newer worker may send another token, passed through, and a malformed one arrives as `unknown`), `expires_at` (ISO UTC or null) |
 | `relogin-cleared` | a slot that was alerted is no longer flagged | `host`, `slot`, `reason` (the alerted one), `since` (when it was alerted) |
 | `unreachable` | a worker failed 3 rounds in a row; once per outage | `host`, `since` (first failure) |
 | `reachable` | a worker that was alerted unreachable answers again | `host`, `since` (when the outage began) |
@@ -208,7 +214,11 @@ emails, organization names or aliases are ever in a payload. Fields may be added
 - Events are recorded **only after the command exits 0**. A nonzero exit, a timeout or a
   command that cannot start logs a warning (the exit code or failure kind; never the payload)
   and the same events are computed and sent again next round. The warning is logged once per
-  failure streak; later failures in the same streak go to the debug log.
+  failure streak; later failures in the same streak go to the debug log. With
+  `fleet.alertCommand` unset nothing is logged at all.
+- **Delivery is at-least-once.** A sender that delivers but then runs past the timeout, or
+  exits 0 when cswap then fails to record it (e.g. a lock timeout on `alerts.json`), gets the
+  same events again next round. Senders should tolerate duplicates.
 - A host removed from `fleet hosts` drops out of `alerts.json` at the next recorded send,
   without a `relogin-cleared` event.
 

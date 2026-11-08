@@ -6,7 +6,8 @@ hosts down for :data:`UNREACHABLE_ROUNDS` rounds in a row and the hosts that
 answered. Events are computed against ``<backup_root>/fleet/alerts.json``
 (what was already sent) and handed to ``fleet.alertCommand`` as one JSON
 document on stdin, from a daemon thread with a :data:`ALERT_TIMEOUT_S`
-timeout. At most one command runs at a time; an event is recorded as sent
+timeout (then its whole process tree is killed by PID). At most one
+command runs at a time; an event is recorded as sent
 only after the command exits 0, so a failure is simply recomputed (and
 retried) next round. The command is never run through a shell.
 
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shlex
 import subprocess
 import sys
@@ -32,9 +34,11 @@ from claude_swap.fleet_lease import FLEET_DIRNAME
 ALERT_CONTRACT = "cswap-fleet-alert/1"
 ALERTS_FILENAME = "alerts.json"
 ALERT_TIMEOUT_S = 30.0
+KILL_WAIT_S = 5.0  # bound on every wait after a timed-out command is killed
 UNREACHABLE_ROUNDS = 3
 LOCAL_HOST = "local"  # == fleet_remote.LOCAL_HOST_NAME
 EVENT_KINDS = ("relogin", "relogin-cleared", "unreachable", "reachable", "test")
+_REASON_RE = re.compile(r"[a-z0-9_-]{1,40}")  # a reason token from a newer worker
 
 _logger = logging.getLogger("claude-swap")
 
@@ -134,47 +138,110 @@ def split_command(command: str, *, windows: bool | None = None) -> list[str]:
 
 
 def alert_command(backup_root: Path) -> str:
-    """The configured command (``""`` = off, or unreadable)."""
+    """The configured command (``""`` = off, or unreadable). Read every
+    round, so it logs nothing (no fallbackStrategy validation either)."""
     try:
-        from claude_swap.settings import load_fleet_settings
+        from claude_swap.settings import load_fleet_alert_command
 
-        return load_fleet_settings(Path(backup_root)).alert_command or ""
+        return load_fleet_alert_command(Path(backup_root)) or ""
     except Exception as e:
         _logger.debug("fleet: alertCommand unreadable: %r", e)
         return ""
+
+
+def _kill_tree(proc: Any) -> None:
+    """Kill ``proc`` and everything it started, by PID (a hung sender's
+    helpers too). Acts only on a real ``subprocess.Popen``; never raises.
+    Windows: ``taskkill /T /F /PID``; POSIX: the process group (the command
+    runs in its own session)."""
+    if not isinstance(proc, subprocess.Popen):
+        return
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=KILL_WAIT_S, shell=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        else:
+            import os
+            import signal
+
+            os.killpg(proc.pid, signal.SIGKILL)
+    except Exception as e:
+        _logger.debug("fleet: alert command tree kill failed: %r", e)
+
+
+def _feed_stdin(proc: Any, data: bytes) -> None:
+    """Write the payload and close stdin (on its own thread: a command that
+    never reads cannot block the caller on a full pipe)."""
+    stdin = getattr(proc, "stdin", None)
+    if stdin is None:
+        return
+    try:
+        stdin.write(data)
+    except (OSError, ValueError):
+        pass  # the command quit (or was killed) without reading it all
+    finally:
+        try:
+            stdin.close()
+        except (OSError, ValueError):
+            pass
 
 
 def run_alert(
     argv: list[str],
     payload: dict,
     *,
-    runner: Callable[..., Any] = subprocess.run,
+    runner: Callable[..., Any] = subprocess.Popen,
     timeout: float = ALERT_TIMEOUT_S,
 ) -> tuple[int | None, str | None]:
-    """Run the hook once with ``payload`` on stdin; never raises.
+    """Run the hook once with ``payload`` on stdin; never raises, never
+    blocks past ``timeout`` + a bounded kill wait.
 
-    Returns ``(exit code or None, error or None)``. Its stdout/stderr are
-    captured and dropped: nothing the sender prints reaches a log."""
+    ``runner`` is ``subprocess.Popen`` (or a stand-in). Returns ``(exit code
+    or None, error or None)``. stdout/stderr go to DEVNULL (nothing the
+    sender prints reaches a log, and no pipe a grandchild inherits can hold
+    us). On timeout the whole process tree is killed by PID."""
     kwargs: dict = {
-        "input": json.dumps(payload),
-        "capture_output": True,
-        "text": True,
-        "encoding": "utf-8",
-        "errors": "replace",
-        "timeout": timeout,
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
         "shell": False,
     }
     if sys.platform == "win32":
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    else:
+        kwargs["start_new_session"] = True  # its own process group: killpg
     try:
         proc = runner(list(argv), **kwargs)
-    except subprocess.TimeoutExpired:
-        return None, f"timeout after {timeout:g}s"
     except FileNotFoundError:
         return None, "command not found"
     except Exception as e:
         return None, f"failed to start ({type(e).__name__})"
-    rc = getattr(proc, "returncode", None)
+    writer = threading.Thread(
+        target=_feed_stdin, args=(proc, json.dumps(payload).encode("utf-8")),
+        name="cswap-fleet-alert-stdin", daemon=True,
+    )
+    writer.start()
+    try:
+        rc = proc.wait(timeout=timeout)
+    except Exception as e:
+        timed_out = isinstance(e, subprocess.TimeoutExpired)
+        _kill_tree(proc)
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        error = f"timeout after {timeout:g}s" if timed_out else f"wait failed ({type(e).__name__})"
+        try:
+            proc.wait(timeout=KILL_WAIT_S)
+        except Exception:
+            error += "; still running after kill"
+        writer.join(KILL_WAIT_S)
+        return None, error
+    writer.join(KILL_WAIT_S)
     if rc == 0:
         return 0, None
     return rc, f"exit {rc}"
@@ -261,7 +328,10 @@ def normalize_detail(value: Any) -> list[dict] | None:
         if not (slot.isascii() and slot.isdigit()) or slot in seen:
             continue
         if reason not in RELOGIN_REASONS:
-            continue
+            # A newer worker's reason: keep the slot (dropping it would read
+            # as a false relogin-cleared); a malformed value becomes "unknown".
+            reason = (reason if isinstance(reason, str) and _REASON_RE.fullmatch(reason)
+                      else "unknown")
         seen.add(slot)
         out.append({
             "slot": slot,
@@ -282,6 +352,8 @@ def detail_from_snapshot(snapshot: Any, *, now: float | None = None) -> list[dic
     accounts = snapshot.get("accounts")
     if isinstance(accounts, dict) and accounts.get("error"):
         return None  # the worker's list failed: its set is unknown, not empty
+    if "relogin_detail" in snapshot and snapshot["relogin_detail"] is None:
+        return None  # its engine state was unreadable: unknown, not empty
     detail = normalize_detail(snapshot.get("relogin_detail"))
     if detail is not None:
         return detail
@@ -385,7 +457,7 @@ class AlertDispatcher:
         self,
         backup_root: Path,
         *,
-        runner: Callable[..., Any] = subprocess.run,
+        runner: Callable[..., Any] = subprocess.Popen,
         timeout_s: float = ALERT_TIMEOUT_S,
         clock: Callable[[], float] = time.time,
     ):
@@ -499,7 +571,7 @@ class AlertDispatcher:
 def send_test(
     backup_root: Path,
     *,
-    runner: Callable[..., Any] = subprocess.run,
+    runner: Callable[..., Any] = subprocess.Popen,
     timeout: float = ALERT_TIMEOUT_S,
 ) -> dict:
     """``cswap fleet alert-test``: one synthetic ``test`` event, run in the

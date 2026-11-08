@@ -626,7 +626,7 @@ class FleetLeader:
         clock: Callable[[], float] = time.time,
         max_workers: int = MAX_WORKERS,
         timeout_s: float = REMOTE_TIMEOUT_S,
-        alert_runner: Callable[..., Any] = subprocess.run,
+        alert_runner: Callable[..., Any] = subprocess.Popen,
     ):
         self.switcher = switcher
         self._engine = engine
@@ -755,7 +755,9 @@ class FleetLeader:
         local = alerts_mod.LOCAL_HOST
         relogin: dict[str, list[dict]] = {}
         if isinstance(usage, dict) and not usage.get("error"):  # a failed list clears nothing
-            relogin[local] = lease_mod.relogin_detail(usage, self.backup_root, now=now)
+            detail = lease_mod.relogin_detail_known(usage, self.backup_root, now=now)
+            if detail is not None:  # unreadable engine state: unknown, skipped
+                relogin[local] = detail
         down: dict[str, str | None] = {}
         up = {local}
         with self._lock:

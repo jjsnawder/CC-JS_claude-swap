@@ -37,29 +37,73 @@ def _iso(ts: float) -> str:
         "+00:00", "Z")
 
 
-class FakeRunner:
-    """subprocess.run stand-in: records argv/kwargs/stdin; ``rc`` per call;
-    ``block`` makes a call wait until released."""
+class _FakeStdin:
+    def __init__(self, owner):
+        self.owner, self.buf, self.closed = owner, bytearray(), False
 
-    def __init__(self, rc=0, block=False):
+    def write(self, data):
+        self.buf += data
+        return len(data)
+
+    def close(self):
+        self.closed = True
+        self.owner.entered.set()
+
+
+class _FakeProc:
+    """A Popen stand-in. ``block``: ``wait`` returns only once released or
+    killed (``ignore_kill``: never on a kill, like a tree whose grandchild
+    holds on); a ``wait`` past its timeout raises TimeoutExpired."""
+
+    pid = -1  # never a real PID: fleet_alerts._kill_tree ignores non-Popen objects
+
+    def __init__(self, owner, rc):
+        self.owner, self.rc = owner, rc
+        self.stdin = _FakeStdin(owner)
+        self.kills = 0
+        self.wait_timeouts: list = []
+
+    def wait(self, timeout=None):
+        self.wait_timeouts.append(timeout)
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self.owner.block and not self.owner.release.is_set():
+            if self.kills and not self.owner.ignore_kill:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired("fake", timeout)
+            time.sleep(0.005)
+        return self.rc
+
+    def kill(self):
+        self.kills += 1
+
+
+class FakeRunner:
+    """subprocess.Popen stand-in: records argv/kwargs and each proc (its
+    stdin is the payload); ``rc`` per call (an exception = failed to start);
+    ``block`` makes ``wait`` hang until released (or killed)."""
+
+    def __init__(self, rc=0, block=False, ignore_kill=False):
         self.rc = rc
         self.calls: list[tuple[list, dict]] = []
+        self.procs: list[_FakeProc] = []
         self.block = block
+        self.ignore_kill = ignore_kill
         self.release = threading.Event()
         self.entered = threading.Event()
 
     def __call__(self, argv, **kwargs):
         self.calls.append((list(argv), kwargs))
-        self.entered.set()
-        if self.block:
-            self.release.wait(10)
         rc = self.rc(len(self.calls)) if callable(self.rc) else self.rc
         if isinstance(rc, BaseException):
+            self.entered.set()
             raise rc
-        return SimpleNamespace(returncode=rc, stdout="sent to someone@example.test", stderr="")
+        proc = _FakeProc(self, rc)
+        self.procs.append(proc)
+        return proc
 
     def payloads(self):
-        return [json.loads(kw["input"]) for _, kw in self.calls]
+        return [json.loads(bytes(p.stdin.buf)) for p in self.procs]
 
 
 def _configure(root: Path, command: str = "sender --mode fleet") -> None:
@@ -197,9 +241,47 @@ class TestReloginDetail:
                                         "relogin": [], "relogin_detail": []}) is None
         snap["relogin_detail"] = [{"slot": "9", "reason": "expiring", "expires_at": None},
                                   {"slot": "x", "reason": "expiring"},
-                                  {"slot": "8", "reason": "bogus"}]
+                                  {"slot": "8", "reason": "bogus"},
+                                  {"slot": "7", "reason": "Has Spaces@x.test"},
+                                  {"slot": "6", "reason": 5}]
+        # A newer worker's reason is kept (dropping the slot would read as
+        # relogin-cleared); a malformed one becomes "unknown".
         assert fa.detail_from_snapshot(snap) == [
-            {"slot": "9", "reason": "expiring", "expires_at": None}]
+            {"slot": "9", "reason": "expiring", "expires_at": None},
+            {"slot": "8", "reason": "bogus", "expires_at": None},
+            {"slot": "7", "reason": "unknown", "expires_at": None},
+            {"slot": "6", "reason": "unknown", "expires_at": None},
+        ]
+
+    def test_unknown_reason_is_not_a_false_clear(self):
+        state = fa.apply_events(fa._empty_state(), [
+            {"kind": "relogin", "host": "w1", "slot": "2", "reason": "expiring",
+             "expires_at": None}], at="T1")
+        detail = fa.normalize_detail([{"slot": "2", "reason": "future_reason"}])
+        ev = fa.compute_events(state, relogin={"w1": detail}, down={}, up={"w1"})
+        assert [e["kind"] for e in ev] == ["relogin"]  # a reason change, never a clear
+        assert ev[0]["reason"] == "future_reason"
+
+    def test_unreadable_state_file_is_unknown(self, tmp_path):
+        payload = {"accounts": [{"number": 2, "usageStatus": "relogin_required"}]}
+        # Missing file: no quarantine, a known set.
+        assert fleet_lease.relogin_detail_known(payload, tmp_path, now=T0) == [
+            {"slot": "2", "reason": "relogin_required", "expires_at": None}]
+        state = tmp_path / "autoswitch_state.json"
+        for bad in ('{"quarantine": {"4": {}', "[1, 2]", '{"quarantine": [4]}'):
+            state.write_text(bad, encoding="utf-8")
+            assert fleet_lease.relogin_detail_known(payload, tmp_path, now=T0) is None, bad
+        state.write_bytes(b"\xff\xfe\x00garbage")
+        assert fleet_lease.relogin_detail_known(payload, tmp_path, now=T0) is None
+        state.write_text("{}", encoding="utf-8")
+        assert fleet_lease.relogin_detail_known(payload, tmp_path, now=T0) is not None
+
+    def test_worker_null_detail_is_unknown_not_older_worker(self):
+        snap = {"host_time": T0, "accounts": {"accounts": []}, "relogin": ["1"],
+                "relogin_detail": None}
+        assert fa.detail_from_snapshot(snap) is None  # no derivation, no clears
+        del snap["relogin_detail"]  # an older worker: derived from relogin
+        assert [d["slot"] for d in fa.detail_from_snapshot(snap)] == ["1"]
 
 
 # --------------------------------------------------------------------------
@@ -294,7 +376,12 @@ class TestDispatcher:
         d.join(5)
         assert len(runner.calls) == 1
         argv, kw = runner.calls[0]
-        assert argv[0].endswith("p.exe") and kw["shell"] is False and kw["timeout"] == 30.0
+        assert argv[0].endswith("p.exe") and kw["shell"] is False
+        # Payload on stdin only; no output pipe a grandchild could hold open.
+        assert kw["stdin"] is subprocess.PIPE
+        assert kw["stdout"] is subprocess.DEVNULL and kw["stderr"] is subprocess.DEVNULL
+        assert runner.procs[0].wait_timeouts[0] == 30.0
+        assert runner.procs[0].stdin.closed
         assert runner.payloads()[0] == {
             "contract": "cswap-fleet-alert/1",
             "generated_at": _iso(T0),
@@ -330,7 +417,6 @@ class TestDispatcher:
         assert fa.alerts_path(tmp_path).exists()
 
     @pytest.mark.parametrize("exc,msg", [
-        (subprocess.TimeoutExpired("x", 30), "timeout after 30s"),
         (FileNotFoundError(), "command not found"),
         (OSError("boom"), "failed to start (OSError)"),
     ])
@@ -355,6 +441,56 @@ class TestDispatcher:
             d.join(5)
         assert not d.in_flight
 
+    def test_timeout_kills_tree_and_unwedges(self, tmp_path, monkeypatch, caplog):
+        """A command that ignores its kill (a grandchild holding on) still
+        frees the dispatcher: every wait after the kill is bounded."""
+        _configure(tmp_path)
+        killed = []
+        monkeypatch.setattr(fa, "_kill_tree", lambda proc: killed.append(proc))
+        monkeypatch.setattr(fa, "KILL_WAIT_S", 0.05)
+        runner = FakeRunner(block=True, ignore_kill=True)
+        d = fa.AlertDispatcher(tmp_path, runner=runner, timeout_s=0.1)
+        with caplog.at_level("DEBUG", logger="claude-swap"):
+            assert d.submit(**VIEW) is True
+            d.join(5)
+        assert not d.in_flight
+        (proc,) = runner.procs
+        assert killed == [proc] and proc.kills == 1
+        assert proc.wait_timeouts == [0.1, 0.05]
+        assert d.last_result == (None, "timeout after 0.1s; still running after kill")
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1 and "timeout" in warnings[0].getMessage()
+        for leaked in ("w2", "relogin_required", "--mode"):
+            assert leaked not in caplog.text
+        assert not fa.alerts_path(tmp_path).exists()
+        # Next round: the same events go out again, and succeed.
+        runner.block = False
+        assert d.submit(**VIEW) is True
+        d.join(5)
+        assert len(runner.procs) == 2
+        assert runner.payloads()[0]["events"] == runner.payloads()[1]["events"]
+        assert fa.alerts_path(tmp_path).exists()
+
+    def test_kill_tree_ignores_non_popen(self, monkeypatch):
+        monkeypatch.setattr(fa.subprocess, "run", lambda *a, **k: pytest.fail("ran taskkill"))
+        fa._kill_tree(_FakeProc(FakeRunner(), 0))  # never a real PID kill
+
+    def test_unset_command_logs_nothing(self, tmp_path, caplog):
+        # An invalid fallbackStrategy would warn through load_fleet_settings.
+        settings_path(tmp_path).write_text(json.dumps(
+            {"fleet": {"fallbackStrategy": "no-such-strategy"}}))
+        runner = FakeRunner()
+        d = fa.AlertDispatcher(tmp_path, runner=runner)
+        with caplog.at_level("DEBUG", logger="claude-swap"):
+            for _ in range(3):
+                assert d.command() == ""
+                assert d.submit(**VIEW) is False
+        assert caplog.records == [] and runner.calls == []
+        settings_path(tmp_path).write_text("{not json")
+        with caplog.at_level("DEBUG", logger="claude-swap"):
+            assert d.submit(**VIEW) is False
+        assert caplog.records == []
+
     def test_unsplittable_command_is_skipped(self, tmp_path):
         _configure(tmp_path, '"unterminated')
         runner = FakeRunner()
@@ -375,17 +511,17 @@ def _run(capsys, argv, **kw):
 class TestAlertTestVerb:
     def test_no_command(self, tmp_path, capsys):
         runner = FakeRunner()
-        rc, out = _run(capsys, ["alert-test", "--json"], backup_root=tmp_path, runner=runner)
+        rc, out = _run(capsys, ["alert-test", "--json"], backup_root=tmp_path, alert_runner=runner)
         doc = json.loads(out)
         assert rc == 1 and doc["op"] == "alert-test" and doc["error"] == "no-alert-command"
         assert runner.calls == []
-        rc, out = _run(capsys, ["alert-test"], backup_root=tmp_path, runner=runner)
+        rc, out = _run(capsys, ["alert-test"], backup_root=tmp_path, alert_runner=runner)
         assert rc == 1 and out.startswith("error (no-alert-command)")
 
     def test_sends_one_test_event(self, tmp_path, capsys):
         _configure(tmp_path, r'"C:\Program Files\p.exe" "D:\a b\send.py"')
         runner = FakeRunner()
-        rc, out = _run(capsys, ["alert-test", "--json"], backup_root=tmp_path, runner=runner)
+        rc, out = _run(capsys, ["alert-test", "--json"], backup_root=tmp_path, alert_runner=runner)
         doc = json.loads(out)
         assert rc == 0 and doc["result"] == "sent" and doc["exit_code"] == 0
         assert doc["event"] == {"kind": "test", "host": "local"}
@@ -393,12 +529,30 @@ class TestAlertTestVerb:
         assert payload["contract"] == "cswap-fleet-alert/1"
         assert payload["events"] == [{"kind": "test", "host": "local"}]
         assert not fa.alerts_path(tmp_path).exists()  # a test is never recorded
-        rc, out = _run(capsys, ["alert-test"], backup_root=tmp_path, runner=runner)
+        rc, out = _run(capsys, ["alert-test"], backup_root=tmp_path, alert_runner=runner)
         assert rc == 0 and "exited 0" in out
 
     def test_failure_reports_exit_code(self, tmp_path, capsys):
         _configure(tmp_path)
         rc, out = _run(capsys, ["--json", "alert-test"], backup_root=tmp_path,
-                       runner=FakeRunner(rc=3))
+                       alert_runner=FakeRunner(rc=3))
         doc = json.loads(out)
         assert rc == 1 and doc["error"] == "alert-failed" and doc["exit_code"] == 3
+
+    def test_timeout_in_the_foreground_is_bounded(self, tmp_path, capsys, monkeypatch):
+        _configure(tmp_path)
+        killed = []
+        monkeypatch.setattr(fa, "_kill_tree", lambda proc: killed.append(proc))
+        monkeypatch.setattr(fa, "KILL_WAIT_S", 0.05)
+        monkeypatch.setattr(fa, "ALERT_TIMEOUT_S", 0.1)
+        monkeypatch.setattr(fa.send_test, "__kwdefaults__",
+                            {**fa.send_test.__kwdefaults__, "timeout": 0.1})
+        runner = FakeRunner(block=True, ignore_kill=True)
+        start = time.monotonic()
+        rc, out = _run(capsys, ["alert-test", "--json"], backup_root=tmp_path,
+                       alert_runner=runner)
+        assert time.monotonic() - start < 3
+        doc = json.loads(out)
+        assert rc == 1 and doc["error"] == "alert-failed" and doc["exit_code"] is None
+        assert "timeout after 0.1s" in doc["message"]
+        assert killed == runner.procs and runner.procs[0].kills == 1

@@ -978,8 +978,10 @@ def run(
     switcher=None,
     runner: Callable[..., Any] = subprocess.run,
     stdin=None,
+    alert_runner: Callable[..., Any] = subprocess.Popen,
 ) -> int:
-    """Parse, act, print; returns the exit code (argparse exits 2)."""
+    """Parse, act, print; returns the exit code (argparse exits 2).
+    ``runner`` runs ssh; ``alert_runner`` (a Popen) runs the alert hook."""
     parser = build_parser()
     args = parser.parse_args(argv)
     json_mode = bool(getattr(args, "json", False))
@@ -1106,7 +1108,7 @@ def run(
             )
         elif action == "alert-test":
             r = Path(switcher.backup_dir) if backup_root is None and switcher is not None else root()
-            res = importlib.import_module("claude_swap.fleet_alerts").send_test(r, runner=runner)
+            res = importlib.import_module("claude_swap.fleet_alerts").send_test(r, runner=alert_runner)
             if not res["command"]:
                 raise FleetError("no-alert-command", "fleet.alertCommand is not set")
             if not res["valid"]:

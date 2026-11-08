@@ -570,18 +570,37 @@ def follow_state(
 # -- snapshot -----------------------------------------------------------------
 
 
-def _quarantined_slots(backup_root: Path) -> set[str]:
-    """Engine-quarantined slots, read-only from the autoswitch state file."""
+def _read_quarantine(backup_root: Path) -> set[str] | None:
+    """Engine-quarantined slots, read-only from the autoswitch state file.
+
+    No state file (or no ``quarantine`` key) = none quarantined. Any other
+    read or parse failure, or a malformed file, is None: the set is UNKNOWN
+    (e.g. read mid-write), never silently empty."""
     from claude_swap.autoswitch import STATE_FILENAME
 
     try:
-        state = json.loads((Path(backup_root) / STATE_FILENAME).read_text(encoding="utf-8"))
+        text = (Path(backup_root) / STATE_FILENAME).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return set()
     except (OSError, ValueError):
+        return None
+    try:
+        state = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(state, dict):
+        return None
+    quarantine = state.get("quarantine")
+    if quarantine is None:
         return set()
-    quarantine = state.get("quarantine") if isinstance(state, dict) else None
     if not isinstance(quarantine, dict):
-        return set()
+        return None
     return {str(k) for k in quarantine if str(k).isascii() and str(k).isdigit()}
+
+
+def _quarantined_slots(backup_root: Path) -> set[str]:
+    """:func:`_read_quarantine`, an unknown set read as empty (display only)."""
+    return _read_quarantine(backup_root) or set()
 
 
 def _parse_iso(value: Any) -> float | None:
@@ -666,6 +685,18 @@ def relogin_detail(
     return out
 
 
+def relogin_detail_known(
+    list_payload: dict, backup_root: Path, *, now: float
+) -> list[dict] | None:
+    """:func:`relogin_detail`, or None when the engine's state file exists
+    but cannot be read or parsed: the re-login set is unknown this round, so
+    the alert leader neither alerts nor clears this host's slots."""
+    quarantined = _read_quarantine(backup_root)
+    if quarantined is None:
+        return None
+    return relogin_detail(list_payload, backup_root, now=now, quarantined=quarantined)
+
+
 def _engine_status(backup_root: Path) -> dict:
     from claude_swap import engine_control
 
@@ -687,7 +718,8 @@ def build_snapshot(
     "follow": follow_state(...), "relogin": [slot numbers],
     "relogin_detail": relogin_detail(...),
     "settings_hash": settings_fingerprint(...)}``. ``host_time`` is this
-    box's epoch seconds.
+    box's epoch seconds. ``relogin_detail`` is null when the engine's state
+    file is unreadable (:func:`relogin_detail_known`): unknown, not empty.
     """
     now = time.time() if now is None else now
     backup_root = Path(backup_root)
@@ -701,7 +733,7 @@ def build_snapshot(
         "engine": engine,
         "follow": follow_state(backup_root, engine, now=now, active=active),
         "relogin": relogin_slots(accounts, backup_root, now=now),
-        "relogin_detail": relogin_detail(accounts, backup_root, now=now),
+        "relogin_detail": relogin_detail_known(accounts, backup_root, now=now),
         "settings_hash": settings_fingerprint(switcher),
     }
 

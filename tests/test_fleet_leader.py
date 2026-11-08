@@ -22,6 +22,7 @@ from claude_swap.fleet_leader import FleetLeader
 from claude_swap.fleet_remote import Host
 
 from tests.test_autoswitch import EngineHarness, _usage
+from tests.test_fleet_alerts import _FakeProc
 
 
 @pytest.fixture(autouse=True)
@@ -460,19 +461,22 @@ class TestStatusBlock:
 
 
 class AlertRunner:
-    """The alert command's subprocess.run stand-in; ``block`` hangs a call."""
+    """The alert command's Popen stand-in (fake procs from the alerts tests);
+    ``calls`` are the payloads written to stdin; ``block`` hangs a call."""
 
     def __init__(self, rc=0, block=False):
-        self.rc, self.block = rc, block
-        self.calls: list[dict] = []
+        self.rc, self.block, self.ignore_kill = rc, block, False
+        self.procs: list = []
         self.entered, self.release = threading.Event(), threading.Event()
 
     def __call__(self, argv, **kwargs):
-        self.calls.append(json.loads(kwargs["input"]))
-        self.entered.set()
-        if self.block:
-            self.release.wait(10)
-        return SimpleNamespace(returncode=self.rc, stdout="", stderr="")
+        proc = _FakeProc(self, self.rc)
+        self.procs.append(proc)
+        return proc
+
+    @property
+    def calls(self) -> list[dict]:
+        return [json.loads(bytes(p.stdin.buf)) for p in self.procs]
 
 
 def _detail_reply(*detail):
@@ -588,6 +592,29 @@ class TestLeaderAlerts:
         finally:
             runner.release.set()
             leader.alerts.join(5)
+
+    def test_unreadable_state_is_unknown_not_cleared(self, h, alerting):
+        """A state-file read error (local) or a null relogin_detail (worker)
+        skips that host for the round: no relogin and no relogin-cleared."""
+        runner = AlertRunner()
+        leader = _leader(h, FakeSSH(), alert_runner=runner)
+        leader._record("w1", _detail_reply(
+            {"slot": "2", "reason": "expiring", "expires_at": None}), None)
+        self._round(leader)
+        assert _kinds(runner.calls[0]) == [("relogin", "local", "3"), ("relogin", "w1", "2")]
+        alerting.rows["rows"] = []
+        state = h.switcher.backup_dir / "autoswitch_state.json"
+        state.write_text('{"quarantine": {', encoding="utf-8")  # mid-write / corrupt
+        reply = _detail_reply()
+        reply["relogin_detail"] = None
+        leader._record("w1", reply, None)
+        self._round(leader)
+        assert len(runner.calls) == 1  # nothing cleared on an unknown set
+        state.unlink()  # missing = no quarantine: a known, empty set
+        leader._record("w1", _detail_reply(), None)
+        self._round(leader)
+        assert _kinds(runner.calls[1]) == [
+            ("relogin-cleared", "local", "3"), ("relogin-cleared", "w1", "2")]
 
     def test_off_without_command_changes_nothing(self, h, stubs):
         stubs.hosts = _hosts(("w1", None))

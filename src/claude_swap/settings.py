@@ -463,6 +463,20 @@ def load_fleet_settings(backup_root: Path) -> FleetSettings:
     return FleetSettings(fallback_strategy=value, alert_command=command.strip())
 
 
+def load_fleet_alert_command(backup_root: Path) -> str:
+    """Fork: ``fleet.alertCommand`` alone (``""`` = off). Read raw and
+    silently: the leader reads it every round, so it never validates (or
+    warns about) the rest of the fleet section, and an unreadable file is
+    simply off."""
+    try:
+        raw = json.loads(settings_path(backup_root).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    section = raw.get("fleet") if isinstance(raw, dict) else None
+    command = section.get("alertCommand") if isinstance(section, dict) else None
+    return command.strip() if isinstance(command, str) else ""
+
+
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
     """Write the autoswitch section, preserving unknown keys and sections."""
     path = settings_path(backup_root)

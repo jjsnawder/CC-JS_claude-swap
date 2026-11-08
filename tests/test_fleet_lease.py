@@ -563,7 +563,8 @@ class TestSnapshot:
         with patch("claude_swap.oauth.try_fetch_usage_for_account", side_effect=_fake_fetch_ok):
             snap = build_snapshot(s, s.backup_dir, now=T0)
         assert set(snap) == {
-            "contract", "host_time", "accounts", "engine", "follow", "relogin", "settings_hash",
+            "contract", "host_time", "accounts", "engine", "follow", "relogin",
+            "relogin_detail", "settings_hash",
         }
         assert snap["contract"] == CONTRACT
         assert snap["host_time"] == T0
@@ -573,6 +574,8 @@ class TestSnapshot:
         assert snap["follow"] == {"state": "autonomous", "reason": "no-engine", "lease_age_s": None,
                                   "on_target": None}
         assert snap["relogin"] == ["1"]
+        assert snap["relogin_detail"] == [
+            {"slot": "1", "reason": "quarantined", "expires_at": None}]
         assert snap["settings_hash"] == settings_fingerprint(s)
         json.dumps(snap)  # serializable
 

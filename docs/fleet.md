@@ -48,6 +48,7 @@ remote command is split like a shell would (`shlex`) and each word must be a pla
 | `cswap fleet push [--host NAME] [--dry-run] [--json]` | dev box | write the dev box's settings + per-account policy to workers |
 | `cswap fleet override HOST follow\|pin N\|strategy S` | dev box | per-worker override, kept until changed |
 | `cswap fleet forget [--json]` | worker | drop the stored lease: a box that left the fleet goes back to its own persisted strategy |
+| `cswap fleet alert-test [--json]` | dev box | send one test event through `fleet.alertCommand` (see [Alerts](#alerts)) |
 | `cswap fleet receive` | worker | lease on stdin → snapshot on stdout (the leader calls this) |
 | `cswap fleet snapshot` | worker | print this box's snapshot |
 | `cswap fleet apply [-] [--dry-run]` | worker | settings document on stdin → what changed |
@@ -111,7 +112,7 @@ An override applies **only while the dev box leads**; the fallback ignores it.
   included (so a stray worker override is cleared).
 
 **Never pushed (box-local):** `ui.*` (theme), `run.*` (`cswap run` defaults), `updates.*` (the
-update hint), `fleet.*` (each box's own fallback), and account aliases. A worker ignores such
+update hint), `fleet.*` (each box's own fallback and alert hook), and account aliases. A worker ignores such
 keys if a document carries them and lists them under `ignored`.
 
 Per slot, the worker compares a salted hash of its own slot's (email, organization) with the
@@ -126,9 +127,103 @@ never silently overwritten: pushing is always on command.
 | Key | Default | Meaning |
 |---|---|---|
 | `fleet.fallbackStrategy` | `consume-first-reserve-jj` | worker strategy while no lease is valid (only once a lease was ever received; a box with no fleet history behaves exactly as without this feature) |
+| `fleet.alertCommand` | (unset: off) | the dev box's needs-login alert hook, a full command line (see [Alerts](#alerts)); box-local |
 
 `cswap config` lists `fleet.fallbackStrategy` on **every** box, fleet or not; it has no effect
-until the box has received a lease.
+until the box has received a lease. `fleet.alertCommand` only matters on the dev box while it
+leads.
+
+## Alerts
+
+The leading dev box can tell you when a slot on any box needs a `/login`, or a worker stops
+answering, without anyone looking at `fleet status`. cswap only **fires a hook**: it runs a
+command you configure and hands it the events as JSON on stdin. Sending the actual message
+(mail relay, recipients, format) is the job of your own script.
+
+```
+cswap config set fleet.alertCommand '/usr/bin/python3 /opt/alerts/send_alert.py'
+cswap config set fleet.alertCommand '"C:\Program Files\Python313\python.exe" "D:\tools\send_alert.py"'
+cswap fleet alert-test
+cswap config unset fleet.alertCommand        # off
+```
+
+The second line is for a POSIX shell or PowerShell 7.3+; Windows PowerShell 5.1 strips the inner
+double quotes on the way to a native command, so there write each one as `\"`.
+
+- **The setting** `fleet.alertCommand` is a full command line, never run through a shell. On
+  Windows it is split by the Windows rules (double-quote paths with spaces; backslashes are
+  literal), elsewhere by POSIX `shlex`. It is box-local: never pushed, never in the drift
+  fingerprint. Unset (the default) = no alerts, and nothing is written.
+- **Where it runs:** only in the dev box's leader (its live engine with fleet hosts configured),
+  at the end of each round. The command runs on its own thread with a **30 s** timeout; at most
+  one runs at a time, and it never delays a round or the engine tick. Its stdout and stderr are
+  discarded.
+- **What is watched:** each worker's last reply (`relogin_detail`) and the dev box itself as
+  host `local` (built from its own store, no usage fetch). Worker replies arrive
+  asynchronously, so a change on a worker is reported one round (about a minute) after the
+  worker reports it.
+
+### Events
+
+| `kind` | When | Fields |
+|---|---|---|
+| `relogin` | a slot is newly in a host's re-login set, or its `reason` or `expires_at` changed | `host`, `slot`, `reason` (`relogin_required` \| `quarantined` \| `expiring`), `expires_at` (ISO UTC or null) |
+| `relogin-cleared` | a slot that was alerted is no longer flagged | `host`, `slot`, `reason` (the alerted one), `since` (when it was alerted) |
+| `unreachable` | a worker failed 3 rounds in a row; once per outage | `host`, `since` (first failure) |
+| `reachable` | a worker that was alerted unreachable answers again | `host`, `since` (when the outage began) |
+| `test` | `cswap fleet alert-test` only | `host` (`local`) |
+
+`reason` is the most urgent one when several apply: `relogin_required` (the store says the login
+is gone), then `quarantined` (the engine quarantined the slot), then `expiring` (its login
+expires within 7 days, or already has). An unreachable worker's slots are neither alerted nor
+cleared until it answers again.
+
+### Payload: contract `cswap-fleet-alert/1`
+
+One JSON object on the command's stdin, holding every event of that round:
+
+```json
+{
+  "contract": "cswap-fleet-alert/1",
+  "generated_at": "2026-11-07T15:00:00Z",
+  "events": [
+    {"kind": "relogin", "host": "worker-a", "slot": "3", "reason": "expiring",
+     "expires_at": "2026-11-12T08:00:00Z"},
+    {"kind": "relogin-cleared", "host": "local", "slot": "2", "reason": "relogin_required",
+     "since": "2026-11-06T09:00:00Z"},
+    {"kind": "unreachable", "host": "worker-b", "since": "2026-11-07T14:57:00Z"}
+  ]
+}
+```
+
+Hosts are the names from `fleet hosts`; the dev box is `local`. Slot numbers are strings. No
+emails, organization names or aliases are ever in a payload. Fields may be added within
+`cswap-fleet-alert/1`; none will be removed or change meaning.
+
+### Dedup and retry
+
+- What was sent is recorded in `<backup_root>/fleet/alerts.json` (atomic writes, under a file
+  lock), per host + slot with its `reason` and `expires_at`, plus the hosts alerted unreachable.
+  A restart of the dev box or its engine does not alert again for anything already sent.
+- Events are recorded **only after the command exits 0**. A nonzero exit, a timeout or a
+  command that cannot start logs a warning (the exit code or failure kind; never the payload)
+  and the same events are computed and sent again next round. The warning is logged once per
+  failure streak; later failures in the same streak go to the debug log.
+- A host removed from `fleet hosts` drops out of `alerts.json` at the next recorded send,
+  without a `relogin-cleared` event.
+
+### `cswap fleet alert-test`
+
+Sends one synthetic event (`{"kind": "test", "host": "local"}`) through the configured command,
+in the foreground, with the same payload contract and 30 s timeout, and reports the exit code.
+Nothing is recorded in `alerts.json`. Use it to check your sender end to end.
+
+| Outcome | Exit | `--json` |
+|---|---|---|
+| command exited 0 | 0 | `{"op": "alert-test", "result": "sent", "exit_code": 0, "event": {...}}` |
+| no `fleet.alertCommand` | 1 | `"error": "no-alert-command"` |
+| the command line cannot be split (unbalanced quote) | 1 | `"error": "invalid-alert-command"` |
+| nonzero exit, timeout, not found | 1 | `"error": "alert-failed"`, `"exit_code"` (null on timeout / not found) |
 
 ## `cswap engine status`: the `fleet` block
 
@@ -169,6 +264,7 @@ last tick actually used (the lease's or the fallback's), not the box's own setti
       "engine": {"running": true, "result": "running", "...": "engine status fields"},
       "accounts": [{"number": "1", "active": false, "usageStatus": "ok", "usage": {}}],
       "relogin": ["3"],
+      "relogin_detail": [{"slot": "3", "reason": "expiring", "expires_at": "2026-11-12T08:00:00Z"}],
       "settings_hash": "<sha256>", "drift": false,
       "override": null, "last_ok_at": null
     }
@@ -187,12 +283,13 @@ Field list (per host; the dev box is always first, named `local`):
 | `error` | str\|null | why not reachable (timeout, ssh error, remote exit) |
 | `state` | `leading`\|`following`\|`overridden`\|`autonomous`\|`unknown` | `leading` only for `local` with a live leader; `unknown` when unreachable |
 | `reason` | str\|null | why autonomous / blocked (e.g. `identity-mismatch`, `lease-expired`) |
-| `on_target` | bool\|null | the worker's active slot is its live lease's follow/pin target (from its snapshot's `follow` block). `false` while it has not switched yet, and always under a strategy override (no target); null when unknown (unreachable, `local`, or an older worker build) |
+| `on_target` | bool\|null | the worker's active slot is its live lease's follow/pin target (from its snapshot's `follow` block). `false` while it has not switched yet, and always under a strategy override (no target); null when unknown (unreachable or an older worker build), and always null for `local` (the dev box follows no one) |
 | `lease_age_s` | number\|null | seconds since the worker received its lease (worker clock) |
 | `active` | str\|null | active slot number |
 | `engine` | object\|null | `running`, `result`, plus the host's `engine status` fields |
 | `accounts` | list | per slot: `number`, `active`, `isOrganization`, `usageStatus`, `usage`, `usageFetchedAt`, `usageAgeSeconds`, `lastGood*`, `usageError`, `usageRetryAt`, `disabled`, `threshold`, `loginExpiresAt` (each present when the `list --json` row has it) |
 | `relogin` | list[str] | slots needing a re-login: `relogin_required`, engine-quarantined, or login expiring within 7 days |
+| `relogin_detail` | list[object] | the same slots with a reason: `{"slot", "reason": "relogin_required"\|"quarantined"\|"expiring", "expires_at": ISO str\|null}`; `[]` from an older worker build |
 | `settings_hash` | str\|null | the host's drift fingerprint |
 | `drift` | bool\|null | hash differs from the dev box's; null when either hash is unknown |
 | `override` | object\|null | `{"mode": "follow"\|"pin"\|"strategy", "account", "strategy"}`; null for `local` |
@@ -221,7 +318,8 @@ Errors with `--json` print `{"contract": "cswap-fleet/1", "op", "result": "error
 <code>, "message"}`. Codes: `invalid-host`, `duplicate-host`, `unknown-host`, `invalid-hosts`,
 `invalid-override`, `invalid-input`, `invalid-lease`, `invalid-document`, `no-hosts`,
 `busy` (`hosts.json` locked by another cswap for over 10 s),
-`push-failed` (with per-host results in `hosts`), `unsupported`, `internal`.
+`push-failed` (with per-host results in `hosts`), `no-alert-command`,
+`invalid-alert-command`, `alert-failed` (with `exit_code`), `unsupported`, `internal`.
 
 ## TUI: the Hosts screen
 

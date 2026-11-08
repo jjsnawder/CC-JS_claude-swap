@@ -76,6 +76,10 @@ def _remote_mod():
     return importlib.import_module("claude_swap.fleet_remote")
 
 
+def _alerts_mod():
+    return importlib.import_module("claude_swap.fleet_alerts")
+
+
 def _iso(ts: float | None) -> str | None:
     if ts is None:
         return None
@@ -550,7 +554,8 @@ def _public_host_snapshot(snap: Any) -> dict | None:
             if key in accounts:
                 accounts_out[key] = accounts[key]
     out = {k: snap[k] for k in (
-        "contract", "host_time", "engine", "follow", "relogin", "settings_hash", "lease",
+        "contract", "host_time", "engine", "follow", "relogin", "relogin_detail",
+        "settings_hash", "lease",
     ) if k in snap}
     out["accounts"] = accounts_out
     return _scrub_tree(out)
@@ -621,6 +626,7 @@ class FleetLeader:
         clock: Callable[[], float] = time.time,
         max_workers: int = MAX_WORKERS,
         timeout_s: float = REMOTE_TIMEOUT_S,
+        alert_runner: Callable[..., Any] = subprocess.run,
     ):
         self.switcher = switcher
         self._engine = engine
@@ -640,6 +646,8 @@ class FleetLeader:
         self._kick = threading.Event()
         self._thread: threading.Thread | None = None
         self._workers: list[threading.Thread] = []
+        # fork: fleet alerts (fleet.alertCommand); idle while it is unset.
+        self.alerts = _alerts_mod().AlertDispatcher(self.backup_root, runner=alert_runner)
 
     @property
     def running(self) -> bool:
@@ -724,7 +732,48 @@ class FleetLeader:
                 self._inflight.add(host.name)
             self._queue.put((host, lease))
             queued += 1
+        try:
+            self._alert_round(hosts, usage)
+        except Exception as e:  # alerts never cost a round
+            _logger.debug("fleet: alert round failed: %r", e)
         return queued
+
+    def _alert_round(self, hosts: list, usage: dict | None) -> bool:
+        """Hand this round's view to the alert dispatcher (a no-op while
+        ``fleet.alertCommand`` is unset). Worker replies land asynchronously,
+        so this sees each host's latest recorded reply. Never blocks: the
+        command runs on the dispatcher's own thread."""
+        alerts = self.alerts
+        command = alerts.command()
+        if not command or alerts.in_flight:
+            return False
+        lease_mod = _lease_mod()
+        alerts_mod = _alerts_mod()
+        now = self.clock()
+        if usage is None:
+            usage = lease_mod.list_payload(self.switcher)  # store-only
+        local = alerts_mod.LOCAL_HOST
+        relogin: dict[str, list[dict]] = {}
+        if isinstance(usage, dict) and not usage.get("error"):  # a failed list clears nothing
+            relogin[local] = lease_mod.relogin_detail(usage, self.backup_root, now=now)
+        down: dict[str, str | None] = {}
+        up = {local}
+        with self._lock:
+            for host in hosts:
+                entry = self._hosts.get(host.name)
+                if entry is None:
+                    continue  # nothing heard yet
+                if entry["reachable"]:
+                    up.add(host.name)
+                    detail = alerts_mod.detail_from_snapshot(entry["snapshot"], now=now)
+                    if detail is not None:
+                        relogin[host.name] = detail
+                elif entry.get("fails", 0) >= alerts_mod.UNREACHABLE_ROUNDS:
+                    down[host.name] = _iso(entry.get("fail_since"))
+        return alerts.submit(
+            relogin=relogin, down=down, up=up,
+            known_hosts={local, *(h.name for h in hosts)}, command=command,
+        )
 
     def _work(self) -> None:
         while True:
@@ -753,9 +802,13 @@ class FleetLeader:
         ok = error is None and isinstance(payload, dict)
         with self._lock:
             prev = self._hosts.get(name) or {}
+            now = self.clock()
             self._hosts[name] = {
                 "reachable": ok,
-                "last_ok_at": self.clock() if ok else prev.get("last_ok_at"),
+                # Consecutive failed rounds and when the streak began (alerts).
+                "fails": 0 if ok else int(prev.get("fails") or 0) + 1,
+                "fail_since": None if ok else (prev.get("fail_since") or now),
+                "last_ok_at": now if ok else prev.get("last_ok_at"),
                 "error": None if ok else (error or "no reply"),
                 # The last good reply survives a failure (status shows it
                 # with reachable: false).

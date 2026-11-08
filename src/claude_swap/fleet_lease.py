@@ -616,6 +616,56 @@ def relogin_slots(list_payload: dict, backup_root: Path, *, now: float) -> list[
     return sorted((n for n in found if n.isdigit()), key=int)
 
 
+#: Why a slot is in ``relogin``, most urgent first (one reason per slot).
+RELOGIN_REASONS = ("relogin_required", "quarantined", "expiring")
+
+
+def _iso_z(ts: float | None) -> str | None:
+    if ts is None:
+        return None
+    return (
+        datetime.fromtimestamp(ts, tz=timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def relogin_detail(
+    list_payload: dict,
+    backup_root: Path | None,
+    *,
+    now: float,
+    quarantined: set[str] | None = None,
+) -> list[dict]:
+    """:func:`relogin_slots` with a reason per slot:
+    ``[{"slot", "reason", "expires_at"}]`` (``reason`` from
+    :data:`RELOGIN_REASONS`; ``expires_at`` is the row's ``loginExpiresAt``
+    as ISO UTC, or null). Same slot set as :func:`relogin_slots`. Slot
+    numbers only; never an email. ``quarantined`` overrides the state-file
+    read (None = read it from ``backup_root``)."""
+    if quarantined is None:
+        quarantined = _quarantined_slots(backup_root) if backup_root is not None else set()
+    rows: dict[str, dict] = {}
+    raw_rows = list_payload.get("accounts") if isinstance(list_payload, dict) else None
+    for row in raw_rows if isinstance(raw_rows, list) else []:
+        if isinstance(row, dict) and "number" in row:
+            rows.setdefault(str(row["number"]), row)
+    out = []
+    for num in sorted((n for n in set(rows) | set(quarantined) if n.isdigit()), key=int):
+        row = rows.get(num) or {}
+        expires = _parse_iso(row.get("loginExpiresAt"))
+        if row.get("usageStatus") == "relogin_required":
+            reason = "relogin_required"
+        elif num in quarantined:
+            reason = "quarantined"
+        elif expires is not None and expires - now <= RELOGIN_WINDOW_S:
+            reason = "expiring"
+        else:
+            continue
+        out.append({"slot": num, "reason": reason, "expires_at": _iso_z(expires)})
+    return out
+
+
 def _engine_status(backup_root: Path) -> dict:
     from claude_swap import engine_control
 
@@ -635,6 +685,7 @@ def build_snapshot(
     ``{"contract", "host_time", "accounts": <list --json payload>,
     "engine": <engine status reply, {"result": "no-engine"} when none>,
     "follow": follow_state(...), "relogin": [slot numbers],
+    "relogin_detail": relogin_detail(...),
     "settings_hash": settings_fingerprint(...)}``. ``host_time`` is this
     box's epoch seconds.
     """
@@ -650,6 +701,7 @@ def build_snapshot(
         "engine": engine,
         "follow": follow_state(backup_root, engine, now=now, active=active),
         "relogin": relogin_slots(accounts, backup_root, now=now),
+        "relogin_detail": relogin_detail(accounts, backup_root, now=now),
         "settings_hash": settings_fingerprint(switcher),
     }
 

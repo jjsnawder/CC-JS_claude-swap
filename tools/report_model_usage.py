@@ -65,6 +65,29 @@ CACHE_READ_PRICE = {
 CACHE_WRITE_5M_MULT = 1.25
 CACHE_WRITE_1H_MULT = 2.00
 
+# Central price table (house rule 2026-11-09, ~/.claude/guides/model-defaults.md):
+# token-dashboard's pricing.json is the canonical rate table. When it is present
+# (dev box: sibling folder of this repo, or $CLAUDE_PRICING_JSON) it overlays the
+# built-in table above, which stays as the fallback (fresh clone, Dev1). Keys are
+# re-sorted longest-first, so a point release never has to sit above its parent.
+def _overlay_central_prices() -> None:
+    global PRICES, CACHE_READ_PRICE
+    path = os.environ.get("CLAUDE_PRICING_JSON") or os.path.join(
+        os.path.dirname(REPO_ROOT), "token-dashboard", "pricing.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            models = json.load(fh)["models"]
+        for mid, r in models.items():
+            PRICES[mid] = (float(r["input"]), float(r["output"]))
+            CACHE_READ_PRICE[mid] = float(r["cache_read"])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    PRICES = dict(sorted(PRICES.items(), key=lambda kv: -len(kv[0])))
+    CACHE_READ_PRICE = dict(sorted(CACHE_READ_PRICE.items(), key=lambda kv: -len(kv[0])))
+
+
+_overlay_central_prices()
+
 
 def project_slug(path: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "-", os.path.abspath(path))

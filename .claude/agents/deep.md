@@ -10,7 +10,7 @@ description: >
   tool-runner could not resolve. Runs on FABLE 5.1, the same model as the main -
   the value is the fresh, isolated read, NOT a capability step-up.
 tools: Read, Write, Edit, Grep, Glob, Bash
-model: claude-fable-5-2
+model: fable
 effort: high
 color: red
 hooks:

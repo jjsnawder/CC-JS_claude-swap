@@ -183,6 +183,12 @@ orchestrator-owned; the worker-side rule is in every Bash-capable agent body.
   ruling; ~/.claude/guides/claude-code-subagent-discipline.md §Parallelize for speed).
 
 ## Model wiring (desktop app)
+> **Model IDs (house rule 2026-11-09):** agent files and `.claude/settings.json` name
+> models by ALIAS (`opus`, `sonnet`, `haiku`, `fable`); the exact model behind each
+> alias is set once, centrally, in the `env` block of `~/.claude/settings.json`
+> (`ANTHROPIC_DEFAULT_<ALIAS>_MODEL`; ~/.claude/guides/model-defaults.md). Never pin an
+> exact ID in this repo's agents or settings. Exact IDs named elsewhere in this file
+> are dated snapshots. Effort stays per agent file.
 Main = Opus 5.5 via `.claude/settings.json` (exact ID `claude-opus-5-5`; the
 house convention is exact IDs, so each release is a deliberate step). Workers
 pinned per agent file (`tool-runner`/`review` = `claude-opus-5-5`, `chore` =

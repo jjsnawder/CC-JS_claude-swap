@@ -7,7 +7,7 @@ description: >
   fixing code - but route work with no code to write and no judgment call to
   chore instead. Returns a summary + diff.
 tools: Read, Write, Edit, Grep, Glob, Bash
-model: claude-opus-5-5
+model: opus
 effort: high
 color: blue
 hooks:

@@ -27,8 +27,8 @@ judgment on an expensive one.
   passes — work with no code to write and no judgment call in it.
 - Discovery: the **HAIKU** `scout` subagent. Read-only lookups — which module
   owns a behaviour, which test covers it, whether a tool already exists.
-- Consequential verification: the **FABLE 5.1** `deep` subagent, isolated, at
-  `xhigh` effort. See §Verification: a *fresh-context* verifier, and since the
+- Consequential verification: the **FABLE 5.2** `deep` subagent, isolated, at
+  `high` effort. See §Verification: a *fresh-context* verifier, and since the
   main moved to Opus 5.5 also a *different-model* one.
 
 ## Routing (per step)
@@ -40,7 +40,7 @@ path.
 - Run a known-good tool or the test suite, capture output → `chore` (Sonnet 5)
 - Change package code, write or fix a tool, make the tests pass → `tool-runner` (Opus 5.5)
 - Review a change before you commit → `review` (Opus 5.5)
-- Independent fresh-context check of consequential work → `deep` (Fable 5.1)
+- Independent fresh-context check of consequential work → `deep` (Fable 5.2)
 - Decompose, sequence, synthesize, decide → inline, you (Opus 5.5)
 
 ### chore vs tool-runner — the one test
@@ -86,7 +86,7 @@ fully green suite.
   read/write paths, the account store layout, the switch/`run` launch logic, the
   `CLAUDE_CONFIG_DIR` copy step (restic and the cross-sessions skill depend on
   that layout), or an upstream rebase with conflicts in those areas.
-- **`deep` stays on FABLE (5.1, `xhigh`).** It was pinned there under Jeremy's
+- **`deep` stays on FABLE (5.2, `high`).** It was pinned there under Jeremy's
   **standing ruling (2026-08-17)** for Fable-main projects
   (`~/.claude/guides/project-scaffolding-scope.md` §Questions that ARE fair to
   ask). With an Opus 5.5 main it is now a different model from the main as well
@@ -144,7 +144,7 @@ this is the project-level summary.
   leaked token is a rotation event.
 - **Deliverables**: you commit and report; subagents leave intermediates in `.tmp/`.
 
-## Fable 5.1 operating facts (for the `deep` subagent)
+## Fable 5.2 operating facts (for the `deep` subagent)
 - **Thinking is always on.** `thinking: {"type": "disabled"}` is a 400; depth is
   controlled by effort alone.
 - **30-day data retention is required.** Fable is not available under zero data
@@ -186,7 +186,7 @@ orchestrator-owned; the worker-side rule is in every Bash-capable agent body.
 Main = Opus 5.5 via `.claude/settings.json` (exact ID `claude-opus-5-5`; the
 house convention is exact IDs, so each release is a deliberate step). Workers
 pinned per agent file (`tool-runner`/`review` = `claude-opus-5-5`, `chore` =
-`claude-sonnet-5`, `scout` = `haiku`, `deep` = `claude-fable-5-1` @ `xhigh`).
+`claude-sonnet-5`, `scout` = `haiku`, `deep` = `claude-fable-5-2` @ `high`).
 **DO NOT set `CLAUDE_CODE_SUBAGENT_MODEL`** — it overrides frontmatter and
 collapses every worker onto one model. Confirm Opus 5.5 in the startup header;
 if the model picker says otherwise it overrides for that session only.

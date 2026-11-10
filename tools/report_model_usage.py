@@ -31,6 +31,8 @@ REPORT_PATH = os.path.join(REPO_ROOT, "docs", "model-usage.md")
 PRICES = {
     # Order matters: price_for() matches by prefix, so a point release must
     # sit ABOVE its parent ("claude-fable-5-1" before "claude-fable-5").
+    "claude-fable-5-2": (8.00, 40.00),
+    "claude-mythos-5-2": (8.00, 40.00),
     "claude-fable-5-1": (10.00, 50.00),
     "claude-mythos-5-1": (10.00, 50.00),
     "claude-fable-5": (10.00, 50.00),
@@ -55,6 +57,8 @@ CACHE_READ_MULT = 0.10
 CACHE_READ_PRICE = {
     "claude-sonnet-5-5": 0.10,
     "claude-opus-5-5": 0.20,
+    "claude-fable-5-2": 0.20,
+    "claude-mythos-5-2": 0.20,
     "claude-fable-5-1": 0.25,
     "claude-mythos-5-1": 0.25,
 }

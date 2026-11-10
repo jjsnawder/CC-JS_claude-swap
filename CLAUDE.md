@@ -42,7 +42,7 @@ That sentence is the whole kickoff. When it arrives, before proposing anything:
    true GitHub fork, public, personal account; `main` mirrors upstream, `jeremy`
    is the working branch based on the latest release tag; editable install into
    system Python 3.13 (no venv — deliberate); Opus 5.5 main and workers, with
-   `deep` on Fable 5.1 (`.claude/routing.md`).
+   `deep` on Fable 5.2 (`.claude/routing.md`).
 3. **Plan with Jeremy, then write `docs/plans/<date>-<slug>.md` before any
    code.** The conversation must produce:
    - **The change itself**, and whether it is (a) generic → structured for an
